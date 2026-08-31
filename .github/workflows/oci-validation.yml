@@ -91,16 +91,11 @@ jobs:
 
           PASS=0; FAIL=0; ERROR=0; TIMEOUT=0
 
-          # Skip patterns — use bash regex ([[ =~ ]]) to avoid
-          # depending on /usr/bin/grep which may vanish inside the
-          # mount namespace after nacre's pivot_root.
           SKIP_V1='^(linux_cgroups_(network|blkio|hugetlb|devices|pids|relative_(blkio|network|hugetlb|devices|pids))|linux_cgroups_relative_cpus|linux_cgroups_relative_memory|linux_cgroups_cpus|linux_cgroups_memory|delete_(only_create_)?resources)$'
           SKIP_BROKEN='^(pidfile|process_rlimits)$'
           SKIP_V1_N=0; SKIP_BROKEN_N=0
 
           for t in validation/*/*.t; do
-            # Use bash builtins instead of basename (external command
-            # may become unavailable inside the mount namespace)
             name="${t##*/}"
             name="${name%.t}"
 
@@ -115,17 +110,25 @@ jobs:
               continue
             fi
 
+            # Each test runs in its own ephemeral mount namespace so
+            # that (a) /proc is remounted to match the PID namespace
+            # and (b) mount corruption from nacre's pivot_root cannot
+            # accumulate across tests.  --propagation private prevents
+            # mount events leaking back to the parent namespace.
             out=$OUTDIR/$name.log
-            timeout --signal=KILL 60 env RUNTIME=$RUNTIME "$t" > "$out" 2>&1
+            unshare --mount --propagation private bash -c '
+              mount -t proc proc /proc 2>/dev/null
+              timeout --signal=KILL 60 env RUNTIME="$1" "$2"
+              rc=$?
+              "$1" delete --force "$3" >/dev/null 2>&1
+              killall -9 perl nacre runtimetest 2>/dev/null
+              exit $rc
+            ' -- "$RUNTIME" "$t" "$name" > "$out" 2>&1
             rc=$?
 
-            # Clean up between tests (use full paths; || true for
-            # each command in case binaries are gone)
-            $RUNTIME delete --force "$name" > /dev/null 2>&1 || true
-            /usr/bin/killall -9 perl nacre runtimetest 2>/dev/null || true
-            # bash-builtin sleep substitute
+            # Brief pause + clean up state directory between tests
             read -t 0.2 </dev/null 2>/dev/null || true
-            /usr/bin/find /run/nacre -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+            find /run/nacre -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
 
             if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
               TIMEOUT=$((TIMEOUT+1))
@@ -133,7 +136,6 @@ jobs:
               continue
             fi
 
-            # Count ok/not-ok with bash builtins (grep may be gone)
             n_ok=0; n_notok=0
             if [ -f "$out" ]; then
               while IFS= read -r line; do
@@ -163,14 +165,14 @@ jobs:
           VALIDATION_SCRIPT
           chmod +x /tmp/run-validation.sh
 
-          # Run inside PID + mount namespace.  The PID namespace
-          # guarantees the kernel kills every orphan when the init
-          # exits.  The mount namespace isolates the /proc remount
-          # (needed so namespace-local PIDs match /proc entries) and
-          # prevents nacre's pivot_root from leaking mount changes
-          # back to the host.
-          sudo -E unshare --pid --fork --mount --propagation private \
-            bash -c 'mount -t proc proc /proc && exec bash /tmp/run-validation.sh' \
+          # Run inside a PID namespace.  The PID namespace guarantees
+          # the kernel kills every orphan when init exits, preventing
+          # the Post Run hang.  Each test gets its own ephemeral mount
+          # namespace (with /proc remounted) inside the script, so
+          # nacre sees correct namespace-local PIDs and mount corruption
+          # from pivot_root is isolated per-test.
+          sudo -E unshare --pid --fork \
+            bash /tmp/run-validation.sh \
             > /tmp/validation-main.log 2>&1 </dev/null
 
           # Display results (set +e so grep failures don't kill the step)
