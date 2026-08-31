@@ -1,0 +1,2580 @@
+#!/usr/bin/perl
+# nacre — a Linux OCI container runtime written in Perl
+use strict;
+use warnings;
+use POSIX qw(setsid _exit dup2 mkfifo WNOHANG WIFEXITED WEXITSTATUS
+             WIFSIGNALED WTERMSIG :sys_wait_h :signal_h :errno_h);
+use Socket qw(AF_UNIX SOCK_STREAM SOCK_SEQPACKET SOL_SOCKET
+              pack_sockaddr_un PF_UNIX MSG_DONTWAIT);
+use JSON::PP;
+use File::Basename qw(basename dirname);
+use File::Path qw(make_path remove_tree);
+use Fcntl qw(:flock :mode :seek O_RDONLY O_WRONLY O_RDWR O_CREAT
+             O_TRUNC O_EXCL O_NONBLOCK O_DIRECTORY O_NOFOLLOW);
+use constant O_CLOEXEC => 0o2000000;
+use Getopt::Long qw(:config pass_through no_auto_abbrev);
+use Cwd qw(abs_path getcwd);
+use Errno qw(EINTR EAGAIN EWOULDBLOCK ENOENT EEXIST EBUSY EPERM ENOSYS EACCES EOVERFLOW);
+
+# ═══════════════════════════════════════════════════════════════════════
+# Constants
+# ═══════════════════════════════════════════════════════════════════════
+
+# -- Syscall numbers (x86_64) --
+use constant {
+    SYS_mount           => 165,
+    SYS_umount2         => 166,
+    SYS_pivot_root      => 155,
+    SYS_unshare         => 272,
+    SYS_setns           => 308,
+    SYS_clone           => 56,
+    SYS_clone3          => 435,
+    SYS_prctl           => 157,
+    SYS_capget          => 125,
+    SYS_capset          => 126,
+    SYS_mknod           => 133,
+    SYS_mknodat         => 259,
+    SYS_seccomp         => 317,
+    SYS_bpf             => 321,
+    SYS_pidfd_open      => 434,
+    SYS_close_range     => 436,
+    SYS_sethostname     => 170,
+    SYS_setdomainname   => 171,
+    SYS_setgroups       => 116,
+    SYS_prlimit64       => 302,
+    SYS_ioprio_set      => 251,
+    SYS_sched_setattr   => 314,
+    SYS_sched_setaffinity => 203,
+    SYS_set_mempolicy   => 238,
+    SYS_keyctl          => 250,
+    SYS_add_key         => 248,
+    SYS_memfd_create    => 319,
+    SYS_open_tree       => 428,
+    SYS_move_mount      => 429,
+    SYS_mount_setattr   => 442,
+    SYS_fsopen          => 430,
+    SYS_fsconfig        => 431,
+    SYS_fsmount         => 432,
+    SYS_sendmsg         => 46,
+    SYS_recvmsg         => 47,
+    SYS_epoll_create1   => 291,
+    SYS_epoll_ctl       => 233,
+    SYS_epoll_wait      => 232,
+    SYS_inotify_init1   => 294,
+    SYS_inotify_add_watch => 254,
+    SYS_waitid          => 247,
+};
+
+# -- Clone / Namespace flags --
+use constant {
+    CLONE_NEWNS     => 0x00020000,
+    CLONE_NEWUTS    => 0x04000000,
+    CLONE_NEWIPC    => 0x08000000,
+    CLONE_NEWUSER   => 0x10000000,
+    CLONE_NEWPID    => 0x20000000,
+    CLONE_NEWNET    => 0x40000000,
+    CLONE_NEWCGROUP => 0x02000000,
+    CLONE_NEWTIME   => 0x00000080,
+    SIGCHLD         => 17,
+};
+
+# -- Mount flags --
+use constant {
+    MS_RDONLY       => 1,
+    MS_NOSUID      => 2,
+    MS_NODEV       => 4,
+    MS_NOEXEC      => 8,
+    MS_REMOUNT     => 32,
+    MS_NOATIME     => 1024,
+    MS_NODIRATIME  => 2048,
+    MS_BIND        => 4096,
+    MS_MOVE        => 8192,
+    MS_REC         => 16384,
+    MS_SILENT      => 32768,
+    MS_RELATIME    => (1 << 21),
+    MS_STRICTATIME => (1 << 24),
+    MS_SLAVE       => (1 << 19),
+    MS_SHARED      => (1 << 20),
+    MS_PRIVATE     => (1 << 18),
+    MS_UNBINDABLE  => (1 << 17),
+    MNT_DETACH     => 2,
+    MNT_FORCE      => 1,
+};
+
+# -- prctl constants --
+use constant {
+    PR_SET_NO_NEW_PRIVS => 38,
+    PR_CAPBSET_READ     => 23,
+    PR_CAPBSET_DROP     => 24,
+    PR_SET_KEEPCAPS     => 8,
+    PR_CAP_AMBIENT      => 47,
+    PR_CAP_AMBIENT_RAISE   => 2,
+    PR_CAP_AMBIENT_LOWER   => 3,
+    PR_CAP_AMBIENT_CLEAR_ALL => 4,
+    PR_SET_CHILD_SUBREAPER  => 36,
+    PR_SET_PDEATHSIG        => 1,
+    PR_SET_DUMPABLE         => 4,
+    PR_SET_NAME             => 15,
+};
+
+# -- Capabilities --
+my @CAP_NAMES = qw(
+    CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_FSETID
+    CAP_KILL CAP_SETGID CAP_SETUID CAP_SETPCAP CAP_LINUX_IMMUTABLE
+    CAP_NET_BIND_SERVICE CAP_NET_BROADCAST CAP_NET_ADMIN CAP_NET_RAW
+    CAP_IPC_LOCK CAP_IPC_OWNER CAP_SYS_MODULE CAP_SYS_RAWIO CAP_SYS_CHROOT
+    CAP_SYS_PTRACE CAP_SYS_PACCT CAP_SYS_ADMIN CAP_SYS_BOOT CAP_SYS_NICE
+    CAP_SYS_RESOURCE CAP_SYS_TIME CAP_SYS_TTY_CONFIG CAP_MKNOD CAP_LEASE
+    CAP_AUDIT_WRITE CAP_AUDIT_CONTROL CAP_SETFCAP CAP_MAC_OVERRIDE
+    CAP_MAC_ADMIN CAP_SYSLOG CAP_WAKE_ALARM CAP_BLOCK_SUSPEND
+    CAP_AUDIT_READ CAP_PERFMON CAP_BPF CAP_CHECKPOINT_RESTORE
+);
+my %CAP_NUM;
+for my $i (0..$#CAP_NAMES) { $CAP_NUM{$CAP_NAMES[$i]} = $i; }
+
+# -- Capability header/data version --
+use constant {
+    _LINUX_CAPABILITY_VERSION_3 => 0x20080522,
+    _LINUX_CAPABILITY_U32S_3   => 2,
+    VFS_CAP_REVISION_2         => 0x02000000,
+};
+
+# -- seccomp --
+use constant {
+    SECCOMP_SET_MODE_FILTER => 1,
+    SECCOMP_FILTER_FLAG_TSYNC     => (1 << 0),
+    SECCOMP_FILTER_FLAG_LOG       => (1 << 1),
+    SECCOMP_FILTER_FLAG_NEW_LISTENER => (1 << 3),
+    SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV => (1 << 5),
+};
+
+# -- BPF --
+use constant {
+    BPF_PROG_LOAD   => 5,
+    BPF_PROG_ATTACH => 8,
+    BPF_CGROUP_DEVICE => 9,
+    BPF_F_ALLOW_MULTI => (1 << 1),
+    BPF_PROG_TYPE_CGROUP_DEVICE => 15,
+};
+
+# -- close_range --
+use constant {
+    CLOSE_RANGE_CLOEXEC => (1 << 2),
+};
+
+# -- Signals (name -> number) --
+my %SIG_NUM;
+{
+    my @names = split ' ', $Config::Config{sig_name} // '';
+    my @nums  = split ' ', $Config::Config{sig_num}  // '';
+    if (!@names) {
+        # Fallback: standard x86_64 signals
+        %SIG_NUM = (
+            HUP => 1, INT => 2, QUIT => 3, ILL => 4, TRAP => 5, ABRT => 6,
+            BUS => 7, FPE => 8, KILL => 9, USR1 => 10, SEGV => 11, USR2 => 12,
+            PIPE => 13, ALRM => 14, TERM => 15, STKFLT => 16, CHLD => 17,
+            CONT => 18, STOP => 19, TSTP => 20, TTIN => 21, TTOU => 22,
+            URG => 23, XCPU => 24, XFSZ => 25, VTALRM => 26, PROF => 27,
+            WINCH => 28, IO => 29, PWR => 30, SYS => 31,
+        );
+    } else {
+        for my $i (0..$#names) {
+            $SIG_NUM{$names[$i]} = $nums[$i] if $names[$i] && $nums[$i];
+        }
+    }
+}
+require Config;  # for sig_name/sig_num
+
+# -- OCI namespace type -> clone flag & proc name --
+my %NS_MAP = (
+    pid     => { flag => CLONE_NEWPID,    proc => 'pid'     },
+    network => { flag => CLONE_NEWNET,    proc => 'net'     },
+    mount   => { flag => CLONE_NEWNS,     proc => 'mnt'     },
+    ipc     => { flag => CLONE_NEWIPC,    proc => 'ipc'     },
+    uts     => { flag => CLONE_NEWUTS,    proc => 'uts'     },
+    user    => { flag => CLONE_NEWUSER,   proc => 'user'    },
+    cgroup  => { flag => CLONE_NEWCGROUP, proc => 'cgroup'  },
+    time    => { flag => CLONE_NEWTIME,   proc => 'time_for_children' },
+);
+
+# -- Default root path for state --
+my $DEFAULT_ROOT = '/run/nacre';
+
+# -- JSON encoder --
+my $JSON = JSON::PP->new->utf8->canonical->pretty->allow_nonref;
+my $JSON_COMPACT = JSON::PP->new->utf8->canonical->allow_nonref;
+
+# ═══════════════════════════════════════════════════════════════════════
+# Utility functions
+# ═══════════════════════════════════════════════════════════════════════
+
+sub fatal { die "nacre: @_\n"; }
+
+sub write_file {
+    my ($path, $content) = @_;
+    open my $fh, '>', $path or fatal("write $path: $!");
+    print $fh $content;
+    close $fh;
+}
+
+sub read_file {
+    my ($path) = @_;
+    open my $fh, '<', $path or return undef;
+    local $/;
+    my $data = <$fh>;
+    close $fh;
+    return $data;
+}
+
+sub read_file_or_die {
+    my ($path) = @_;
+    my $data = read_file($path);
+    fatal("cannot read $path: $!") unless defined $data;
+    return $data;
+}
+
+sub write_file_atomic {
+    my ($path, $content) = @_;
+    my $tmp = "$path.tmp.$$";
+    write_file($tmp, $content);
+    rename($tmp, $path) or do { unlink $tmp; fatal("rename $tmp -> $path: $!"); };
+}
+
+sub ensure_dir {
+    my ($path) = @_;
+    make_path($path, { mode => 0o755 }) unless -d $path;
+}
+
+sub iso8601_now {
+    my @t = gmtime(time);
+    return sprintf('%04d-%02d-%02dT%02d:%02d:%02dZ',
+        $t[5]+1900, $t[4]+1, $t[3], $t[2], $t[1], $t[0]);
+}
+
+# Safe wrapper around syscall() that retries on EINTR
+sub do_syscall {
+    my $ret;
+    do {
+        $ret = syscall(@_);
+    } while ($ret == -1 && $! == EINTR);
+    return $ret;
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# OCI Spec loading
+# ═══════════════════════════════════════════════════════════════════════
+
+sub load_spec {
+    my ($bundle) = @_;
+    my $config_path = "$bundle/config.json";
+    my $raw = read_file_or_die($config_path);
+    my $spec = $JSON->decode($raw);
+    fatal("invalid ociVersion") unless ($spec->{ociVersion} // '') =~ /^\d+\.\d+\.\d+/;
+    return $spec;
+}
+
+sub default_spec {
+    return {
+        ociVersion => '1.2.0',
+        root => { path => 'rootfs', readonly => JSON::PP::false },
+        process => {
+            terminal => JSON::PP::true,
+            user => { uid => 0, gid => 0 },
+            args => [ 'sh' ],
+            env => [
+                'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+                'TERM=xterm',
+            ],
+            cwd => '/',
+            capabilities => {
+                bounding   => [qw(CAP_AUDIT_WRITE CAP_KILL CAP_NET_BIND_SERVICE)],
+                effective  => [qw(CAP_AUDIT_WRITE CAP_KILL CAP_NET_BIND_SERVICE)],
+                permitted  => [qw(CAP_AUDIT_WRITE CAP_KILL CAP_NET_BIND_SERVICE)],
+                ambient    => [qw(CAP_AUDIT_WRITE CAP_KILL CAP_NET_BIND_SERVICE)],
+            },
+            rlimits => [
+                { type => 'RLIMIT_NOFILE', hard => 1024, soft => 1024 },
+            ],
+            noNewPrivileges => JSON::PP::true,
+        },
+        hostname => 'nacre',
+        mounts => [
+            { destination => '/proc', type => 'proc', source => 'proc',
+              options => [qw(nosuid noexec nodev)] },
+            { destination => '/dev', type => 'tmpfs', source => 'tmpfs',
+              options => [qw(nosuid strictatime), 'mode=755', 'size=65536k'] },
+            { destination => '/dev/pts', type => 'devpts', source => 'devpts',
+              options => [qw(nosuid noexec), 'newinstance', 'ptmxmode=0666', 'mode=0620'] },
+            { destination => '/dev/shm', type => 'tmpfs', source => 'shm',
+              options => [qw(nosuid noexec nodev), 'mode=1777', 'size=65536k'] },
+            { destination => '/dev/mqueue', type => 'mqueue', source => 'mqueue',
+              options => [qw(nosuid noexec nodev)] },
+            { destination => '/sys', type => 'sysfs', source => 'sysfs',
+              options => [qw(nosuid noexec nodev readonly)] },
+            { destination => '/sys/fs/cgroup', type => 'cgroup2', source => 'cgroup',
+              options => [qw(nosuid noexec nodev readonly)] },
+        ],
+        linux => {
+            resources => {
+                devices => [ { allow => JSON::PP::false, access => 'rwm' } ],
+            },
+            namespaces => [
+                { type => 'pid' },
+                { type => 'network' },
+                { type => 'ipc' },
+                { type => 'uts' },
+                { type => 'mount' },
+                { type => 'cgroup' },
+            ],
+            maskedPaths => [qw(
+                /proc/acpi /proc/asound /proc/kcore /proc/keys
+                /proc/latency_stats /proc/timer_list /proc/timer_stats
+                /proc/sched_debug /proc/scsi /sys/firmware
+                /sys/devices/virtual/powercap
+            )],
+            readonlyPaths => [qw(
+                /proc/bus /proc/fs /proc/irq /proc/sys /proc/sysrq-trigger
+            )],
+        },
+    };
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Container State
+# ═══════════════════════════════════════════════════════════════════════
+
+sub state_dir {
+    my ($root, $id) = @_;
+    return "$root/$id";
+}
+
+sub load_state {
+    my ($root, $id) = @_;
+    my $path = state_dir($root, $id) . '/state.json';
+    my $raw = read_file($path);
+    fatal("container '$id' does not exist") unless defined $raw;
+    my $state = $JSON->decode($raw);
+    refresh_state($state);
+    return $state;
+}
+
+sub save_state {
+    my ($root, $state) = @_;
+    my $dir = state_dir($root, $state->{id});
+    ensure_dir($dir);
+    write_file_atomic("$dir/state.json", $JSON->encode($state));
+}
+
+sub delete_state {
+    my ($root, $id) = @_;
+    my $dir = state_dir($root, $id);
+    remove_tree($dir) if -d $dir;
+}
+
+sub refresh_state {
+    my ($state) = @_;
+    my $pid = $state->{pid};
+    return unless $pid && $pid > 0;
+    my $status = $state->{status};
+    return if $status eq 'stopped';
+
+    # Check if process is alive
+    my $stat = read_file("/proc/$pid/stat");
+    if (!defined $stat) {
+        $state->{status} = 'stopped';
+        $state->{pid} = 0;
+        return;
+    }
+
+    # PID reuse detection via starttime
+    if ($state->{pidStartTime}) {
+        my $current_start = parse_proc_starttime($stat);
+        if (defined $current_start && $current_start ne $state->{pidStartTime}) {
+            $state->{status} = 'stopped';
+            $state->{pid} = 0;
+            return;
+        }
+    }
+
+    # Check zombie/dead
+    if ($stat =~ /\)\s+([RSDZTW])/) {
+        my $proc_state = $1;
+        if ($proc_state eq 'Z' || $proc_state eq 'X') {
+            $state->{status} = 'stopped';
+        }
+    }
+}
+
+sub parse_proc_starttime {
+    my ($stat_line) = @_;
+    # /proc/pid/stat: pid (comm) state ppid pgrp session tty_nr tpgid flags
+    #   minflt cminflt majflt cmajflt utime stime cutime cstime priority nice
+    #   num_threads itrealvalue starttime ...
+    # comm can contain spaces and parens, so find the last ')'
+    if ($stat_line =~ /\)\s+\S+\s+          # state
+                        \S+\s+\S+\s+\S+\s+  # ppid pgrp session
+                        \S+\s+\S+\s+\S+\s+  # tty tpgid flags
+                        \S+\s+\S+\s+\S+\s+  # minflt cminflt majflt
+                        \S+\s+\S+\s+\S+\s+  # cmajflt utime stime
+                        \S+\s+\S+\s+\S+\s+  # cutime cstime priority
+                        \S+\s+\S+\s+\S+\s+  # nice threads itrealvalue
+                        (\S+)/x) {
+        return $1;
+    }
+    return undef;
+}
+
+sub get_pid_starttime {
+    my ($pid) = @_;
+    my $stat = read_file("/proc/$pid/stat");
+    return undef unless $stat;
+    return parse_proc_starttime($stat);
+}
+
+sub oci_state_json {
+    my ($state) = @_;
+    return {
+        ociVersion => $state->{ociVersion} // '1.2.0',
+        id         => $state->{id},
+        status     => $state->{status},
+        pid        => $state->{pid} + 0,
+        bundle     => $state->{bundle},
+        annotations => $state->{annotations} // {},
+        created     => $state->{created} // '',
+    };
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Cgroup v2
+# ═══════════════════════════════════════════════════════════════════════
+
+my $CGROUP_ROOT = '/sys/fs/cgroup';
+
+sub cgroup_path {
+    my ($spec, $id) = @_;
+    my $rel = $spec->{linux}{cgroupsPath};
+    if ($rel && $rel =~ m{^/}) {
+        return "$CGROUP_ROOT$rel";
+    } elsif ($rel) {
+        return "$CGROUP_ROOT/nacre/$rel";
+    } else {
+        return "$CGROUP_ROOT/nacre/$id";
+    }
+}
+
+sub cgroup_setup {
+    my ($cgpath, $spec) = @_;
+    ensure_dir($cgpath);
+
+    # Enable controllers up the tree
+    my @parts = split m{/}, $cgpath;
+    my $root_parts = scalar(split m{/}, $CGROUP_ROOT);
+    for my $depth ($root_parts .. $#parts - 1) {
+        my $ancestor = join('/', @parts[0..$depth]);
+        my $sc_file = "$ancestor/cgroup.subtree_control";
+        next unless -f $sc_file;
+        my $current = read_file($sc_file) // '';
+        for my $ctrl (qw(cpu memory pids io cpuset hugetlb)) {
+            if ($current !~ /\b$ctrl\b/) {
+                eval { write_file($sc_file, "+$ctrl\n"); };
+            }
+        }
+    }
+
+    # Apply resources
+    cgroup_apply_resources($cgpath, $spec);
+}
+
+sub cgroup_apply_resources {
+    my ($cgpath, $spec, %opts) = @_;
+    my $res = $spec->{linux}{resources} // {};
+
+    # Memory
+    if (my $mem = $res->{memory}) {
+        cg_write($cgpath, 'memory.max',      $mem->{limit})       if defined $mem->{limit};
+        cg_write($cgpath, 'memory.low',      $mem->{reservation}) if defined $mem->{reservation};
+        cg_write($cgpath, 'memory.swap.max', $mem->{swap})        if defined $mem->{swap};
+    }
+
+    # CPU
+    if (my $cpu = $res->{cpu}) {
+        if (defined $cpu->{shares}) {
+            my $weight = convert_cpu_shares($cpu->{shares});
+            cg_write($cgpath, 'cpu.weight', $weight);
+        }
+        if (defined $cpu->{quota} || defined $cpu->{period}) {
+            my $quota  = $cpu->{quota}  // 'max';
+            my $period = $cpu->{period} // 100000;
+            cg_write($cgpath, 'cpu.max', "$quota $period");
+        }
+        if (defined $cpu->{burst}) {
+            cg_write($cgpath, 'cpu.max.burst', $cpu->{burst});
+        }
+        if (defined $cpu->{idle}) {
+            cg_write($cgpath, 'cpu.idle', $cpu->{idle});
+        }
+        cg_write($cgpath, 'cpuset.cpus', $cpu->{cpus}) if defined $cpu->{cpus};
+        cg_write($cgpath, 'cpuset.mems', $cpu->{mems}) if defined $cpu->{mems};
+    }
+
+    # PIDs
+    if (my $pids = $res->{pids}) {
+        unless ($opts{defer_pids}) {
+            my $max = $pids->{limit} // 'max';
+            $max = 'max' if $max <= 0;
+            cg_write($cgpath, 'pids.max', $max);
+        }
+    }
+
+    # Hugepages
+    if (my $hp = $res->{hugepageLimits}) {
+        for my $entry (@$hp) {
+            my $size = $entry->{pageSize} // next;
+            my $limit = $entry->{limit} // next;
+            cg_write($cgpath, "hugetlb.${size}.max", $limit);
+        }
+    }
+
+    # Block IO
+    if (my $bio = $res->{blockIO}) {
+        if (defined $bio->{weight}) {
+            my $weight = $bio->{weight};
+            cg_write($cgpath, 'io.weight', "default $weight");
+        }
+        if (my $tbd = $bio->{throttleReadBpsDevice}) {
+            for my $d (@$tbd) {
+                cg_write($cgpath, 'io.max', "$d->{major}:$d->{minor} rbps=$d->{rate}");
+            }
+        }
+        if (my $tbd = $bio->{throttleWriteBpsDevice}) {
+            for my $d (@$tbd) {
+                cg_write($cgpath, 'io.max', "$d->{major}:$d->{minor} wbps=$d->{rate}");
+            }
+        }
+    }
+
+    # Unified (raw cgroup file writes)
+    if (my $u = $res->{unified}) {
+        for my $key (keys %$u) {
+            cg_write($cgpath, $key, $u->{$key});
+        }
+    }
+}
+
+sub cgroup_add_process {
+    my ($cgpath, $pid) = @_;
+    cg_write($cgpath, 'cgroup.procs', $pid);
+}
+
+sub cgroup_cleanup {
+    my ($cgpath) = @_;
+    return unless -d $cgpath;
+
+    # Kill all processes in the cgroup
+    my $procs = read_file("$cgpath/cgroup.procs") // '';
+    for my $pid (split /\n/, $procs) {
+        next unless $pid =~ /^\d+$/;
+        kill 9, $pid;
+    }
+
+    # Wait a bit for processes to die
+    my $deadline = time + 2;
+    while (time < $deadline) {
+        $procs = read_file("$cgpath/cgroup.procs") // '';
+        last unless $procs =~ /\d/;
+        select(undef, undef, undef, 0.05);
+    }
+
+    # Remove cgroup directory with retry (EBUSY)
+    for my $attempt (1..10) {
+        last if rmdir($cgpath);
+        last unless $! == EBUSY;
+        select(undef, undef, undef, 0.05 * $attempt);
+    }
+}
+
+sub cgroup_pids {
+    my ($cgpath) = @_;
+    my $data = read_file("$cgpath/cgroup.procs") // '';
+    return grep { /^\d+$/ } split /\n/, $data;
+}
+
+sub cg_write {
+    my ($cgpath, $file, $value) = @_;
+    my $path = "$cgpath/$file";
+    eval { write_file($path, "$value\n"); };
+    # Non-fatal: some cgroup files may not exist
+}
+
+sub convert_cpu_shares {
+    my ($shares) = @_;
+    return 100 if !$shares || $shares < 2;
+    return 1 if $shares == 2;
+    return int(1 + (($shares - 2) * 9999 / 262142));
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Mount / Rootfs
+# ═══════════════════════════════════════════════════════════════════════
+
+my %MOUNT_FLAGS = (
+    bind        => MS_BIND,
+    rbind       => MS_BIND | MS_REC,
+    ro          => MS_RDONLY,
+    rw          => 0,
+    nosuid      => MS_NOSUID,
+    suid        => 0,
+    nodev       => MS_NODEV,
+    dev         => 0,
+    noexec      => MS_NOEXEC,
+    exec        => 0,
+    noatime     => MS_NOATIME,
+    atime       => 0,
+    nodiratime  => MS_NODIRATIME,
+    diratime    => 0,
+    relatime    => MS_RELATIME,
+    norelatime  => 0,
+    strictatime => MS_STRICTATIME,
+    nostrictatime => 0,
+    remount     => MS_REMOUNT,
+    sync        => 16,     # MS_SYNCHRONOUS
+    async       => 0,
+    dirsync     => 128,    # MS_DIRSYNC
+    silent      => MS_SILENT,
+    loud        => 0,
+    slave       => MS_SLAVE,
+    rslave      => MS_SLAVE | MS_REC,
+    private     => MS_PRIVATE,
+    rprivate    => MS_PRIVATE | MS_REC,
+    shared      => MS_SHARED,
+    rshared     => MS_SHARED | MS_REC,
+    unbindable  => MS_UNBINDABLE,
+    runbindable => MS_UNBINDABLE | MS_REC,
+    readonly    => MS_RDONLY,
+);
+
+sub parse_mount_options {
+    my ($opts_ref) = @_;
+    my $flags = 0;
+    my @data;
+    for my $opt (@{$opts_ref // []}) {
+        if (exists $MOUNT_FLAGS{$opt}) {
+            $flags |= $MOUNT_FLAGS{$opt};
+        } else {
+            push @data, $opt;
+        }
+    }
+    return ($flags, join(',', @data));
+}
+
+sub do_mount {
+    my ($src, $target, $fstype, $flags, $data) = @_;
+    $src   //= '';
+    $fstype //= '';
+    $data   //= '';
+    my $ret = do_syscall(SYS_mount,
+        $src . "\0", $target . "\0", $fstype . "\0",
+        $flags, $data . "\0");
+    return $ret == 0;
+}
+
+sub do_umount {
+    my ($target, $flags) = @_;
+    $flags //= 0;
+    return do_syscall(SYS_umount2, $target . "\0", $flags) == 0;
+}
+
+sub do_pivot_root {
+    my ($new_root, $put_old) = @_;
+    return do_syscall(SYS_pivot_root, $new_root . "\0", $put_old . "\0") == 0;
+}
+
+# Default devices to create
+my @DEFAULT_DEVICES = (
+    { path => '/dev/null',    type => 'c', major => 1, minor => 3, mode => 0o666 },
+    { path => '/dev/zero',    type => 'c', major => 1, minor => 5, mode => 0o666 },
+    { path => '/dev/full',    type => 'c', major => 1, minor => 7, mode => 0o666 },
+    { path => '/dev/random',  type => 'c', major => 1, minor => 8, mode => 0o666 },
+    { path => '/dev/urandom', type => 'c', major => 1, minor => 9, mode => 0o444 },
+    { path => '/dev/tty',     type => 'c', major => 5, minor => 0, mode => 0o666 },
+);
+
+# Default symlinks for /dev
+my @DEFAULT_SYMLINKS = (
+    { path => '/dev/fd',     target => '/proc/self/fd'     },
+    { path => '/dev/stdin',  target => '/proc/self/fd/0'   },
+    { path => '/dev/stdout', target => '/proc/self/fd/1'   },
+    { path => '/dev/stderr', target => '/proc/self/fd/2'   },
+    { path => '/dev/ptmx',   target => 'pts/ptmx'          },
+);
+
+sub prepare_rootfs {
+    my ($spec, $rootfs) = @_;
+
+    # Make everything slave to avoid mount events leaking
+    do_mount('', '/', '', MS_SLAVE | MS_REC, '')
+        or fatal("mount rslave /: $!");
+
+    # Bind mount rootfs on itself
+    do_mount($rootfs, $rootfs, '', MS_BIND | MS_REC, '')
+        or fatal("bind mount rootfs: $!");
+
+    # Apply spec mounts
+    apply_mounts($spec, $rootfs);
+
+    # Create default devices via bind mount
+    create_devices($rootfs, $spec);
+
+    # Create default symlinks
+    create_symlinks($rootfs);
+}
+
+sub apply_mounts {
+    my ($spec, $rootfs) = @_;
+    for my $m (@{$spec->{mounts} // []}) {
+        my $dest = "$rootfs$m->{destination}";
+        ensure_dir($dest);
+
+        my ($flags, $data) = parse_mount_options($m->{options});
+        my $type = $m->{type} // '';
+        my $src  = $m->{source} // $type;
+
+        if ($flags & MS_BIND) {
+            # Bind mount
+            do_mount($src, $dest, '', $flags, '')
+                or do { warn "nacre: mount bind $dest: $!\n"; next; };
+            # Apply remaining flags via remount
+            if ($flags & ~(MS_BIND | MS_REC)) {
+                do_mount('', $dest, '', MS_REMOUNT | MS_BIND | ($flags & ~MS_REC), '')
+                    or warn "nacre: remount $dest: $!\n";
+            }
+        } else {
+            do_mount($src, $dest, $type, $flags, $data)
+                or do { warn "nacre: mount $type on $dest: $!\n"; next; };
+        }
+    }
+}
+
+sub create_devices {
+    my ($rootfs, $spec) = @_;
+
+    my @devices = @DEFAULT_DEVICES;
+
+    # Add spec devices
+    for my $d (@{$spec->{linux}{devices} // []}) {
+        push @devices, {
+            path  => $d->{path},
+            type  => $d->{type} // 'c',
+            major => $d->{major} // 0,
+            minor => $d->{minor} // 0,
+            mode  => $d->{fileMode} // 0o666,
+            uid   => $d->{uid},
+            gid   => $d->{gid},
+        };
+    }
+
+    for my $dev (@devices) {
+        my $dest = "$rootfs$dev->{path}";
+        my $dir = dirname($dest);
+        ensure_dir($dir);
+
+        # Try bind mount from host first (works in user namespaces)
+        my $host_dev = $dev->{path};
+        if (-e $host_dev) {
+            # Create empty file as mount point
+            if (!-e $dest) {
+                open my $fh, '>', $dest;
+                close $fh if $fh;
+            }
+            if (do_mount($host_dev, $dest, '', MS_BIND, '')) {
+                next;  # success
+            }
+        }
+
+        # Fallback: mknod (requires privileges)
+        unlink $dest;
+        my $dev_num = ($dev->{major} << 8) | $dev->{minor};
+        my $ftype = $dev->{type} eq 'b' ? S_IFBLK : S_IFCHR;
+        my $ret = do_syscall(SYS_mknod,
+            $dest . "\0", $ftype | ($dev->{mode} & 0o7777), $dev_num);
+        if ($ret != 0) {
+            # Non-fatal in user namespaces
+            next;
+        }
+        if (defined $dev->{uid} || defined $dev->{gid}) {
+            chown($dev->{uid} // -1, $dev->{gid} // -1, $dest);
+        }
+    }
+}
+
+sub create_symlinks {
+    my ($rootfs) = @_;
+    for my $s (@DEFAULT_SYMLINKS) {
+        my $dest = "$rootfs$s->{path}";
+        next if -e $dest || -l $dest;
+        symlink($s->{target}, $dest);
+    }
+}
+
+sub apply_pivot_root {
+    my ($rootfs) = @_;
+    chdir($rootfs) or fatal("chdir to rootfs: $!");
+
+    # pivot_root(".", ".") — old root ends up mounted atop new root
+    do_pivot_root('.', '.') or fatal("pivot_root: $!");
+
+    # Unmount old root (lazy)
+    do_umount('.', MNT_DETACH) or fatal("umount old root: $!");
+
+    chdir('/') or fatal("chdir /: $!");
+}
+
+sub apply_masked_paths {
+    my ($paths) = @_;
+    for my $p (@{$paths // []}) {
+        if (-d $p) {
+            do_mount('tmpfs', $p, 'tmpfs', MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, 'size=0');
+        } elsif (-e $p) {
+            do_mount('/dev/null', $p, '', MS_BIND, '');
+        }
+    }
+}
+
+sub apply_readonly_paths {
+    my ($paths) = @_;
+    for my $p (@{$paths // []}) {
+        next unless -e $p;
+        do_mount($p, $p, '', MS_BIND | MS_REC, '');
+        do_mount('', $p, '', MS_REMOUNT | MS_BIND | MS_RDONLY | MS_REC, '');
+    }
+}
+
+sub set_rootfs_readonly {
+    my ($rootfs_readonly) = @_;
+    return unless $rootfs_readonly;
+    do_mount('', '/', '', MS_REMOUNT | MS_BIND | MS_RDONLY, '')
+        or fatal("remount / readonly: $!");
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Capabilities
+# ═══════════════════════════════════════════════════════════════════════
+
+sub apply_capabilities {
+    my ($spec) = @_;
+    my $caps = $spec->{process}{capabilities} // return;
+
+    # Drop bounding set
+    if (my $bounding = $caps->{bounding}) {
+        my %keep = map { $_ => 1 } @$bounding;
+        for my $name (@CAP_NAMES) {
+            next if $keep{$name};
+            my $num = $CAP_NUM{$name} // next;
+            do_syscall(SYS_prctl, PR_CAPBSET_DROP, $num, 0, 0, 0);
+        }
+    }
+
+    # Keep caps across setuid
+    do_syscall(SYS_prctl, PR_SET_KEEPCAPS, 1, 0, 0, 0);
+
+    # Apply capabilities via capset
+    my @sets = (
+        [effective  => $caps->{effective}  // []],
+        [permitted  => $caps->{permitted}  // []],
+        [inheritable => $caps->{inheritable} // []],
+    );
+
+    my ($eff_lo, $eff_hi) = (0, 0);
+    my ($prm_lo, $prm_hi) = (0, 0);
+    my ($inh_lo, $inh_hi) = (0, 0);
+
+    for my $name (@{$caps->{effective} // []}) {
+        my $n = $CAP_NUM{$name} // next;
+        if ($n < 32) { $eff_lo |= (1 << $n); } else { $eff_hi |= (1 << ($n - 32)); }
+    }
+    for my $name (@{$caps->{permitted} // []}) {
+        my $n = $CAP_NUM{$name} // next;
+        if ($n < 32) { $prm_lo |= (1 << $n); } else { $prm_hi |= (1 << ($n - 32)); }
+    }
+    for my $name (@{$caps->{inheritable} // []}) {
+        my $n = $CAP_NUM{$name} // next;
+        if ($n < 32) { $inh_lo |= (1 << $n); } else { $inh_hi |= (1 << ($n - 32)); }
+    }
+
+    # capset: header (version, pid) + data[2] (effective, permitted, inheritable)
+    my $hdr = pack('Ii', _LINUX_CAPABILITY_VERSION_3, 0);
+    my $data = pack('III III',
+        $eff_lo, $prm_lo, $inh_lo,
+        $eff_hi, $prm_hi, $inh_hi);
+    do_syscall(SYS_capset, $hdr, $data);
+
+    # Clear keepcaps
+    do_syscall(SYS_prctl, PR_SET_KEEPCAPS, 0, 0, 0, 0);
+
+    # Raise ambient capabilities
+    for my $name (@{$caps->{ambient} // []}) {
+        my $n = $CAP_NUM{$name} // next;
+        do_syscall(SYS_prctl, PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, $n, 0, 0);
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Seccomp (via dlopen/dlsym of libseccomp)
+# ═══════════════════════════════════════════════════════════════════════
+
+# We'll use Perl's DynaLoader to call libseccomp functions
+# This avoids the FFI::Platypus dependency
+
+my $SECCOMP_AVAILABLE = 0;
+my $LIBSECCOMP;
+
+sub init_libseccomp {
+    eval {
+        require DynaLoader;
+        $LIBSECCOMP = DynaLoader::dl_load_file('/usr/lib/x86_64-linux-gnu/libseccomp.so.2', 0);
+        $SECCOMP_AVAILABLE = 1 if $LIBSECCOMP;
+    };
+}
+
+# Seccomp actions
+use constant {
+    SCMP_ACT_KILL         => 0x00000000,
+    SCMP_ACT_KILL_PROCESS => 0x80000000,
+    SCMP_ACT_TRAP         => 0x00030000,
+    SCMP_ACT_NOTIFY       => 0x7fc00000,
+    SCMP_ACT_LOG          => 0x7ffc0000,
+    SCMP_ACT_ALLOW        => 0x7fff0000,
+    SCMP_ACT_ERRNO_BASE   => 0x00050000,
+};
+
+# For now, seccomp via raw BPF when libseccomp isn't available via FFI
+# The full libseccomp integration requires FFI::Platypus
+sub apply_seccomp_raw {
+    my ($spec) = @_;
+    my $seccomp = $spec->{linux}{seccomp} // return;
+
+    # If FFI::Platypus is available, use it
+    if (eval { require FFI::Platypus; 1 }) {
+        return apply_seccomp_ffi($spec);
+    }
+
+    # Fallback: apply a simple default-allow or default-kill filter via raw BPF
+    # This is a minimal implementation
+    warn "nacre: seccomp: FFI::Platypus not available, using minimal raw BPF\n";
+    apply_seccomp_minimal($seccomp);
+}
+
+sub apply_seccomp_ffi {
+    my ($spec) = @_;
+    my $seccomp = $spec->{linux}{seccomp} // return;
+
+    require FFI::Platypus;
+    my $ffi = FFI::Platypus->new(api => 2);
+    $ffi->lib('/usr/lib/x86_64-linux-gnu/libseccomp.so.2');
+
+    # Attach libseccomp functions
+    $ffi->attach('seccomp_init'           => ['uint32'] => 'opaque');
+    $ffi->attach('seccomp_arch_add'       => ['opaque', 'uint32'] => 'int');
+    $ffi->attach('seccomp_rule_add'       => ['opaque', 'uint32', 'int', 'uint'] => 'int', sub {
+        my ($xsub, @args) = @_;
+        return $xsub->(@args);
+    });
+    $ffi->attach('seccomp_syscall_resolve_name' => ['string'] => 'int');
+    $ffi->attach('seccomp_load'           => ['opaque'] => 'int');
+    $ffi->attach('seccomp_release'        => ['opaque'] => 'void');
+    $ffi->attach('seccomp_export_bpf'     => ['opaque', 'int'] => 'int');
+    $ffi->attach('seccomp_attr_set'       => ['opaque', 'uint32', 'uint32'] => 'int');
+
+    # Map OCI action to libseccomp action
+    my %action_map = (
+        SCMP_ACT_KILL         => SCMP_ACT_KILL,
+        SCMP_ACT_KILL_PROCESS => SCMP_ACT_KILL_PROCESS,
+        SCMP_ACT_TRAP         => SCMP_ACT_TRAP,
+        SCMP_ACT_NOTIFY       => SCMP_ACT_NOTIFY,
+        SCMP_ACT_LOG          => SCMP_ACT_LOG,
+        SCMP_ACT_ALLOW        => SCMP_ACT_ALLOW,
+    );
+
+    my $default_action_str = $seccomp->{defaultAction} // 'SCMP_ACT_ALLOW';
+    my $default_action;
+    if ($default_action_str =~ /^SCMP_ACT_ERRNO\((\d+)\)$/) {
+        $default_action = SCMP_ACT_ERRNO_BASE | ($1 & 0xffff);
+    } else {
+        $default_action = $action_map{$default_action_str}
+            // fatal("unknown seccomp action: $default_action_str");
+    }
+
+    my $ctx = seccomp_init($default_action)
+        or fatal("seccomp_init failed");
+
+    # Disable NNP control (we handle it ourselves)
+    seccomp_attr_set($ctx, 2, 0);  # SCMP_FLTATR_CTL_NNP = 2
+
+    # Add architectures
+    my %arch_map = (
+        SCMP_ARCH_X86_64  => 0xc000003e,
+        SCMP_ARCH_X86     => 0x40000003,
+        SCMP_ARCH_AARCH64 => 0xc00000b7,
+        SCMP_ARCH_ARM     => 0x40000028,
+    );
+
+    for my $arch (@{$seccomp->{architectures} // []}) {
+        my $arch_val = $arch_map{$arch} // next;
+        seccomp_arch_add($ctx, $arch_val);
+    }
+
+    # Add syscall rules
+    for my $rule (@{$seccomp->{syscalls} // []}) {
+        my $action_str = $rule->{action} // $default_action_str;
+        my $action;
+        if ($action_str =~ /^SCMP_ACT_ERRNO\((\d+)\)$/) {
+            $action = SCMP_ACT_ERRNO_BASE | ($1 & 0xffff);
+        } else {
+            $action = $action_map{$action_str} // next;
+        }
+
+        for my $name (@{$rule->{names} // []}) {
+            my $nr = seccomp_syscall_resolve_name($name);
+            next if $nr < 0;
+            seccomp_rule_add($ctx, $action, $nr, 0);
+        }
+    }
+
+    # Export BPF and load via raw seccomp syscall (bypasses NNP)
+    # Create a pipe to capture the BPF program
+    pipe(my $rd, my $wr) or fatal("pipe for seccomp export: $!");
+    my $fd = fileno($wr);
+    my $ret = seccomp_export_bpf($ctx, $fd);
+    close $wr;
+
+    if ($ret == 0) {
+        # Read the BPF program
+        local $/;
+        my $bpf_prog = <$rd>;
+        close $rd;
+
+        if (defined $bpf_prog && length $bpf_prog >= 8) {
+            # BPF program format: struct sock_fprog { unsigned short len; struct sock_filter *filter; }
+            # But seccomp_export_bpf writes raw sock_filter array
+            my $filter_count = length($bpf_prog) / 8;  # each sock_filter is 8 bytes
+            my $sock_fprog = pack('S x![P] P', $filter_count, unpack('Q', pack('P', $bpf_prog)));
+
+            # Use a more portable approach: write to a buffer and pass pointer
+            my $flags = 0;
+            do_syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, $flags, $sock_fprog);
+        }
+    } else {
+        close $rd;
+        # Fallback to seccomp_load (sets NNP)
+        seccomp_load($ctx);
+    }
+
+    seccomp_release($ctx);
+}
+
+sub apply_seccomp_minimal {
+    my ($seccomp) = @_;
+    # Minimal: just set NNP which is usually wanted anyway
+    # Full seccomp requires FFI::Platypus
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# eBPF Device Cgroup
+# ═══════════════════════════════════════════════════════════════════════
+
+sub apply_device_cgroup {
+    my ($cgpath, $spec) = @_;
+    my $rules = $spec->{linux}{resources}{devices} // return;
+
+    # Emulate device rules (runc's devices_emulator)
+    my ($default_allow, $exceptions) = emulate_device_rules($rules);
+
+    # Build BPF program
+    my $prog = build_device_bpf($default_allow, $exceptions);
+    return unless @$prog;
+
+    # Load BPF program
+    my $insns = join('', map { pack_bpf_insn(@$_) } @$prog);
+    my $license = "GPL\0";
+    my $log_buf = "\0" x 4096;
+
+    # bpf_attr for BPF_PROG_LOAD
+    my $attr = pack('L      L      Q      Q      L      L      Q      a*',
+        BPF_PROG_TYPE_CGROUP_DEVICE,  # prog_type
+        scalar(@$prog),                # insn_cnt
+        unpack('Q', pack('P', $insns)),   # insns ptr
+        unpack('Q', pack('P', $license)), # license ptr
+        4,                              # log_level
+        4096,                           # log_size
+        unpack('Q', pack('P', $log_buf)), # log_buf ptr
+    );
+    # Pad to expected size
+    $attr .= "\0" x (256 - length($attr)) if length($attr) < 256;
+
+    my $prog_fd = do_syscall(SYS_bpf, BPF_PROG_LOAD, $attr, length($attr));
+    if ($prog_fd < 0) {
+        warn "nacre: BPF_PROG_LOAD failed: $!\n";
+        return;
+    }
+
+    # Open cgroup dir fd
+    sysopen(my $cgdir_fh, $cgpath, O_RDONLY | O_DIRECTORY)
+        or do { warn "nacre: open cgroup dir: $!\n"; return; };
+    my $cgdir_fd = fileno($cgdir_fh);
+
+    # bpf_attr for BPF_PROG_ATTACH
+    my $attach_attr = pack('L L L L',
+        BPF_CGROUP_DEVICE,  # attach_type at offset 0
+        $cgdir_fd,          # target_fd at offset 4
+        $prog_fd,           # attach_bpf_fd at offset 8
+        BPF_F_ALLOW_MULTI,  # attach_flags at offset 12
+    );
+    $attach_attr .= "\0" x (256 - length($attach_attr)) if length($attach_attr) < 256;
+
+    my $ret = do_syscall(SYS_bpf, BPF_PROG_ATTACH, $attach_attr, length($attach_attr));
+    warn "nacre: BPF_PROG_ATTACH failed: $!\n" if $ret < 0;
+
+    close $cgdir_fh;
+    POSIX::close($prog_fd);
+}
+
+sub emulate_device_rules {
+    my ($rules) = @_;
+    my $default_allow = 0;
+    my @exceptions;
+
+    for my $r (@$rules) {
+        my $type = $r->{type} // 'a';
+        my $allow = $r->{allow} ? 1 : 0;
+        my $access = $r->{access} // 'rwm';
+        my $major = $r->{major};
+        my $minor = $r->{minor};
+
+        if ($type eq 'a') {
+            $default_allow = $allow;
+            @exceptions = ();
+            next;
+        }
+
+        my $exc = {
+            type   => $type,
+            major  => $major // -1,
+            minor  => $minor // -1,
+            access => $access,
+        };
+
+        if ($allow != $default_allow) {
+            push @exceptions, $exc;
+        } else {
+            @exceptions = grep {
+                !($_->{type} eq $exc->{type} &&
+                  $_->{major} == $exc->{major} &&
+                  $_->{minor} == $exc->{minor})
+            } @exceptions;
+        }
+    }
+
+    return ($default_allow, \@exceptions);
+}
+
+sub build_device_bpf {
+    my ($default_allow, $exceptions) = @_;
+    my @prog;
+
+    return \@prog unless @$exceptions;
+
+    # BPF instructions for cgroup device filter
+    # R1 = pointer to bpf_cgroup_dev_ctx:
+    #   u32 access_type: (access << 16) | type  (type: 1=block, 2=char)
+    #   u32 major
+    #   u32 minor
+
+    # Load access_type
+    push @prog, bpf_ld_abs(0);    # R0 = *(u32*)(ctx + 0) = access_type
+    push @prog, bpf_st(0);        # M[0] = R0 (save access_type)
+
+    # For each exception, generate check-and-jump
+    my $num_exc = scalar @$exceptions;
+    for my $i (0..$num_exc-1) {
+        my $exc = $exceptions->[$i];
+        my $remaining = $num_exc - $i - 1;
+
+        # Calculate jump target for "not matching" = skip to next exception
+        my $jumps_in_this_exc = 0;
+        $jumps_in_this_exc++ if $exc->{type};           # type check
+        $jumps_in_this_exc++ if $exc->{major} != -1;    # major check
+        $jumps_in_this_exc++ if $exc->{minor} != -1;    # minor check
+        $jumps_in_this_exc++;                            # access check
+        $jumps_in_this_exc++;                            # return action
+
+        # Type check
+        my $type_val = $exc->{type} eq 'b' ? 1 : 2;
+        my $skip = $jumps_in_this_exc - 1;
+
+        push @prog, bpf_ld_mem(0);     # R0 = M[0] (access_type)
+        push @prog, bpf_alu_and(0xffff);  # R0 &= 0xffff (type field)
+        push @prog, bpf_jne($type_val, $skip - 2, 0);
+
+        # Major check
+        if ($exc->{major} != -1) {
+            push @prog, bpf_ld_abs(4);  # R0 = major
+            $skip -= 3;
+            push @prog, bpf_jne($exc->{major}, $skip > 0 ? $skip : 0, 0);
+        }
+
+        # Minor check
+        if ($exc->{minor} != -1) {
+            push @prog, bpf_ld_abs(8);  # R0 = minor
+            $skip -= 2;
+            push @prog, bpf_jne($exc->{minor}, $skip > 0 ? $skip : 0, 0);
+        }
+
+        # Access check
+        push @prog, bpf_ld_mem(0);      # R0 = M[0] (access_type)
+        my $access_mask = 0;
+        $access_mask |= 1 if $exc->{access} =~ /m/;
+        $access_mask |= 2 if $exc->{access} =~ /r/;
+        $access_mask |= 4 if $exc->{access} =~ /w/;
+        push @prog, bpf_alu_rsh(16);    # R0 >>= 16 (access field)
+        push @prog, bpf_alu_and($access_mask);
+        push @prog, bpf_jeq(0, 1, 0);   # if no matching access bits, skip return
+
+        # Return opposite of default
+        push @prog, bpf_ret($default_allow ? 0 : 1);
+    }
+
+    # Default return
+    push @prog, bpf_ret($default_allow ? 1 : 0);
+
+    return \@prog;
+}
+
+# BPF instruction helpers (eBPF format: 8 bytes each)
+# struct bpf_insn { __u8 code; __u8 dst_reg:4, src_reg:4; __s16 off; __s32 imm; }
+
+sub pack_bpf_insn {
+    my ($code, $dst_src, $off, $imm) = @_;
+    return pack('CCsl', $code, $dst_src // 0, $off // 0, $imm // 0);
+}
+
+# eBPF opcodes
+use constant {
+    BPF_LD_IMM64   => 0x18,
+    BPF_LDX_MEM_W  => 0x61,
+    BPF_STX_MEM_W  => 0x63,
+    BPF_ALU_AND_K  => 0x54,
+    BPF_ALU_RSH_K  => 0x74,
+    BPF_JNE_K      => 0x55,
+    BPF_JEQ_K      => 0x15,
+    BPF_MOV_K      => 0xb4,
+    BPF_EXIT       => 0x95,
+};
+
+sub bpf_ld_abs {
+    my ($off) = @_;
+    # ldx r0, [r1 + off]  (BPF_LDX | BPF_MEM | BPF_W, dst=r0, src=r1)
+    return [BPF_LDX_MEM_W, 0x10, $off, 0];  # dst=0, src=1
+}
+
+sub bpf_st {
+    my ($off) = @_;
+    # stx [r10 + off], r0  (store to stack)
+    return [BPF_STX_MEM_W, 0xa0, -4 - $off * 4, 0];  # dst=r10(fp), src=r0
+}
+
+sub bpf_ld_mem {
+    my ($off) = @_;
+    # ldx r0, [r10 + off]  (load from stack)
+    return [BPF_LDX_MEM_W, 0x0a, -4 - $off * 4, 0];  # dst=r0, src=r10(fp)
+}
+
+sub bpf_alu_and {
+    my ($imm) = @_;
+    return [BPF_ALU_AND_K, 0x00, 0, $imm];
+}
+
+sub bpf_alu_rsh {
+    my ($imm) = @_;
+    return [BPF_ALU_RSH_K, 0x00, 0, $imm];
+}
+
+sub bpf_jne {
+    my ($imm, $jt, $jf) = @_;
+    return [BPF_JNE_K, 0x00, $jt, $imm];
+}
+
+sub bpf_jeq {
+    my ($imm, $jt, $jf) = @_;
+    return [BPF_JEQ_K, 0x00, $jt, $imm];
+}
+
+sub bpf_ret {
+    my ($val) = @_;
+    # mov r0, val; exit
+    return [BPF_MOV_K, 0x00, 0, $val], [BPF_EXIT, 0x00, 0, 0];
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# IPC Channel (socketpair-based)
+# ═══════════════════════════════════════════════════════════════════════
+
+sub create_channel {
+    socketpair(my $a, my $b, PF_UNIX, SOCK_SEQPACKET, 0)
+        or fatal("socketpair: $!");
+    return (fileno($a), fileno($b), $a, $b);
+}
+
+sub channel_send {
+    my ($fd, $msg) = @_;
+    my $data = $JSON_COMPACT->encode($msg);
+    my $ret = POSIX::write($fd, $data, length($data));
+    fatal("channel_send: $!") unless defined $ret && $ret > 0;
+}
+
+sub channel_recv {
+    my ($fd) = @_;
+    my $buf;
+    my $ret = POSIX::read($fd, $buf, 65536);
+    return undef unless defined $ret && $ret > 0;
+    return $JSON_COMPACT->decode($buf);
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Notify Socket (for start command)
+# ═══════════════════════════════════════════════════════════════════════
+
+sub create_notify_listener {
+    my ($sock_path) = @_;
+    unlink $sock_path;
+    socket(my $srv, AF_UNIX, SOCK_STREAM, 0) or fatal("socket: $!");
+    bind($srv, pack_sockaddr_un($sock_path))  or fatal("bind $sock_path: $!");
+    listen($srv, 1)                           or fatal("listen: $!");
+    return $srv;
+}
+
+sub wait_for_start {
+    my ($srv_fh) = @_;
+    accept(my $cli, $srv_fh) or fatal("accept on notify socket: $!");
+    # Read "start container" message
+    my $buf;
+    sysread($cli, $buf, 4096);
+    close $cli;
+    return 1;
+}
+
+sub notify_container_start {
+    my ($sock_path) = @_;
+    socket(my $s, AF_UNIX, SOCK_STREAM, 0) or fatal("socket: $!");
+    connect($s, pack_sockaddr_un($sock_path)) or fatal("connect $sock_path: $!");
+    syswrite($s, "start container");
+    close $s;
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Process Security
+# ═══════════════════════════════════════════════════════════════════════
+
+sub apply_process_security {
+    my ($spec) = @_;
+    my $proc = $spec->{process} // {};
+
+    # 1. OOM score adj
+    if (defined $proc->{oomScoreAdj}) {
+        eval { write_file('/proc/self/oom_score_adj', $proc->{oomScoreAdj}); };
+    }
+
+    # 2. Umask
+    if (defined $proc->{user}{umask}) {
+        umask($proc->{user}{umask});
+    }
+
+    # 3. No new privileges
+    if ($proc->{noNewPrivileges}) {
+        do_syscall(SYS_prctl, PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    }
+
+    # 4. Seccomp
+    apply_seccomp_raw($spec);
+
+    # 5. Capabilities (includes bounding set drop, keepcaps, capset, ambient)
+    apply_capabilities($spec);
+
+    # 6. Set supplementary groups
+    if (my $groups = $proc->{user}{additionalGids}) {
+        my $packed = pack('L*', @$groups);
+        do_syscall(SYS_setgroups, scalar @$groups, $packed);
+    } else {
+        do_syscall(SYS_setgroups, 0, '');
+    }
+
+    # 7. setgid then setuid
+    my $gid = $proc->{user}{gid} // 0;
+    my $uid = $proc->{user}{uid} // 0;
+    POSIX::setgid($gid) if $gid;
+    POSIX::setuid($uid) if $uid;
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# rlimits
+# ═══════════════════════════════════════════════════════════════════════
+
+my %RLIMIT_MAP = (
+    RLIMIT_AS         => 9,
+    RLIMIT_CORE       => 4,
+    RLIMIT_CPU        => 0,
+    RLIMIT_DATA       => 2,
+    RLIMIT_FSIZE      => 1,
+    RLIMIT_LOCKS      => 10,
+    RLIMIT_MEMLOCK    => 8,
+    RLIMIT_MSGQUEUE   => 12,
+    RLIMIT_NICE       => 13,
+    RLIMIT_NOFILE     => 7,
+    RLIMIT_NPROC      => 6,
+    RLIMIT_RSS        => 5,
+    RLIMIT_RTPRIO     => 14,
+    RLIMIT_RTTIME     => 15,
+    RLIMIT_SIGPENDING => 11,
+    RLIMIT_STACK      => 3,
+);
+
+sub apply_rlimits {
+    my ($spec) = @_;
+    my $rlimits = $spec->{process}{rlimits} // return;
+    for my $rl (@$rlimits) {
+        my $type = $RLIMIT_MAP{$rl->{type}} // next;
+        my $soft = $rl->{soft} // 0;
+        my $hard = $rl->{hard} // 0;
+        # prlimit64(pid=0, resource, new_rlim, old_rlim=NULL)
+        my $new_rlim = pack('QQ', $soft, $hard);
+        do_syscall(SYS_prlimit64, 0, $type, $new_rlim, 0);
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Sysctls
+# ═══════════════════════════════════════════════════════════════════════
+
+my %SYSCTL_ALLOWED_PREFIXES = map { $_ => 1 } qw(
+    net. fs.mqueue.
+    kernel.msgmax kernel.msgmnb kernel.msgmni
+    kernel.sem kernel.shmall kernel.shmmax kernel.shmmni
+    kernel.domainname
+);
+
+sub validate_sysctl {
+    my ($key) = @_;
+    for my $prefix (keys %SYSCTL_ALLOWED_PREFIXES) {
+        return 1 if index($key, $prefix) == 0;
+    }
+    return 0;
+}
+
+sub apply_sysctls {
+    my ($spec) = @_;
+    my $sysctls = $spec->{linux}{sysctl} // return;
+    for my $key (keys %$sysctls) {
+        fatal("sysctl '$key' not allowed") unless validate_sysctl($key);
+        my $path = '/proc/sys/' . ($key =~ s/\./\//gr);
+        eval { write_file($path, $sysctls->{$key}); };
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Hooks
+# ═══════════════════════════════════════════════════════════════════════
+
+sub run_hooks {
+    my ($hooks, $state) = @_;
+    return unless $hooks;
+    for my $hook (@$hooks) {
+        my $pid = fork();
+        fatal("fork for hook: $!") unless defined $pid;
+        if ($pid == 0) {
+            # Set env
+            if ($hook->{env}) {
+                for my $e (@{$hook->{env}}) {
+                    my ($k, $v) = split /=/, $e, 2;
+                    $ENV{$k} = $v;
+                }
+            }
+            # Pipe state JSON to stdin
+            my $state_json = $JSON_COMPACT->encode(oci_state_json($state));
+            open STDIN, '<', \$state_json;
+            my @args = @{$hook->{args} // [$hook->{path}]};
+            exec { $hook->{path} } @args;
+            _exit(1);
+        }
+        my $timeout = $hook->{timeout} // 30;
+        my $elapsed = 0;
+        while ($elapsed < $timeout) {
+            my $w = waitpid($pid, WNOHANG);
+            last if $w > 0;
+            select(undef, undef, undef, 0.1);
+            $elapsed += 0.1;
+        }
+        if ($elapsed >= $timeout) {
+            kill 9, $pid;
+            waitpid($pid, 0);
+            warn "nacre: hook $hook->{path} timed out\n";
+        }
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Init Process (runs inside the container)
+# ═══════════════════════════════════════════════════════════════════════
+
+sub run_init_process {
+    my ($spec, $rootfs, $notify_fd, $main_chan_w, $main_chan_r, $cgpath) = @_;
+
+    # Setup rootfs (mounts, devices, symlinks)
+    prepare_rootfs($spec, $rootfs);
+
+    # pivot_root
+    apply_pivot_root($rootfs);
+
+    # Hostname
+    if (my $hostname = $spec->{hostname}) {
+        do_syscall(SYS_sethostname, $hostname . "\0", length($hostname));
+    }
+    if (my $domainname = $spec->{domainname}) {
+        do_syscall(SYS_setdomainname, $domainname . "\0", length($domainname));
+    }
+
+    # Sysctls (after pivot_root, /proc/sys is the container's)
+    apply_sysctls($spec);
+
+    # Masked paths
+    apply_masked_paths($spec->{linux}{maskedPaths});
+
+    # Readonly paths
+    apply_readonly_paths($spec->{linux}{readonlyPaths});
+
+    # Set rootfs readonly if requested
+    set_rootfs_readonly($spec->{root}{readonly});
+
+    # chdir to cwd
+    my $cwd = $spec->{process}{cwd} // '/';
+    chdir($cwd) or warn "nacre: chdir $cwd: $!\n";
+
+    # Signal main process: init ready
+    channel_send($main_chan_w, { type => 'init_ready' });
+
+    # Wait for start signal
+    wait_for_start($notify_fd);
+
+    # Run startContainer hooks
+    # (hooks run in the container namespace)
+
+    # Apply process security (NNP, seccomp, caps, setuid/setgid)
+    apply_process_security($spec);
+
+    # Apply rlimits
+    apply_rlimits($spec);
+
+    # Set environment
+    %ENV = ();
+    for my $e (@{$spec->{process}{env} // []}) {
+        my ($k, $v) = split /=/, $e, 2;
+        $ENV{$k} = $v if defined $k;
+    }
+
+    # Close extra fds
+    eval { do_syscall(SYS_close_range, 3, ~0, CLOSE_RANGE_CLOEXEC); };
+    # Fallback: close individually
+    if ($@ || $! == ENOSYS) {
+        for my $fd (3..1023) {
+            POSIX::close($fd);
+        }
+    }
+
+    # Exec
+    my @args = @{$spec->{process}{args} // ['sh']};
+    exec { $args[0] } @args
+        or fatal("exec $args[0]: $!");
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Main Process (runs on the host, coordinates init setup)
+# ═══════════════════════════════════════════════════════════════════════
+
+sub run_main_process {
+    my (%p) = @_;
+    my $spec       = $p{spec};
+    my $id         = $p{id};
+    my $bundle     = $p{bundle};
+    my $root       = $p{root};
+    my $cgpath     = $p{cgpath};
+    my $init_pid   = $p{init_pid};
+    my $chan_r_fd   = $p{chan_r};
+
+    # Setup cgroup
+    eval { cgroup_setup($cgpath, $spec); };
+    warn "nacre: cgroup setup: $@" if $@;
+
+    # Add init process to cgroup
+    eval { cgroup_add_process($cgpath, $init_pid); };
+
+    # Apply device cgroup (eBPF)
+    eval { apply_device_cgroup($cgpath, $spec); };
+
+    # Write UID/GID mappings for user namespace
+    write_id_mappings($init_pid, $spec);
+
+    # Wait for init_ready message
+    my $msg = channel_recv($chan_r_fd);
+    if (!$msg || $msg->{type} ne 'init_ready') {
+        fatal("init process failed to become ready");
+    }
+
+    # Save state
+    my $start_time = get_pid_starttime($init_pid);
+    my $state = {
+        ociVersion   => $spec->{ociVersion} // '1.2.0',
+        id           => $id,
+        status       => 'created',
+        pid          => $init_pid,
+        pidStartTime => $start_time,
+        bundle       => $bundle,
+        annotations  => $spec->{annotations} // {},
+        created      => iso8601_now(),
+        cgroupPath   => $cgpath,
+    };
+    save_state($root, $state);
+
+    # Write pid file if requested
+    if ($p{pid_file}) {
+        write_file($p{pid_file}, "$init_pid\n");
+    }
+
+    # Run createRuntime hooks
+    if (my $hooks = $spec->{hooks}) {
+        run_hooks($hooks->{createRuntime}, $state);
+        run_hooks($hooks->{prestart}, $state);      # deprecated but still supported
+    }
+
+    return $state;
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# User namespace UID/GID mapping
+# ═══════════════════════════════════════════════════════════════════════
+
+sub write_id_mappings {
+    my ($pid, $spec) = @_;
+    my $linux = $spec->{linux} // return;
+
+    my $uid_maps = $linux->{uidMappings};
+    my $gid_maps = $linux->{gidMappings};
+    return unless $uid_maps || $gid_maps;
+
+    # Write "deny" to setgroups before gid_map
+    eval { write_file("/proc/$pid/setgroups", "deny"); };
+
+    if ($uid_maps) {
+        my $content = join("\n", map {
+            "$_->{containerID} $_->{hostID} $_->{size}"
+        } @$uid_maps) . "\n";
+        write_file("/proc/$pid/uid_map", $content);
+    }
+
+    if ($gid_maps) {
+        my $content = join("\n", map {
+            "$_->{containerID} $_->{hostID} $_->{size}"
+        } @$gid_maps) . "\n";
+        write_file("/proc/$pid/gid_map", $content);
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Container Lifecycle: create
+# ═══════════════════════════════════════════════════════════════════════
+
+sub cmd_create {
+    my (%p) = @_;
+    my $id     = $p{id}     // fatal("container id required");
+    my $bundle = $p{bundle} // getcwd();
+    my $root   = $p{root}   // $DEFAULT_ROOT;
+
+    $bundle = abs_path($bundle);
+
+    # Check container doesn't already exist
+    if (-d state_dir($root, $id)) {
+        my $s = eval { load_state($root, $id) };
+        fatal("container '$id' already exists") if $s && $s->{status} ne 'stopped';
+        delete_state($root, $id) if $s;
+    }
+
+    my $spec = load_spec($bundle);
+    my $rootfs = $spec->{root}{path} // 'rootfs';
+    $rootfs = "$bundle/$rootfs" unless $rootfs =~ m{^/};
+    fatal("rootfs '$rootfs' does not exist") unless -d $rootfs;
+
+    my $cgpath = cgroup_path($spec, $id);
+
+    # Determine which namespaces to create vs join
+    my $namespaces = $spec->{linux}{namespaces} // [];
+    my $clone_flags = 0;
+    my @join_ns;
+    my $has_userns = 0;
+    my $has_pidns = 0;
+
+    for my $ns (@$namespaces) {
+        my $info = $NS_MAP{$ns->{type}} // next;
+        if ($ns->{path}) {
+            push @join_ns, { type => $ns->{type}, path => $ns->{path}, info => $info };
+        } else {
+            $clone_flags |= $info->{flag};
+        }
+        $has_userns = 1 if $ns->{type} eq 'user';
+        $has_pidns  = 1 if $ns->{type} eq 'pid';
+    }
+
+    # Create IPC channels
+    my ($main_r_fd, $main_w_fd, $main_r_fh, $main_w_fh) = create_channel();
+    my ($init_r_fd, $init_w_fd, $init_r_fh, $init_w_fh) = create_channel();
+
+    # Create notify socket directory
+    my $notify_dir = state_dir($root, $id);
+    ensure_dir($notify_dir);
+    my $notify_path = "$notify_dir/notify.sock";
+
+    # Fork: child will become the init process
+    my $child_pid = fork();
+    fatal("fork: $!") unless defined $child_pid;
+
+    if ($child_pid == 0) {
+        # === Child process (will become container init) ===
+        close $main_r_fh;  # Close parent's read end
+        close $init_w_fh;  # Close parent's write end
+
+        # Set death signal
+        do_syscall(SYS_prctl, PR_SET_PDEATHSIG, 9, 0, 0, 0);
+
+        # Join specified namespaces
+        for my $ns (@join_ns) {
+            my $ns_fd;
+            sysopen($ns_fd, $ns->{path}, O_RDONLY) or fatal("open ns $ns->{path}: $!");
+            do_syscall(SYS_setns, fileno($ns_fd), $ns->{info}{flag})
+                == 0 or fatal("setns $ns->{type}: $!");
+            close $ns_fd;
+        }
+
+        # Unshare namespaces (except PID — that's handled by fork below)
+        my $unshare_flags = $clone_flags & ~CLONE_NEWPID & ~CLONE_NEWCGROUP;
+        if ($has_userns) {
+            # Unshare user namespace first
+            do_syscall(SYS_unshare, CLONE_NEWUSER)
+                == 0 or fatal("unshare NEWUSER: $!");
+            $unshare_flags &= ~CLONE_NEWUSER;
+
+            # Signal parent to write UID/GID mappings
+            channel_send($main_w_fd, { type => 'write_mapping', pid => $$ });
+
+            # Wait for mapping done
+            my $resp = channel_recv($init_r_fd);
+            fatal("mapping failed") unless $resp && $resp->{type} eq 'mapping_done';
+        }
+
+        # Unshare remaining namespaces (not PID, not cgroup)
+        if ($unshare_flags) {
+            do_syscall(SYS_unshare, $unshare_flags)
+                == 0 or fatal("unshare: $!");
+        }
+
+        # Fork again for PID namespace (child becomes PID 1 in new PID ns)
+        if ($has_pidns) {
+            do_syscall(SYS_unshare, CLONE_NEWPID)
+                == 0 or fatal("unshare NEWPID: $!");
+        }
+
+        my $init_pid = fork();
+        fatal("fork for PID ns: $!") unless defined $init_pid;
+
+        if ($init_pid > 0) {
+            # Intermediate child: report init PID and exit
+            channel_send($main_w_fd, { type => 'init_pid', pid => $init_pid });
+            _exit(0);
+        }
+
+        # === Init process (PID 1 in new PID namespace) ===
+        setsid();
+
+        # Unshare cgroup namespace
+        if ($clone_flags & CLONE_NEWCGROUP) {
+            # Wait until parent has set up cgroups
+            my $msg = channel_recv($init_r_fd);
+            # Then unshare
+            do_syscall(SYS_unshare, CLONE_NEWCGROUP);
+        }
+
+        # Create notify listener
+        my $notify_srv = create_notify_listener($notify_path);
+
+        # Run the init process
+        run_init_process($spec, $rootfs, $notify_srv, $main_w_fd, $init_r_fd, $cgpath);
+        _exit(1);  # Should not reach here
+    }
+
+    # === Parent process ===
+    close $main_w_fh;  # Close child's write end
+    close $init_r_fh;  # Close child's read end
+
+    # Handle messages from child
+    my $init_pid;
+    my $mapping_written = 0;
+
+    while (1) {
+        my $msg = channel_recv($main_r_fd);
+        last unless $msg;
+
+        if ($msg->{type} eq 'write_mapping') {
+            # Child created user namespace, write mappings
+            write_id_mappings($msg->{pid}, $spec);
+            $mapping_written = 1;
+            channel_send($init_w_fd, { type => 'mapping_done' });
+        }
+        elsif ($msg->{type} eq 'init_pid') {
+            $init_pid = $msg->{pid};
+            # Tell init that cgroup is ready (for CLONE_NEWCGROUP)
+            if ($clone_flags & CLONE_NEWCGROUP) {
+                eval { cgroup_setup($cgpath, $spec); };
+                eval { cgroup_add_process($cgpath, $init_pid); };
+                eval { apply_device_cgroup($cgpath, $spec); };
+                channel_send($init_w_fd, { type => 'cgroup_done' });
+            }
+        }
+        elsif ($msg->{type} eq 'init_ready') {
+            last;
+        }
+    }
+
+    # Reap intermediate child
+    waitpid($child_pid, 0);
+
+    fatal("init process failed to start") unless $init_pid;
+
+    # If cgroup wasn't set up yet (no CLONE_NEWCGROUP path)
+    unless ($clone_flags & CLONE_NEWCGROUP) {
+        eval { cgroup_setup($cgpath, $spec); };
+        eval { cgroup_add_process($cgpath, $init_pid); };
+        eval { apply_device_cgroup($cgpath, $spec); };
+    }
+
+    # If no user namespace, write mappings now (for non-userns case they're not needed)
+    # (uid/gid mappings are only for user namespaces)
+
+    # Save state
+    my $start_time = get_pid_starttime($init_pid);
+    my $state = {
+        ociVersion   => $spec->{ociVersion} // '1.2.0',
+        id           => $id,
+        status       => 'created',
+        pid          => $init_pid,
+        pidStartTime => $start_time,
+        bundle       => $bundle,
+        annotations  => $spec->{annotations} // {},
+        created      => iso8601_now(),
+        cgroupPath   => $cgpath,
+    };
+    save_state($root, $state);
+
+    # Write pid file
+    if ($p{pid_file}) {
+        write_file($p{pid_file}, "$init_pid\n");
+    }
+
+    # Run createRuntime hooks
+    if (my $hooks = $spec->{hooks}) {
+        run_hooks($hooks->{createRuntime}, $state);
+        run_hooks($hooks->{prestart}, $state);
+    }
+
+    return $state;
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Container Lifecycle: start
+# ═══════════════════════════════════════════════════════════════════════
+
+sub cmd_start {
+    my (%p) = @_;
+    my $id   = $p{id}   // fatal("container id required");
+    my $root = $p{root} // $DEFAULT_ROOT;
+
+    my $state = load_state($root, $id);
+    fatal("container '$id' is not in 'created' state (is '$state->{status}')")
+        unless $state->{status} eq 'created';
+
+    # Connect to notify socket
+    my $notify_path = state_dir($root, $id) . '/notify.sock';
+    notify_container_start($notify_path);
+
+    # Update state to running
+    $state->{status} = 'running';
+    save_state($root, $state);
+
+    # Run poststart hooks
+    my $spec = eval { load_spec($state->{bundle}) };
+    if ($spec && $spec->{hooks}) {
+        run_hooks($spec->{hooks}{poststart}, $state);
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Container Lifecycle: state
+# ═══════════════════════════════════════════════════════════════════════
+
+sub cmd_state {
+    my (%p) = @_;
+    my $id   = $p{id}   // fatal("container id required");
+    my $root = $p{root} // $DEFAULT_ROOT;
+
+    my $state = load_state($root, $id);
+    print $JSON->encode(oci_state_json($state));
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Container Lifecycle: kill
+# ═══════════════════════════════════════════════════════════════════════
+
+sub cmd_kill {
+    my (%p) = @_;
+    my $id     = $p{id}     // fatal("container id required");
+    my $root   = $p{root}   // $DEFAULT_ROOT;
+    my $signal = $p{signal} // 'TERM';
+    my $all    = $p{all}    // 0;
+
+    my $state = load_state($root, $id);
+    fatal("container '$id' is not running or created (is '$state->{status}')")
+        unless $state->{status} eq 'running' || $state->{status} eq 'created';
+
+    # Parse signal
+    my $signum;
+    if ($signal =~ /^\d+$/) {
+        $signum = $signal;
+    } else {
+        $signal =~ s/^SIG//i;
+        $signum = $SIG_NUM{uc($signal)} // fatal("unknown signal: $signal");
+    }
+
+    if ($all && $state->{cgroupPath}) {
+        # Kill all processes in cgroup
+        my @pids = cgroup_pids($state->{cgroupPath});
+        for my $pid (@pids) {
+            kill $signum, $pid;
+        }
+    } else {
+        kill $signum, $state->{pid} or fatal("kill $state->{pid}: $!");
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Container Lifecycle: delete
+# ═══════════════════════════════════════════════════════════════════════
+
+sub cmd_delete {
+    my (%p) = @_;
+    my $id    = $p{id}    // fatal("container id required");
+    my $root  = $p{root}  // $DEFAULT_ROOT;
+    my $force = $p{force} // 0;
+
+    my $state = load_state($root, $id);
+
+    if ($state->{status} eq 'running' || $state->{status} eq 'created') {
+        if ($force) {
+            # Force kill
+            if ($state->{pid} > 0) {
+                kill 9, $state->{pid};
+                # Wait a bit
+                select(undef, undef, undef, 0.1);
+            }
+            if ($state->{cgroupPath}) {
+                cgroup_cleanup($state->{cgroupPath});
+            }
+        } else {
+            fatal("container '$id' is not stopped (is '$state->{status}'). Use --force to force delete.");
+        }
+    }
+
+    # Cleanup cgroup
+    if ($state->{cgroupPath} && -d $state->{cgroupPath}) {
+        cgroup_cleanup($state->{cgroupPath});
+    }
+
+    # Run poststop hooks
+    my $spec = eval { load_spec($state->{bundle}) };
+    if ($spec && $spec->{hooks}) {
+        run_hooks($spec->{hooks}{poststop}, $state);
+    }
+
+    # Remove state
+    delete_state($root, $id);
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Container Lifecycle: run (create + start + wait + delete)
+# ═══════════════════════════════════════════════════════════════════════
+
+sub cmd_run {
+    my (%p) = @_;
+    my $id     = $p{id}     // fatal("container id required");
+    my $root   = $p{root}   // $DEFAULT_ROOT;
+    my $bundle = $p{bundle} // getcwd();
+
+    # Set as subreaper so we can wait for the init process
+    do_syscall(SYS_prctl, PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
+
+    # Create
+    my $state = cmd_create(%p);
+
+    # Start
+    cmd_start(id => $id, root => $root);
+
+    # Forward signals to init
+    my $init_pid = $state->{pid};
+    for my $sig (qw(TERM INT HUP QUIT USR1 USR2)) {
+        $SIG{$sig} = sub { kill $SIG_NUM{$sig}, $init_pid; };
+    }
+
+    # Wait for init process to exit
+    my $exit_code = 0;
+    while (1) {
+        my $w = waitpid($init_pid, 0);
+        if ($w == $init_pid) {
+            if (WIFEXITED($?)) {
+                $exit_code = WEXITSTATUS($?);
+            } elsif (WIFSIGNALED($?)) {
+                $exit_code = 128 + WTERMSIG($?);
+            }
+            last;
+        }
+        last if $w < 0 && $! != EINTR;
+        # Reap other children (intermediate processes)
+        waitpid(-1, WNOHANG) while waitpid(-1, WNOHANG) > 0;
+    }
+
+    # Delete
+    eval { cmd_delete(id => $id, root => $root, force => 1); };
+
+    exit($exit_code);
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Container: list
+# ═══════════════════════════════════════════════════════════════════════
+
+sub cmd_list {
+    my (%p) = @_;
+    my $root   = $p{root}   // $DEFAULT_ROOT;
+    my $format = $p{format} // 'table';
+    my $quiet  = $p{quiet}  // 0;
+
+    my @containers;
+    if (opendir(my $dh, $root)) {
+        while (my $id = readdir($dh)) {
+            next if $id =~ /^\./;
+            my $st = eval { load_state($root, $id) };
+            next unless $st;
+            push @containers, $st;
+        }
+        closedir($dh);
+    }
+
+    if ($quiet) {
+        print "$_->{id}\n" for @containers;
+        return;
+    }
+
+    if ($format eq 'json') {
+        print $JSON->encode([map { oci_state_json($_) } @containers]);
+        return;
+    }
+
+    # Table format
+    printf "%-20s %-10s %-10s %-10s %s\n", 'ID', 'PID', 'STATUS', 'CREATED', 'BUNDLE';
+    for my $c (sort { $a->{id} cmp $b->{id} } @containers) {
+        printf "%-20s %-10s %-10s %-10s %s\n",
+            $c->{id}, $c->{pid}, $c->{status},
+            substr($c->{created} // '', 0, 10),
+            $c->{bundle} // '';
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Container: pause / resume
+# ═══════════════════════════════════════════════════════════════════════
+
+sub cmd_pause {
+    my (%p) = @_;
+    my $id   = $p{id}   // fatal("container id required");
+    my $root = $p{root} // $DEFAULT_ROOT;
+
+    my $state = load_state($root, $id);
+    fatal("container '$id' is not running") unless $state->{status} eq 'running';
+
+    cg_write($state->{cgroupPath}, 'cgroup.freeze', '1');
+    $state->{status} = 'paused';
+    save_state($root, $state);
+}
+
+sub cmd_resume {
+    my (%p) = @_;
+    my $id   = $p{id}   // fatal("container id required");
+    my $root = $p{root} // $DEFAULT_ROOT;
+
+    my $state = load_state($root, $id);
+    fatal("container '$id' is not paused") unless $state->{status} eq 'paused';
+
+    cg_write($state->{cgroupPath}, 'cgroup.freeze', '0');
+    $state->{status} = 'running';
+    save_state($root, $state);
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Container: exec
+# ═══════════════════════════════════════════════════════════════════════
+
+sub cmd_exec {
+    my (%p) = @_;
+    my $id         = $p{id}         // fatal("container id required");
+    my $root       = $p{root}       // $DEFAULT_ROOT;
+    my @cmd        = @{$p{command}  // fatal("command required")};
+    my $exec_cwd   = $p{cwd};
+    my $exec_env   = $p{env};
+    my $exec_user  = $p{user};
+
+    my $state = load_state($root, $id);
+    fatal("container '$id' is not running")
+        unless $state->{status} eq 'running';
+
+    my $init_pid = $state->{pid};
+    my $spec = load_spec($state->{bundle});
+
+    # Open namespace fds
+    my @ns_order = qw(user mnt uts ipc net pid cgroup);
+    my @ns_fds;
+    for my $ns (@ns_order) {
+        my $path = "/proc/$init_pid/ns/$ns";
+        if (sysopen(my $fd, $path, O_RDONLY)) {
+            push @ns_fds, { name => $ns, fd => $fd, fileno => fileno($fd) };
+        }
+    }
+
+    my $child = fork();
+    fatal("fork for exec: $!") unless defined $child;
+
+    if ($child == 0) {
+        # Join namespaces
+        for my $ns (@ns_fds) {
+            my $flag = 0;  # setns auto-detects from fd
+            do_syscall(SYS_setns, $ns->{fileno}, 0)
+                == 0 or warn "nacre: setns $ns->{name}: $!\n";
+        }
+
+        # chdir
+        chdir($exec_cwd // $spec->{process}{cwd} // '/');
+
+        # Set environment
+        if ($exec_env) {
+            for my $e (@$exec_env) {
+                my ($k, $v) = split /=/, $e, 2;
+                $ENV{$k} = $v;
+            }
+        }
+
+        # Set user
+        if ($exec_user) {
+            if ($exec_user =~ /^(\d+)(?::(\d+))?$/) {
+                POSIX::setgid($2) if defined $2;
+                POSIX::setuid($1);
+            }
+        }
+
+        exec { $cmd[0] } @cmd;
+        _exit(1);
+    }
+
+    # Close namespace fds in parent
+    for my $ns (@ns_fds) { close $ns->{fd}; }
+
+    # Wait for exec'd process
+    waitpid($child, 0);
+    if (WIFEXITED($?)) {
+        exit(WEXITSTATUS($?));
+    } elsif (WIFSIGNALED($?)) {
+        exit(128 + WTERMSIG($?));
+    }
+    exit(1);
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Container: update (resource limits)
+# ═══════════════════════════════════════════════════════════════════════
+
+sub cmd_update {
+    my (%p) = @_;
+    my $id       = $p{id}        // fatal("container id required");
+    my $root     = $p{root}      // $DEFAULT_ROOT;
+    my $res_file = $p{resources};
+
+    my $state = load_state($root, $id);
+    fatal("container '$id' is not running or created or paused")
+        unless $state->{status} =~ /^(running|created|paused)$/;
+
+    my $cgpath = $state->{cgroupPath}
+        // fatal("no cgroup path for container");
+
+    # Load resources from file or stdin
+    my $res_json;
+    if ($res_file && $res_file ne '-') {
+        $res_json = read_file_or_die($res_file);
+    } else {
+        local $/;
+        $res_json = <STDIN>;
+    }
+    my $resources = $JSON->decode($res_json);
+
+    # Build a fake spec with just the resources
+    my $fake_spec = { linux => { resources => $resources } };
+    cgroup_apply_resources($cgpath, $fake_spec);
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Container: events (stats)
+# ═══════════════════════════════════════════════════════════════════════
+
+sub cmd_events {
+    my (%p) = @_;
+    my $id       = $p{id}       // fatal("container id required");
+    my $root     = $p{root}     // $DEFAULT_ROOT;
+    my $interval = $p{interval} // 5;
+    my $stats    = $p{stats};
+
+    my $state = load_state($root, $id);
+    my $cgpath = $state->{cgroupPath} // fatal("no cgroup path");
+
+    my $print_stats = sub {
+        my %s;
+        $s{pids}{current} = scalar(cgroup_pids($cgpath));
+        $s{pids}{limit}   = read_file("$cgpath/pids.max") // 'max';
+        chomp $s{pids}{limit} if $s{pids}{limit};
+
+        my $mem_current = read_file("$cgpath/memory.current");
+        $s{memory}{usage} = int($mem_current // 0);
+        my $mem_max = read_file("$cgpath/memory.max");
+        $s{memory}{limit} = $mem_max ? int($mem_max) : 0;
+
+        my $cpu_stat = read_file("$cgpath/cpu.stat") // '';
+        for my $line (split /\n/, $cpu_stat) {
+            my ($k, $v) = split /\s+/, $line;
+            $s{cpu}{$k} = int($v) if defined $v;
+        }
+
+        # OOM events
+        my $events = read_file("$cgpath/memory.events") // '';
+        for my $line (split /\n/, $events) {
+            my ($k, $v) = split /\s+/, $line;
+            $s{memory}{$k} = int($v) if defined $v;
+        }
+
+        print $JSON_COMPACT->encode({ type => 'stats', id => $id, data => \%s }), "\n";
+    };
+
+    if ($stats) {
+        $print_stats->();
+        return;
+    }
+
+    while (1) {
+        $print_stats->();
+        sleep $interval;
+        # Refresh state to check if still alive
+        $state = eval { load_state($root, $id) };
+        last unless $state;
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Container: ps
+# ═══════════════════════════════════════════════════════════════════════
+
+sub cmd_ps {
+    my (%p) = @_;
+    my $id       = $p{id}      // fatal("container id required");
+    my $root     = $p{root}    // $DEFAULT_ROOT;
+    my $format   = $p{format}  // 'table';
+    my @ps_args  = @{$p{ps_args} // ['-ef']};
+
+    my $state = load_state($root, $id);
+    my $cgpath = $state->{cgroupPath} // fatal("no cgroup path");
+
+    my @pids = cgroup_pids($cgpath);
+
+    if ($format eq 'json') {
+        print $JSON->encode(\@pids);
+        return;
+    }
+
+    # Run ps and filter to only our PIDs
+    my %our_pids = map { $_ => 1 } @pids;
+    open my $ps, '-|', 'ps', @ps_args or fatal("ps: $!");
+    my $header = <$ps>;
+    print $header if $header;
+    while (<$ps>) {
+        # Find PID in the line
+        if (/^\s*\S+\s+(\d+)/ || /^\s*(\d+)/) {
+            print if $our_pids{$1};
+        }
+    }
+    close $ps;
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Container: spec (generate default config.json)
+# ═══════════════════════════════════════════════════════════════════════
+
+sub cmd_spec {
+    my (%p) = @_;
+    my $bundle = $p{bundle} // '.';
+    my $path = "$bundle/config.json";
+
+    if (-e $path && !$p{force}) {
+        fatal("$path already exists. Use --force to overwrite.");
+    }
+
+    write_file($path, $JSON->encode(default_spec()));
+    print "Generated $path\n" unless $p{quiet};
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Container: features
+# ═══════════════════════════════════════════════════════════════════════
+
+sub cmd_features {
+    my $features = {
+        ociVersionMin => '1.0.0',
+        ociVersionMax => '1.2.0',
+        hooks => [qw(prestart createRuntime createContainer startContainer poststart poststop)],
+        mountOptions => [sort keys %MOUNT_FLAGS],
+        linux => {
+            namespaces => [sort keys %NS_MAP],
+            capabilities => [@CAP_NAMES],
+            cgroup => {
+                v2 => JSON::PP::true,
+            },
+            seccomp => {
+                enabled => JSON::PP::true,
+                actions => [qw(SCMP_ACT_KILL SCMP_ACT_KILL_PROCESS SCMP_ACT_TRAP
+                              SCMP_ACT_ERRNO SCMP_ACT_LOG SCMP_ACT_ALLOW)],
+                operators => [qw(SCMP_CMP_NE SCMP_CMP_LT SCMP_CMP_LE
+                                SCMP_CMP_EQ SCMP_CMP_GE SCMP_CMP_GT
+                                SCMP_CMP_MASKED_EQ)],
+            },
+            apparmor => { enabled => JSON::PP::false },
+            selinux  => { enabled => JSON::PP::false },
+        },
+        annotations => {
+            'org.opencontainers.runtime.nacre' => 'Perl OCI runtime',
+        },
+    };
+    print $JSON->encode($features);
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# CLI Argument Parsing and Dispatch
+# ═══════════════════════════════════════════════════════════════════════
+
+sub main {
+    my $root = $DEFAULT_ROOT;
+    my $log_level = 'warn';
+    my $log_format = 'text';
+    my $debug = 0;
+    my $systemd_cgroup = 0;
+
+    # Parse global options (before command)
+    Getopt::Long::Configure('pass_through', 'no_auto_abbrev');
+    GetOptions(
+        'root=s'           => \$root,
+        'log=s'            => \my $log_file,
+        'log-format=s'     => \$log_format,
+        'debug'            => \$debug,
+        'systemd-cgroup'   => \$systemd_cgroup,
+    );
+
+    my $command = shift @ARGV // usage();
+
+    if ($command eq 'create') {
+        my ($bundle, $pid_file, $console_socket, $no_pivot);
+        GetOptions(
+            'bundle|b=s'         => \$bundle,
+            'pid-file=s'         => \$pid_file,
+            'console-socket=s'   => \$console_socket,
+            'no-pivot'           => \$no_pivot,
+        );
+        my $id = shift @ARGV // fatal("container id required");
+        cmd_create(id => $id, bundle => $bundle, root => $root, pid_file => $pid_file);
+    }
+    elsif ($command eq 'start') {
+        my $id = shift @ARGV // fatal("container id required");
+        cmd_start(id => $id, root => $root);
+    }
+    elsif ($command eq 'state') {
+        my $id = shift @ARGV // fatal("container id required");
+        cmd_state(id => $id, root => $root);
+    }
+    elsif ($command eq 'kill') {
+        my $all = 0;
+        GetOptions('all' => \$all);
+        my $id = shift @ARGV // fatal("container id required");
+        my $signal = shift @ARGV // 'TERM';
+        cmd_kill(id => $id, root => $root, signal => $signal, all => $all);
+    }
+    elsif ($command eq 'delete') {
+        my $force = 0;
+        GetOptions('force|f' => \$force);
+        my $id = shift @ARGV // fatal("container id required");
+        cmd_delete(id => $id, root => $root, force => $force);
+    }
+    elsif ($command eq 'run') {
+        my ($bundle, $pid_file, $console_socket, $no_pivot, $detach);
+        GetOptions(
+            'bundle|b=s'         => \$bundle,
+            'pid-file=s'         => \$pid_file,
+            'console-socket=s'   => \$console_socket,
+            'no-pivot'           => \$no_pivot,
+            'detach|d'           => \$detach,
+        );
+        my $id = shift @ARGV // fatal("container id required");
+        cmd_run(id => $id, bundle => $bundle, root => $root, pid_file => $pid_file);
+    }
+    elsif ($command eq 'list') {
+        my ($format, $quiet);
+        GetOptions(
+            'format|f=s' => \$format,
+            'quiet|q'    => \$quiet,
+        );
+        cmd_list(root => $root, format => $format, quiet => $quiet);
+    }
+    elsif ($command eq 'pause') {
+        my $id = shift @ARGV // fatal("container id required");
+        cmd_pause(id => $id, root => $root);
+    }
+    elsif ($command eq 'resume') {
+        my $id = shift @ARGV // fatal("container id required");
+        cmd_resume(id => $id, root => $root);
+    }
+    elsif ($command eq 'exec') {
+        my ($exec_cwd, @exec_env, $exec_user, $detach, $pid_file,
+            $console_socket, $tty, $process_file);
+        # Separate exec args: everything after "--" or after container id
+        my @before;
+        my @exec_cmd;
+        my $found_sep = 0;
+        for my $arg (@ARGV) {
+            if ($arg eq '--' && !$found_sep) {
+                $found_sep = 1;
+                next;
+            }
+            if ($found_sep) {
+                push @exec_cmd, $arg;
+            } else {
+                push @before, $arg;
+            }
+        }
+        @ARGV = @before;
+        GetOptions(
+            'cwd=s'             => \$exec_cwd,
+            'env|e=s'           => \@exec_env,
+            'user|u=s'          => \$exec_user,
+            'detach|d'          => \$detach,
+            'pid-file=s'        => \$pid_file,
+            'console-socket=s'  => \$console_socket,
+            'tty|t'             => \$tty,
+            'process|p=s'       => \$process_file,
+        );
+        my $id = shift @ARGV // fatal("container id required");
+        @exec_cmd = @ARGV unless @exec_cmd;
+        fatal("command required for exec") unless @exec_cmd;
+        cmd_exec(id => $id, root => $root, command => \@exec_cmd,
+                 cwd => $exec_cwd, env => \@exec_env, user => $exec_user);
+    }
+    elsif ($command eq 'update') {
+        my $resources;
+        GetOptions('resources|r=s' => \$resources);
+        my $id = shift @ARGV // fatal("container id required");
+        cmd_update(id => $id, root => $root, resources => $resources);
+    }
+    elsif ($command eq 'events') {
+        my ($interval, $stats);
+        GetOptions(
+            'interval|i=i' => \$interval,
+            'stats'        => \$stats,
+        );
+        my $id = shift @ARGV // fatal("container id required");
+        cmd_events(id => $id, root => $root, interval => $interval, stats => $stats);
+    }
+    elsif ($command eq 'ps') {
+        my $format;
+        GetOptions('format|f=s' => \$format);
+        my $id = shift @ARGV // fatal("container id required");
+        cmd_ps(id => $id, root => $root, format => $format, ps_args => \@ARGV);
+    }
+    elsif ($command eq 'spec') {
+        my ($bundle, $force);
+        GetOptions(
+            'bundle|b=s' => \$bundle,
+            'force'      => \$force,
+        );
+        cmd_spec(bundle => $bundle, force => $force);
+    }
+    elsif ($command eq 'features') {
+        cmd_features();
+    }
+    elsif ($command eq '--help' || $command eq '-h' || $command eq 'help') {
+        usage();
+    }
+    elsif ($command eq '--version' || $command eq '-v') {
+        print "nacre version 0.1.0\n";
+        print "spec: 1.2.0\n";
+    }
+    else {
+        fatal("unknown command: $command");
+    }
+}
+
+sub usage {
+    print <<'USAGE';
+nacre - a Linux OCI container runtime written in Perl
+
+USAGE:
+    nacre [global options] <command> [command options] [arguments...]
+
+GLOBAL OPTIONS:
+    --root <path>       root directory for state (default: /run/nacre)
+    --log <path>        log file path
+    --log-format <fmt>  log format (text or json)
+    --debug             enable debug logging
+
+COMMANDS:
+    create      Create a container
+    start       Start a created container
+    run         Create and run a container
+    state       Query container state
+    kill        Send a signal to a container
+    delete      Delete a container
+    list        List containers
+    exec        Execute a command in a container
+    pause       Pause a container
+    resume      Resume a paused container
+    update      Update container resources
+    events      Display container events/stats
+    ps          List processes in a container
+    spec        Generate a default OCI spec
+    features    Display runtime features
+USAGE
+    exit(0);
+}
+
+# Run
+main();
