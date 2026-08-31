@@ -16,11 +16,9 @@
 #   nacre:pidfd   --pidfd-socket not implemented
 #   nacre:idmap   idmap mounts not implemented
 #   nacre:netdev  network device move not implemented
-#   nacre:affin   CPU affinity not implemented
-#   nacre:keyring session keyring not implemented
 #   nacre:notify  seccomp SCMP_ACT_NOTIFY listener not implemented
-#   nacre:timens  time namespace offsets not implemented
-#   nacre:exec    exec feature gap (missing --cap/tty/userns)
+#   nacre:exec    exec feature gap (missing tty/userns)
+#   nacre:cgroup  cgroup feature gap
 #   nacre:cgroup  cgroup feature gap
 
 # --- spec ---
@@ -188,8 +186,8 @@ runc run [host mount ns + hooks]
 [skip]runc run (no selinux label) # selinux
 
 # --- run (session keyring) ---
-[skip]runc run (session keyring security label) # nacre:keyring
-[skip]runc run (session keyring security label + userns) # nacre:keyring
+runc run (session keyring security label)
+runc run (session keyring security label + userns)
 
 # --- run (tty) ---
 runc run [tty owner]
@@ -198,10 +196,10 @@ runc run [tty ptsname]
 
 # --- run (userns / idmap) ---
 runc run [joining existing container namespaces]
-[skip]runc run [simple timens] # nacre:timens
-[skip]runc run [simple timens + userns] # nacre:timens
-[skip]runc run [timens offsets with no timens] # nacre:timens
-[skip]runc run [timens with no offsets] # nacre:timens
+runc run [simple timens]
+runc run [simple timens + userns]
+runc run [timens offsets with no timens]
+runc run [timens with no offsets]
 
 # --- run (rlimits) ---
 runc run with RLIMIT_NOFILE(Bigger than system's hard value)
@@ -209,8 +207,8 @@ runc run with RLIMIT_NOFILE(Smaller than system's hard value)
 runc run with RLIMIT_NOFILE(The same as system's hard value)
 
 # --- run (cpu affinity) ---
-[skip]runc run [CPU affinity should reset to cgroup cpuset] # nacre:affin
-[skip]runc run [CPU affinity should reset] # nacre:affin
+runc run [CPU affinity should reset to cgroup cpuset]
+runc run [CPU affinity should reset]
 
 # --- run (personality) ---
 [skip]runc run personality for i686 # arch
@@ -273,8 +271,8 @@ runc exec --user
 runc exec --user vs /dev/null ownership
 runc exec --user with no access to cwd
 runc exec --additional-gids
-[skip]runc exec --cap # nacre:exec
-[skip]runc exec --cap [ambient is set from spec] # nacre:exec
+runc exec --cap
+runc exec --cap [ambient is set from spec]
 runc exec --preserve-fds
 runc exec --ignore-paused
 runc exec --pid-file
@@ -293,21 +291,21 @@ runc exec with RLIMIT_NOFILE(The same as system's hard value)
 [skip]runc exec (cgroup v2, rw cgroupfs, inherit cgroupns) does not chown cgroup # nacre:cgroup
 [skip]runc exec (cgroup v2, rw cgroupfs, new cgroupns) does chown cgroup # nacre:cgroup
 [skip]runc exec (limits + cgrouppath + permission on the cgroup dir) succeeds # systemd
-[skip]runc exec (session keyring security label) # nacre:keyring
-[skip]runc exec (session keyring security label + userns) # nacre:keyring
+runc exec (session keyring security label)
+runc exec (session keyring security label + userns)
 [skip]runc exec [seccomp] (SCMP_ACT_NOTIFY noNewPrivileges false) # nacre:notify
 [skip]runc exec [seccomp] (SCMP_ACT_NOTIFY noNewPrivileges true) # nacre:notify
-[skip]runc exec [simple timens] # nacre:timens
+runc exec [simple timens]
 [skip]runc exec [tty consolesize] # nacre:exec
 [skip]runc exec [tty owner] # nacre:exec
 [skip]runc exec [tty owner] ({u,g}id != 0) # nacre:exec
 [skip]runc exec [tty ptsname] # nacre:exec
 [skip]runc exec [init changes cgroup] # nacre:cgroup
-[skip]runc exec [CPU affinity, initial and final set from config.json] # nacre:affin
-[skip]runc exec [CPU affinity, initial and final set from process.json] # nacre:affin
-[skip]runc exec [CPU affinity, only initial set from process.json] # nacre:affin
-[skip]runc exec [default CPU affinity should reset to cgroup cpuset] # nacre:affin
-[skip]runc exec [default CPU affinity should reset] # nacre:affin
+runc exec [CPU affinity, initial and final set from config.json]
+runc exec [CPU affinity, initial and final set from process.json]
+runc exec [CPU affinity, only initial set from process.json]
+runc exec [default CPU affinity should reset to cgroup cpuset]
+runc exec [default CPU affinity should reset]
 [skip]runc exec --cgroup sub-cgroups [v1] # cgroups_v1
 [skip]runc exec --cgroup subcgroup [v2] # nacre:cgroup
 [skip]runc exec [ --pidfd-socket ] [cgroups_v1]  # cgroups_v1

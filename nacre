@@ -2262,6 +2262,221 @@ sub apply_memory_policy {
 }
 
 # ═══════════════════════════════════════════════════════════════════════
+# Time Namespace Offsets
+# ═══════════════════════════════════════════════════════════════════════
+
+sub apply_timens_offsets {
+    my ($spec) = @_;
+    my $offsets = $spec->{linux}{timeOffsets} // return;
+
+    my $path = '/proc/self/timens_offsets';
+    open(my $fh, '>', $path)
+        or fatal("open $path: $!");
+
+    for my $clock (qw(monotonic boottime)) {
+        my $entry = $offsets->{$clock} // next;
+        my $secs  = $entry->{secs}     // 0;
+        my $nsecs = $entry->{nanosecs} // 0;
+        print $fh "$clock $secs $nsecs\n";
+    }
+    close $fh;
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# CPU Affinity
+# ═══════════════════════════════════════════════════════════════════════
+
+sub parse_cpu_list {
+    # Parse a CPU list string like "0", "0-3", "0,2,4-7" into a list of
+    # individual CPU numbers.
+    my ($str) = @_;
+    my @cpus;
+    for my $part (split /,/, $str) {
+        if ($part =~ /^(\d+)-(\d+)$/) {
+            push @cpus, $1 .. $2;
+        } elsif ($part =~ /^(\d+)$/) {
+            push @cpus, $1;
+        }
+    }
+    return @cpus;
+}
+
+sub cpu_list_to_mask {
+    # Convert a list of CPU numbers to a bitmask for sched_setaffinity.
+    # Returns ($mask_bytes, $mask_len).  The mask is a packed byte string
+    # suitable for the syscall.
+    my @cpus = @_;
+    return ('', 0) unless @cpus;
+    my $max = 0;
+    for my $c (@cpus) { $max = $c if $c > $max; }
+    # Kernel expects mask size in bytes, aligned to sizeof(unsigned long)=8
+    my $longs = int(($max + 64) / 64);
+    my @mask = (0) x $longs;
+    for my $c (@cpus) {
+        my $idx = int($c / 64);
+        $mask[$idx] |= (1 << ($c % 64));
+    }
+    return (pack('Q*', @mask), $longs * 8);
+}
+
+sub get_available_cpus {
+    # Read the set of online CPUs from /sys/devices/system/cpu/online.
+    my $online = '';
+    if (open my $fh, '<', '/sys/devices/system/cpu/online') {
+        $online = <$fh>;
+        chomp $online;
+        close $fh;
+    }
+    return parse_cpu_list($online);
+}
+
+sub apply_cpu_affinity_reset {
+    # Reset CPU affinity to the full available set (cgroup cpuset or system).
+    # This undoes any taskset/affinity constraint inherited from the parent.
+    my ($spec) = @_;
+
+    # Determine cpuset from cgroup config or fall back to system online CPUs
+    my $cpus_str = '';
+    if (my $cpu = $spec->{linux}{resources}{cpu}) {
+        $cpus_str = $cpu->{cpus} // '';
+    }
+
+    my @cpus;
+    if ($cpus_str ne '') {
+        @cpus = parse_cpu_list($cpus_str);
+    } else {
+        @cpus = get_available_cpus();
+    }
+    return unless @cpus;
+
+    my ($mask, $len) = cpu_list_to_mask(@cpus);
+    my $nr  = SYS_sched_setaffinity + 0;
+    my $pid = 0 + 0;  # 0 = current process
+    my $l   = $len + 0;
+    syscall($nr, $pid, $l, $mask);
+}
+
+sub apply_exec_cpu_affinity {
+    # Apply execCPUAffinity from config/process for exec.
+    # Sets initial affinity before exec and returns final affinity to set
+    # right before exec (or undef if no final).
+    my ($affinity, $dbg) = @_;
+    return unless $affinity;
+
+    if (my $initial = $affinity->{initial}) {
+        my @cpus = parse_cpu_list($initial);
+        if (@cpus) {
+            my ($mask, $len) = cpu_list_to_mask(@cpus);
+            my $nr  = SYS_sched_setaffinity + 0;
+            my $pid = 0 + 0;
+            my $l   = $len + 0;
+            syscall($nr, $pid, $l, $mask);
+            # Log in nsexec-compatible format for bats tests
+            my $hex_mask = 0;
+            for my $c (@cpus) { $hex_mask |= (1 << $c); }
+            $dbg->(sprintf("nsexec container setup: affinity: 0x%x", $hex_mask)) if $dbg;
+        }
+    }
+
+    # Return final affinity info for post-setns application
+    if (my $final = $affinity->{final}) {
+        return $final;
+    }
+    return;
+}
+
+sub apply_final_cpu_affinity {
+    my ($final_str) = @_;
+    return unless $final_str;
+    my @cpus = parse_cpu_list($final_str);
+    return unless @cpus;
+    my ($mask, $len) = cpu_list_to_mask(@cpus);
+    my $nr  = SYS_sched_setaffinity + 0;
+    my $pid = 0 + 0;
+    my $l   = $len + 0;
+    syscall($nr, $pid, $l, $mask);
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Exec Capabilities (--cap flag)
+# ═══════════════════════════════════════════════════════════════════════
+
+sub apply_exec_caps {
+    # Apply capabilities added via `runc exec --cap CAP_FOO --cap CAP_BAR`.
+    # runc semantics: --cap adds to bounding+permitted+effective.
+    # If the container's spec has inheritable caps, also add to ambient.
+    my ($cap_list, $spec) = @_;
+    return unless $cap_list && @$cap_list;
+
+    my $spec_caps = $spec->{process}{capabilities} // {};
+    my $has_inheritable = $spec_caps->{inheritable} && @{$spec_caps->{inheritable}};
+
+    # Build the full capability sets from spec + additions
+    my %bnd_caps  = map { $_ => 1 } @{$spec_caps->{bounding}   // []};
+    my %prm_caps  = map { $_ => 1 } @{$spec_caps->{permitted}  // []};
+    my %eff_caps  = map { $_ => 1 } @{$spec_caps->{effective}  // []};
+    my %inh_caps  = map { $_ => 1 } @{$spec_caps->{inheritable}// []};
+    my %amb_caps  = map { $_ => 1 } @{$spec_caps->{ambient}    // []};
+
+    for my $cap (@$cap_list) {
+        my $name = $cap;
+        $name = "CAP_$name" unless $name =~ /^CAP_/;
+        $name = uc($name);
+        fatal("unknown capability: $name") unless exists $CAP_NUM{$name};
+        $bnd_caps{$name} = 1;
+        $prm_caps{$name} = 1;
+        $eff_caps{$name} = 1;
+        if ($has_inheritable) {
+            $amb_caps{$name} = 1;
+        }
+    }
+
+    # Drop bounding set caps not in the desired set
+    for my $name (@CAP_NAMES) {
+        next if $bnd_caps{$name};
+        my $num = $CAP_NUM{$name} // next;
+        do_syscall(SYS_prctl, PR_CAPBSET_DROP, $num, 0, 0, 0);
+    }
+
+    # Set KEEPCAPS across setuid
+    do_syscall(SYS_prctl, PR_SET_KEEPCAPS, 1, 0, 0, 0);
+
+    # Build capset data
+    my ($eff_lo, $eff_hi) = (0, 0);
+    my ($prm_lo, $prm_hi) = (0, 0);
+    my ($inh_lo, $inh_hi) = (0, 0);
+
+    for my $name (keys %eff_caps) {
+        my $n = $CAP_NUM{$name} // next;
+        if ($n < 32) { $eff_lo |= (1 << $n); } else { $eff_hi |= (1 << ($n - 32)); }
+    }
+    for my $name (keys %prm_caps) {
+        my $n = $CAP_NUM{$name} // next;
+        if ($n < 32) { $prm_lo |= (1 << $n); } else { $prm_hi |= (1 << ($n - 32)); }
+    }
+    for my $name (keys %inh_caps) {
+        my $n = $CAP_NUM{$name} // next;
+        if ($n < 32) { $inh_lo |= (1 << $n); } else { $inh_hi |= (1 << ($n - 32)); }
+    }
+
+    my $hdr = pack('Ii', _LINUX_CAPABILITY_VERSION_3, 0);
+    my $data = pack('III III',
+        $eff_lo, $prm_lo, $inh_lo,
+        $eff_hi, $prm_hi, $inh_hi);
+    my $nr_capset = SYS_capset + 0;
+    syscall($nr_capset, $hdr, $data);
+
+    # Clear keepcaps
+    do_syscall(SYS_prctl, PR_SET_KEEPCAPS, 0, 0, 0, 0);
+
+    # Raise ambient capabilities
+    for my $name (keys %amb_caps) {
+        my $n = $CAP_NUM{$name} // next;
+        do_syscall(SYS_prctl, PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, $n, 0, 0);
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
 # Sysctls
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -2449,6 +2664,9 @@ sub run_init_process {
 
     # Apply memory policy
     apply_memory_policy($spec);
+
+    # Reset CPU affinity to available set (undoes any taskset constraint)
+    apply_cpu_affinity_reset($spec);
 
     # Set environment
     %ENV = ();
@@ -2640,6 +2858,16 @@ sub cmd_create {
     validate_rlimits($spec);
     validate_memory_policy($spec);
 
+    # Validate: timeOffsets require a time namespace
+    if (my $to = $spec->{linux}{timeOffsets}) {
+        if (ref $to eq 'HASH' && keys %$to) {
+            my $has_timens = grep { ($_->{type} // '') eq 'time' }
+                             @{$spec->{linux}{namespaces} // []};
+            fatal("time offsets require a time namespace")
+                unless $has_timens;
+        }
+    }
+
     # Snapshot config.json — OCI spec: "Any updates to config.json
     # after this step MUST NOT affect the container."
     cache_spec($root, $id, $spec);
@@ -2740,6 +2968,13 @@ sub cmd_create {
             my $ret;
             do { $ret = syscall($nr, $flg) } while ($ret == -1 && $! == EINTR);
             $ret == 0 or fatal(sprintf("unshare(0x%x): $!", $unshare_flags));
+        }
+
+        # Write time namespace offsets (must happen after unshare that
+        # includes CLONE_NEWTIME, before fork that creates children in
+        # the new time namespace).
+        if ($clone_flags & CLONE_NEWTIME) {
+            apply_timens_offsets($spec);
         }
 
         # Fork again for PID namespace (child becomes PID 1 in new PID ns).
@@ -3460,6 +3695,21 @@ sub cmd_exec {
             apply_scheduler($fake_spec);
         }
 
+        # Apply exec --cap capabilities
+        if ($cap_add && @$cap_add) {
+            apply_exec_caps($cap_add, $spec);
+        }
+
+        # Apply CPU affinity for exec
+        my $exec_affinity = ($exec_proc && $exec_proc->{execCPUAffinity})
+                         // $spec->{process}{execCPUAffinity};
+        my $dbg_fn = sub { log_debug(@_) };
+        my $final_affinity = apply_exec_cpu_affinity($exec_affinity, $dbg_fn);
+        if (!$exec_affinity) {
+            # No explicit execCPUAffinity — reset to available CPUs
+            apply_cpu_affinity_reset($spec);
+        }
+
         log_debug("setns_init: about to exec");
 
         # Close fds above preserve range
@@ -3480,6 +3730,9 @@ sub cmd_exec {
             }
             closedir $dh;
         }
+        # Apply final CPU affinity right before exec
+        apply_final_cpu_affinity($final_affinity) if $final_affinity;
+
         { exec { $cmd[0] } @cmd };
         my $msg = "exec: $cmd[0]: $!";
         syswrite($err_w, $msg);
