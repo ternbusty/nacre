@@ -1820,25 +1820,8 @@ sub create_devices {
         my $dir = dirname($dest);
         ensure_dir($dir);
 
-        # Try bind mount from host first (works in user namespaces)
-        my $host_dev = $dev->{path};
-        if (-e $host_dev) {
-            # Create empty file as mount point
-            if (!-e $dest) {
-                open my $fh, '>', $dest;
-                close $fh if $fh;
-            }
-            if (do_mount($host_dev, $dest, '', MS_BIND, '')) {
-                # Apply ownership: default to uid=0 gid=0 per OCI spec
-                my $d_uid = $dev->{uid} // 0;
-                my $d_gid = $dev->{gid} // 0;
-                chown($d_uid, $d_gid, $dest);
-                next;  # success
-            }
-        }
-
-        # Fallback: mknod (requires privileges)
-        unlink $dest;
+        # Try mknod first (gives us correct ownership/mode)
+        unlink $dest if -e $dest;
         my $dev_num = (($dev->{major} << 8) | $dev->{minor}) + 0;
         my $ftype = $dev->{type} eq 'b' ? S_IFBLK : S_IFCHR;
         my $mode  = ($ftype | ($dev->{mode} & 0o7777)) + 0;
@@ -1855,12 +1838,22 @@ sub create_devices {
             do { $ret = syscall($nr, $dirfd, $path, $mode, $dev_num) }
                 while ($ret == -1 && $! == EINTR);
         }
-        if ($ret != 0) {
-            # Non-fatal in user namespaces
+        if ($ret == 0) {
+            chown($dev->{uid} // 0, $dev->{gid} // 0, $dest);
             next;
         }
-        if (defined $dev->{uid} || defined $dev->{gid}) {
-            chown($dev->{uid} // -1, $dev->{gid} // -1, $dest);
+
+        # Fallback: bind mount from host (works in user namespaces)
+        my $host_dev = $dev->{path};
+        if (-e $host_dev) {
+            # Create empty file as mount point
+            if (!-e $dest) {
+                open my $fh, '>', $dest;
+                close $fh if $fh;
+            }
+            if (do_mount($host_dev, $dest, '', MS_BIND, '')) {
+                next;  # success
+            }
         }
     }
 }
@@ -2026,12 +2019,9 @@ sub apply_capabilities_final {
         my $n = $CAP_NUM{$name} // next;
         if ($n < 32) { $inh_lo |= (1 << $n); } else { $inh_hi |= (1 << ($n - 32)); }
     }
-    # Ambient caps require the cap in BOTH permitted AND inheritable sets.
-    # Merge ambient into inheritable (same as runc's ApplyCaps).
-    for my $name (@{$caps->{ambient} // []}) {
-        my $n = $CAP_NUM{$name} // next;
-        if ($n < 32) { $inh_lo |= (1 << $n); } else { $inh_hi |= (1 << ($n - 32)); }
-    }
+    # Do NOT merge ambient caps into inheritable — runc doesn't.
+    # Ambient caps that are not in the spec's inheritable set will
+    # fail to raise (EPERM) and produce a warning, matching runc.
 
     # capset: header (version, pid) + data[2] (effective, permitted, inheritable)
     my $hdr = pack('Ii', _LINUX_CAPABILITY_VERSION_3, 0);
@@ -2130,9 +2120,14 @@ sub apply_seccomp_ffi {
     );
 
     my $default_action_str = $seccomp->{defaultAction} // 'SCMP_ACT_ALLOW';
+    my $default_errno_ret_ffi = $seccomp->{defaultErrnoRet};
     my $default_action;
     if ($default_action_str =~ /^SCMP_ACT_ERRNO\((\d+)\)$/) {
         $default_action = SCMP_ACT_ERRNO_BASE | ($1 & 0xffff);
+    } elsif ($default_action_str eq 'SCMP_ACT_ERRNO') {
+        # Bare SCMP_ACT_ERRNO: use defaultErrnoRet or fall back to EPERM(1)
+        my $ev = $default_errno_ret_ffi // 1;
+        $default_action = SCMP_ACT_ERRNO_BASE | ($ev & 0xffff);
     } else {
         $default_action = $action_map{$default_action_str}
             // fatal("unknown seccomp action: $default_action_str");
@@ -2211,9 +2206,15 @@ sub apply_seccomp_ffi {
                 SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV => SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV,
             );
             my $fl = 0;
+            my $ffi_has_flags_field = exists $seccomp->{flags};
             for my $fn (@{$seccomp->{flags} // []}) {
                 $fl |= ($ffi_flag_map{$fn} // 0);
             }
+            # Auto-set SPEC_ALLOW when no flags field (like runc)
+            if (!$ffi_has_flags_field) {
+                $fl |= (1 << 2);  # SECCOMP_FILTER_FLAG_SPEC_ALLOW
+            }
+            log_debug("seccomp filter flags: $fl");
             $fl += 0;
             my $sec_ret = syscall($nr_sec, $op, $fl, $sock_fprog);
             if ($sec_ret != 0) {
@@ -2414,7 +2415,7 @@ sub apply_seccomp_minimal {
     # should use this value instead of the default EPERM(1).
     my $default_errno_ret = $seccomp->{defaultErrnoRet};
 
-    my $default_ret = _seccomp_action_val($default_str)
+    my $default_ret = _seccomp_action_val($default_str, $default_errno_ret)
         // do { warn "nacre: seccomp: unknown default action $default_str\n"; return };
 
     # Collect (syscall_nr → ret_val) pairs whose action differs from default
@@ -2453,6 +2454,18 @@ sub apply_seccomp_minimal {
     # 2. Load syscall number
     push @insns, pack('SCCL', _BPF_LD_W_ABS, 0, 0, 0);             # load nr
 
+    # 2b. Return ENOSYS for out-of-range syscall numbers (matches kernel
+    #     behaviour: calling an unknown syscall returns -ENOSYS regardless
+    #     of the seccomp policy).  Only add when the default action would
+    #     return something other than ENOSYS.
+    my $enosys_val = 0x00050000 | 38;   # SECCOMP_RET_ERRNO | ENOSYS
+    if ($default_ret != $enosys_val) {
+        # Max valid syscall numbers per arch (conservative, kernel 6.x)
+        my $max_nr = $arch_val == _AUDIT_ARCH_AARCH64 ? 294 : 463;
+        push @insns, pack('SCCL', _BPF_JMP_JGE_K, 0, 1, $max_nr);  # if nr>=max → next (RET), else skip
+        push @insns, pack('SCCL', _BPF_RET_K,     0, 0, $enosys_val); # return ERRNO(ENOSYS)
+    }
+
     # 3. Per-rule checks — each rule is two instructions (JEQ + RET)
     for my $r (@rules) {
         my ($nr, $ret) = @$r;
@@ -2490,6 +2503,7 @@ sub apply_seccomp_minimal {
         SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV => SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV,
     );
     my $fl = 0;
+    my $has_flags_field = exists $seccomp->{flags};
     for my $flag_name (@{$seccomp->{flags} // []}) {
         my $fv = $flag_map{$flag_name};
         if (defined $fv) {
@@ -2503,6 +2517,13 @@ sub apply_seccomp_minimal {
     if ($has_notify) {
         $fl |= SECCOMP_FILTER_FLAG_NEW_LISTENER;
     }
+
+    # If no flags field, auto-set SPEC_ALLOW (like runc)
+    if (!$has_flags_field) {
+        $fl |= (1 << 2);   # SECCOMP_FILTER_FLAG_SPEC_ALLOW
+    }
+
+    log_debug("seccomp filter flags: $fl");
 
     my $nr = SYS_seccomp + 0;
     my $op = SECCOMP_SET_MODE_FILTER + 0;
@@ -3622,12 +3643,24 @@ sub run_hooks {
             }
             warn "nacre: $hook_label timed out\n";
         } elsif ($?) {
-            # Hook exited non-zero
+            # Hook exited non-zero or was killed by signal
+            my $sig = $? & 127;
             my $exit_code = $? >> 8;
-            if ($must_succeed) {
-                fatal("error running $hook_label: hook command exited with error code $exit_code");
+            if ($sig) {
+                my %sig_names = (4 => 'illegal instruction', 6 => 'aborted',
+                    8 => 'floating point exception', 9 => 'killed',
+                    11 => 'segmentation fault', 31 => 'bad system call');
+                my $sig_name = $sig_names{$sig} // "signal $sig";
+                if ($must_succeed) {
+                    fatal("error running $hook_label: $sig_name: $hook->{path}");
+                }
+                warn "nacre: $hook_label: $sig_name\n";
+            } else {
+                if ($must_succeed) {
+                    fatal("error running $hook_label: hook command exited with error code $exit_code");
+                }
+                warn "nacre: $hook_label exited with code $exit_code\n";
             }
-            warn "nacre: $hook_label exited with code $exit_code\n";
         }
         $hook_idx++;
     }
@@ -4282,13 +4315,18 @@ sub cmd_create {
         if ($@) {
             my $err = "$@";
             chomp $err;
+            # Write error directly to stderr (which is the PTY slave in
+            # terminal mode, or the original stderr otherwise).  The die
+            # message was caught by eval and never reached stderr, and
+            # the channel fd is already closed (fd cleanup after init_ready),
+            # so this is the only way to get the message to the parent.
+            POSIX::write(2, "$err\n", length($err) + 1);
             # Write error to debug log
             if (defined $init_debug_fd && $init_debug_fd >= 0) {
                 my $msg = "init_process FATAL: $err\n";
                 POSIX::write($init_debug_fd, $msg, length($msg));
             }
-            # Send error to parent through channel so it appears in the
-            # error message that the runtime prints to stderr.
+            # Also try the channel (may fail if fd was closed)
             eval { channel_send($main_w_fd, { type => 'init_error', error => $err }); };
         }
         _exit(1);
@@ -4319,8 +4357,9 @@ sub cmd_create {
             $init_pid = $msg->{pid};
             # Tell init that cgroup is ready (for CLONE_NEWCGROUP)
             if ($clone_flags & CLONE_NEWCGROUP) {
-                eval { cgroup_setup($cgpath, $spec); };
-                if ($@) { log_debug("cgroup_setup in NEWCGROUP path: $@"); }
+                # cgroup_setup must NOT be silenced — "non-empty cgroup"
+                # is a real error that must propagate.
+                cgroup_setup($cgpath, $spec) if $cgpath;
                 eval { cgroup_add_process($cgpath, $init_pid); };
                 if ($@) { log_debug("cgroup_add_process in NEWCGROUP path: $@"); }
                 eval { apply_device_cgroup($cgpath, $spec); };
@@ -4768,6 +4807,19 @@ sub cmd_run {
             }
         };
 
+        # Check if child already exited before handler was installed
+        {
+            my $w = waitpid($init_pid, WNOHANG);
+            if ($w > 0) {
+                if (WIFEXITED($?)) {
+                    $exit_code = WEXITSTATUS($?);
+                } elsif (WIFSIGNALED($?)) {
+                    $exit_code = 128 + WTERMSIG($?);
+                }
+                $done = 1;
+            }
+        }
+
         while (!$done) {
             my $rin = '';
             vec($rin, $pty_master_fd, 1) = 1;
@@ -5017,6 +5069,20 @@ sub exec_tty_relay {
             $child_exited = 1;
         }
     };
+
+    # Check if child already exited before SIGCHLD handler was installed
+    # (the signal may have been delivered with the default handler).
+    {
+        my $ret = waitpid($child_pid, WNOHANG);
+        if ($ret > 0) {
+            if (WIFEXITED($?)) {
+                $exit_status = WEXITSTATUS($?);
+            } elsif (WIFSIGNALED($?)) {
+                $exit_status = 128 + WTERMSIG($?);
+            }
+            $child_exited = 1;
+        }
+    }
 
     my $pty_eof = 0;
     while (!$child_exited && !$pty_eof) {
@@ -5928,9 +5994,7 @@ sub cmd_features {
                                 SCMP_CMP_MASKED_EQ)],
                 supportedFlags => [qw(SECCOMP_FILTER_FLAG_TSYNC
                                       SECCOMP_FILTER_FLAG_LOG
-                                      SECCOMP_FILTER_FLAG_SPEC_ALLOW
-                                      SECCOMP_FILTER_FLAG_NEW_LISTENER
-                                      SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV)],
+                                      SECCOMP_FILTER_FLAG_SPEC_ALLOW)],
             },
             apparmor => { enabled => JSON::PP::false },
             selinux  => { enabled => JSON::PP::false },
