@@ -317,20 +317,6 @@ sub do_syscall {
     return $ret;
 }
 
-# Variant for pure-integer syscalls (unshare, setns, prctl, etc.).
-# Copies @_ and coerces every element to a fresh IV.  Perl's syscall()
-# inspects each SV's type flags to decide whether to pass the value as a
-# C long (IOK) or a string pointer (POK).  @_ aliases from constant subs
-# can carry stale type flags, causing syscall() to misinterpret an integer
-# as a pointer.  Copying + coercion guarantees clean IOK-only SVs.
-sub do_syscall_int {
-    my @a = map { $_ + 0 } @_;
-    my $ret;
-    do {
-        $ret = syscall(@a);
-    } while ($ret == -1 && $! == EINTR);
-    return $ret;
-}
 
 # ═══════════════════════════════════════════════════════════════════════
 # OCI Spec loading
@@ -1648,9 +1634,15 @@ sub run_hooks {
     my ($hooks, $state) = @_;
     return unless $hooks;
     for my $hook (@$hooks) {
+        # Prepare state JSON and pipe BEFORE forking so the child inherits
+        # a real file descriptor that survives exec().
+        my $state_json = $JSON_COMPACT->encode(oci_state_json($state));
+        pipe(my $rd, my $wr) or fatal("pipe for hook stdin: $!");
+
         my $pid = fork();
         fatal("fork for hook: $!") unless defined $pid;
         if ($pid == 0) {
+            close $wr;  # Child doesn't write
             # Set env
             if ($hook->{env}) {
                 for my $e (@{$hook->{env}}) {
@@ -1658,13 +1650,18 @@ sub run_hooks {
                     $ENV{$k} = $v;
                 }
             }
-            # Pipe state JSON to stdin
-            my $state_json = $JSON_COMPACT->encode(oci_state_json($state));
-            open STDIN, '<', \$state_json;
+            # Redirect the pipe read-end to STDIN (real fd survives exec)
+            open STDIN, '<&', $rd or _exit(1);
+            close $rd;
             my @args = @{$hook->{args} // [$hook->{path}]};
             { exec { $hook->{path} } @args };
             _exit(1);
         }
+        # Parent: write state JSON into the pipe, then close
+        close $rd;
+        print $wr $state_json;
+        close $wr;
+
         my $timeout = $hook->{timeout} // 30;
         my $elapsed = 0;
         while ($elapsed < $timeout) {
@@ -1997,6 +1994,17 @@ sub cmd_create {
         # === Init process (PID 1 in new PID namespace) ===
         setsid();
 
+        # For detached containers (create, not run), close stdout/stderr so
+        # that shell callers like output=$(...) don't hang waiting for us.
+        # The init process communicates via the IPC channel and notify socket;
+        # it will reopen stdio appropriately before exec (close_range + exec
+        # inherits whatever the user process sets up).  For 'run', we keep
+        # the parent's stdio so the user sees container output.
+        if (!$p{foreground}) {
+            open STDOUT, '>', '/dev/null';
+            open STDERR, '>', '/dev/null';
+        }
+
         # Unshare cgroup namespace
         if ($clone_flags & CLONE_NEWCGROUP) {
             # Wait until parent has set up cgroups
@@ -2237,8 +2245,8 @@ sub cmd_run {
     # Set as subreaper so we can wait for the init process
     do_syscall(SYS_prctl, PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
 
-    # Create
-    my $state = cmd_create(%p);
+    # Create (foreground: keep stdio so user sees container output)
+    my $state = cmd_create(%p, foreground => 1);
 
     # Start
     cmd_start(id => $id, root => $root);
@@ -2751,7 +2759,8 @@ sub main {
     }
     elsif ($command eq '--version' || $command eq '-v' || $command eq 'version') {
         use Config;
-        # Use runc-compatible output format for interoperability
+        # nacre-specific line + runc-compatible format for interoperability
+        print "nacre version 0.5.1\n";
         print "runc version 1.2.0-nacre\n";
         print "spec: 1.2.0\n";
         print "go: n/a (perl $Config{archname})\n";
