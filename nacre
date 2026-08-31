@@ -4,13 +4,13 @@ use strict;
 use warnings;
 use POSIX qw(setsid _exit dup2 mkfifo WNOHANG WIFEXITED WEXITSTATUS
              WIFSIGNALED WTERMSIG :sys_wait_h :signal_h :errno_h);
-use Socket qw(AF_UNIX SOCK_STREAM SOCK_SEQPACKET SOL_SOCKET
+use Socket qw(AF_UNIX SOCK_STREAM SOCK_SEQPACKET SOL_SOCKET SCM_RIGHTS
               pack_sockaddr_un PF_UNIX MSG_DONTWAIT);
 use JSON::PP;
 use File::Basename qw(basename dirname);
 use File::Path qw(make_path remove_tree);
 use Fcntl qw(:flock :mode :seek O_RDONLY O_WRONLY O_RDWR O_CREAT
-             O_TRUNC O_EXCL O_NONBLOCK O_DIRECTORY O_NOFOLLOW);
+             O_TRUNC O_EXCL O_NONBLOCK O_DIRECTORY O_NOFOLLOW O_NOCTTY);
 use constant O_CLOEXEC => 0o2000000;
 use Getopt::Long qw(:config pass_through no_auto_abbrev);
 use Cwd qw(abs_path getcwd);
@@ -217,6 +217,13 @@ use constant {
 # -- close_range --
 use constant {
     CLOSE_RANGE_CLOEXEC => (1 << 2),
+};
+
+# -- PTY / terminal ioctls --
+use constant {
+    TIOCGPTN   => 0x80045430,   # Get PTY slave number
+    TIOCSPTLCK => 0x40045431,   # Unlock PTY slave
+    TIOCSCTTY  => 0x5480,       # Set controlling terminal
 };
 
 # -- Signals (name -> number) --
@@ -1512,6 +1519,82 @@ sub notify_container_start {
 }
 
 # ═══════════════════════════════════════════════════════════════════════
+# PTY / Console Socket
+# ═══════════════════════════════════════════════════════════════════════
+
+# Send a file descriptor over a Unix domain socket using SCM_RIGHTS.
+sub send_fd_via_socket {
+    my ($socket_path, $fd) = @_;
+
+    socket(my $sock, AF_UNIX, SOCK_STREAM, 0) or fatal("socket: $!");
+    connect($sock, pack_sockaddr_un($socket_path))
+        or fatal("connect to console socket '$socket_path': $!");
+
+    my $sock_fd = fileno($sock) + 0;
+
+    # iovec: one byte of data (required for SCM_RIGHTS)
+    my $data = "\x00";
+    my $iov = pack('P L!', $data, 1);
+
+    # cmsg: SOL_SOCKET / SCM_RIGHTS / fd
+    my $cmsg_data = pack('i', $fd);
+    my $cmsg_len  = 8 + 4 + 4 + length($cmsg_data);   # cmsghdr + data
+    my $cmsg = pack('L! i i', $cmsg_len, SOL_SOCKET, SCM_RIGHTS)
+             . $cmsg_data;
+    my $pad = (8 - (length($cmsg) % 8)) % 8;
+    $cmsg .= "\0" x $pad;
+
+    # msghdr (x86_64 / aarch64 LP64 layout — both are 56 bytes)
+    my $msghdr = pack('Q',    0)              # msg_name      (NULL)
+               . pack('I x4', 0)              # msg_namelen   (0 + pad)
+               . pack('P',    $iov)           # msg_iov
+               . pack('Q',    1)              # msg_iovlen
+               . pack('P',    $cmsg)          # msg_control
+               . pack('Q',    length($cmsg))  # msg_controllen
+               . pack('I x4', 0);             # msg_flags     (0 + pad)
+
+    my $nr  = SYS_sendmsg + 0;
+    my $ret = syscall($nr, $sock_fd, $msghdr, 0);
+    $ret >= 0 or fatal("sendmsg (console socket): $!");
+
+    close($sock);
+}
+
+# Create a PTY pair, send the master to the console socket, return the
+# slave file descriptor (as an integer fd number).  Must be called before
+# pivot_root so that both /dev/ptmx and the console-socket path are
+# reachable on the host filesystem.
+sub setup_pty_console {
+    my ($console_socket_path) = @_;
+
+    # Open PTY master
+    sysopen(my $ptm, '/dev/ptmx', O_RDWR | O_NOCTTY | O_CLOEXEC)
+        or fatal("open /dev/ptmx: $!");
+
+    # Get slave number
+    my $ptn_buf = pack('i', 0);
+    ioctl($ptm, TIOCGPTN, $ptn_buf) or fatal("TIOCGPTN: $!");
+    my $ptn = unpack('i', $ptn_buf);
+
+    # Unlock slave
+    my $unlock = pack('i', 0);
+    ioctl($ptm, TIOCSPTLCK, $unlock) or fatal("TIOCSPTLCK: $!");
+
+    # Open slave (keep it open across pivot_root; we dup2 it to 0/1/2 later)
+    my $pts_path = "/dev/pts/$ptn";
+    sysopen(my $pts, $pts_path, O_RDWR | O_NOCTTY)
+        or fatal("open PTY slave $pts_path: $!");
+
+    # Deliver master to whoever is listening on the console socket
+    send_fd_via_socket($console_socket_path, fileno($ptm));
+
+    # Master stays open in the receiver; close our copy
+    close($ptm);
+
+    return fileno($pts);
+}
+
+# ═══════════════════════════════════════════════════════════════════════
 # Process Security
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -1683,7 +1766,7 @@ sub run_hooks {
 # ═══════════════════════════════════════════════════════════════════════
 
 sub run_init_process {
-    my ($spec, $rootfs, $notify_fd, $main_chan_w, $main_chan_r, $cgpath, $id, $bundle) = @_;
+    my ($spec, $rootfs, $notify_fd, $main_chan_w, $main_chan_r, $cgpath, $id, $bundle, $pts_fd) = @_;
 
     # Setup rootfs (mounts, devices, symlinks)
     prepare_rootfs($spec, $rootfs);
@@ -1755,7 +1838,19 @@ sub run_init_process {
         $ENV{$k} = $v if defined $k;
     }
 
-    # Close extra fds
+    # Set up container stdio from PTY slave BEFORE close_range fallback
+    # can destroy it (close_range with CLOEXEC only marks, but the POSIX
+    # fallback actually closes fds immediately).
+    if (defined $pts_fd) {
+        POSIX::dup2($pts_fd, 0) >= 0 or fatal("dup2 pts→stdin: $!");
+        POSIX::dup2($pts_fd, 1) >= 0 or fatal("dup2 pts→stdout: $!");
+        POSIX::dup2($pts_fd, 2) >= 0 or fatal("dup2 pts→stderr: $!");
+        # Set the PTY as the controlling terminal for this session
+        ioctl(STDIN, TIOCSCTTY, pack('i', 0));
+        # pts_fd itself (>= 3) will be closed below
+    }
+
+    # Close extra fds (marks CLOEXEC — actually closed at exec)
     eval { do_syscall(SYS_close_range, 3, ~0, CLOSE_RANGE_CLOEXEC); };
     # Fallback: close individually
     if ($@ || $! == ENOSYS) {
@@ -1994,13 +2089,21 @@ sub cmd_create {
         # === Init process (PID 1 in new PID namespace) ===
         setsid();
 
+        # Set up PTY console if terminal is requested and a console socket
+        # was provided.  Must happen before pivot_root (host paths needed).
+        my $pts_fd;
+        my $terminal = $spec->{process}{terminal};
+        if ($terminal && $p{console_socket}) {
+            $pts_fd = setup_pty_console($p{console_socket});
+        }
+
         # For detached containers (create, not run), close stdout/stderr so
         # that shell callers like output=$(...) don't hang waiting for us.
-        # The init process communicates via the IPC channel and notify socket;
-        # it will reopen stdio appropriately before exec (close_range + exec
-        # inherits whatever the user process sets up).  For 'run', we keep
+        # When a PTY is set up the slave will replace stdio before exec;
+        # otherwise redirect to /dev/null.  For 'run' (foreground), keep
         # the parent's stdio so the user sees container output.
         if (!$p{foreground}) {
+            open STDIN,  '<', '/dev/null';
             open STDOUT, '>', '/dev/null';
             open STDERR, '>', '/dev/null';
         }
@@ -2021,7 +2124,7 @@ sub cmd_create {
         my $notify_srv = create_notify_listener($notify_path);
 
         # Run the init process
-        run_init_process($spec, $rootfs, $notify_srv, $main_w_fd, $init_r_fd, $cgpath, $id, $bundle);
+        run_init_process($spec, $rootfs, $notify_srv, $main_w_fd, $init_r_fd, $cgpath, $id, $bundle, $pts_fd);
         _exit(1);  # Should not reach here
     }
 
@@ -2241,7 +2344,22 @@ sub cmd_run {
     my $id     = $p{id}     // fatal("container id required");
     my $root   = $p{root}   // $DEFAULT_ROOT;
     my $bundle = $p{bundle} // getcwd();
+    my $detach = $p{detach};
 
+    if ($detach) {
+        # Detached mode: create + start, then return immediately.
+        # Equivalent to `runc create` + `runc start`.
+        my $state = cmd_create(%p);
+        cmd_start(id => $id, root => $root);
+
+        # Write pid file if requested
+        if ($p{pid_file} && $state->{pid}) {
+            write_file($p{pid_file}, $state->{pid});
+        }
+        return;
+    }
+
+    # Foreground mode: create + start + wait
     # Set as subreaper so we can wait for the init process
     do_syscall(SYS_prctl, PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
 
@@ -2257,10 +2375,12 @@ sub cmd_run {
         $SIG{$sig} = sub { kill $SIG_NUM{$sig}, $init_pid; };
     }
 
-    # Wait for init process to exit
+    # Wait for init process to exit.
+    # Use waitpid(-1) to reap ANY child (including orphaned grandchildren
+    # adopted via subreaper), and check whether we got $init_pid each time.
     my $exit_code = 0;
     while (1) {
-        my $w = waitpid($init_pid, 0);
+        my $w = waitpid(-1, 0);
         if ($w == $init_pid) {
             if (WIFEXITED($?)) {
                 $exit_code = WEXITSTATUS($?);
@@ -2270,8 +2390,7 @@ sub cmd_run {
             last;
         }
         last if $w < 0 && $! != EINTR;
-        # Reap other children (intermediate processes)
-        waitpid(-1, WNOHANG) while waitpid(-1, WNOHANG) > 0;
+        # Otherwise it was some other child (zombie, intermediate process) — keep waiting.
     }
 
     # Delete
@@ -2636,7 +2755,8 @@ sub main {
             'no-pivot'           => \$no_pivot,
         );
         my $id = shift @ARGV // fatal("container id required");
-        cmd_create(id => $id, bundle => $bundle, root => $root, pid_file => $pid_file);
+        cmd_create(id => $id, bundle => $bundle, root => $root,
+                   pid_file => $pid_file, console_socket => $console_socket);
     }
     elsif ($command eq 'start') {
         my $id = shift @ARGV // fatal("container id required");
@@ -2669,7 +2789,9 @@ sub main {
             'detach|d'           => \$detach,
         );
         my $id = shift @ARGV // fatal("container id required");
-        cmd_run(id => $id, bundle => $bundle, root => $root, pid_file => $pid_file);
+        cmd_run(id => $id, bundle => $bundle, root => $root,
+                pid_file => $pid_file, console_socket => $console_socket,
+                detach => $detach);
     }
     elsif ($command eq 'list') {
         my ($format, $quiet);
@@ -2760,15 +2882,15 @@ sub main {
     elsif ($command eq '--version' || $command eq '-v' || $command eq 'version') {
         use Config;
         # nacre-specific line + runc-compatible format for interoperability
-        print "nacre version 0.5.1\n";
         print "runc version 1.2.0-nacre\n";
+        print "nacre version 0.5.1\n";
         print "spec: 1.2.0\n";
         print "go: n/a (perl $Config{archname})\n";
     }
     else {
         # Handle `<command> -h` for any command (runc compat)
         if (@ARGV && ($ARGV[0] eq '-h' || $ARGV[0] eq '--help')) {
-            print "Usage: runc $command [options]\n";
+            print "NAME:\n   runc $command\n\nUSAGE:\n   runc $command [options]\n";
             exit(0);
         }
         fatal("unknown command: $command");
