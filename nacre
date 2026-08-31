@@ -2721,7 +2721,15 @@ sub cmd_run {
     # kernel arg to be misinterpreted as a pointer.
     my $pr_nr  = SYS_prctl + 0;
     my $pr_opt = PR_SET_CHILD_SUBREAPER + 0;
-    my $sr_ret = do_syscall($pr_nr, $pr_opt, 1, 0, 0, 0);
+    my $one    = 1 + 0;
+    my $zero   = 0 + 0;
+    $! = 0;
+    my $sr_ret = syscall($pr_nr, $pr_opt, $one, $zero, $zero, $zero);
+    my $sr_errno = $! + 0;
+    if ($sr_ret == -1) {
+        warn "nacre: PR_SET_CHILD_SUBREAPER failed: errno=$sr_errno ($!)\n"
+            if $ENV{NACRE_RUN_DEBUG};
+    }
 
     # Create (foreground: keep stdio so user sees container output)
     my $state = cmd_create(%p, foreground => 1);
