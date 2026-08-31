@@ -751,9 +751,38 @@ sub do_mount {
     my $src_arg  = (defined $src    && $src    ne '') ? ($src    . "\0") : 0;
     my $fs_arg   = (defined $fstype && $fstype ne '') ? ($fstype . "\0") : 0;
     my $data_arg = (defined $data   && $data   ne '') ? ($data   . "\0") : 0;
+    my $tgt_arg  = $target . "\0";
+
+    # DEBUG: print mount args for propagation calls
+    if ($target eq '/') {
+        use B;
+        my $dump = sub {
+            my ($name, $val) = @_;
+            my $sv = B::svref_2object(\$val);
+            my $fl = $sv->FLAGS;
+            my $is_iok = ($fl & B::SVf_IOK()) ? 1 : 0;
+            my $is_pok = ($fl & B::SVf_POK()) ? 1 : 0;
+            my $is_rok = ($fl & B::SVf_ROK()) ? 1 : 0;
+            warn sprintf("  %s: val=%s IOK=%d POK=%d ROK=%d flags=0x%x\n",
+                $name, defined($val) ? $val : 'undef', $is_iok, $is_pok, $is_rok, $fl);
+        };
+        warn "DEBUG do_mount: target='$target' src='$src' fstype='$fstype' flags=$flags data='$data'\n";
+        $dump->('src_arg', $src_arg);
+        $dump->('tgt_arg', $tgt_arg);
+        $dump->('fs_arg', $fs_arg);
+        $dump->('flags', $flags);
+        $dump->('data_arg', $data_arg);
+        warn sprintf("  SYS_mount=%d\n", SYS_mount);
+    }
+
     my $ret = do_syscall(SYS_mount,
-        $src_arg, $target . "\0", $fs_arg,
+        $src_arg, $tgt_arg, $fs_arg,
         $flags, $data_arg);
+
+    if ($target eq '/') {
+        warn "DEBUG do_mount result: ret=$ret errno=" . int($!) . " ($!)\n";
+    }
+
     return $ret == 0;
 }
 
@@ -1645,6 +1674,29 @@ sub run_hooks {
 
 sub run_init_process {
     my ($spec, $rootfs, $notify_fd, $main_chan_w, $main_chan_r, $cgpath, $id, $bundle) = @_;
+
+    # DEBUG: direct mount test before prepare_rootfs
+    {
+        warn "DEBUG: direct mount test - PID=$$ uid=$< euid=$>\n";
+        warn "DEBUG: / exists=" . (-d '/' ? 'yes' : 'no') . "\n";
+        my $nr  = SYS_mount + 0;
+        my $fl  = (MS_SLAVE | MS_REC) + 0;
+        my $tgt = "/\0";
+        warn sprintf("DEBUG: calling syscall(%d, 0, tgt, 0, %d, 0) directly\n", $nr, $fl);
+        my $r = syscall($nr, 0, $tgt, 0, $fl, 0);
+        my $e = int($!);
+        warn "DEBUG: direct mount result: r=$r errno=$e ($!)\n";
+        # Also try with undef
+        warn "DEBUG: trying with empty-string source (old way)\n";
+        my $r2 = syscall($nr, "\0", $tgt, "\0", $fl, "\0");
+        my $e2 = int($!);
+        warn "DEBUG: empty-string mount result: r2=$r2 errno=$e2 ($!)\n";
+        # Try calling mount(2) via system
+        warn "DEBUG: trying system mount --make-rslave /\n";
+        system("mount --make-rslave / 2>&1") == 0
+            ? warn "DEBUG: system mount succeeded\n"
+            : warn "DEBUG: system mount failed rc=$?\n";
+    }
 
     # Setup rootfs (mounts, devices, symlinks)
     prepare_rootfs($spec, $rootfs);
