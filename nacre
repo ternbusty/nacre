@@ -699,7 +699,7 @@ sub cgroup_setup {
         if (defined $freeze) {
             chomp $freeze;
             if ($freeze eq '1') {
-                fatal("container's cgroup is frozen: $cgpath");
+                fatal("container's cgroup unexpectedly frozen");
             }
         }
     }
@@ -2396,7 +2396,9 @@ sub _seccomp_action_val {
 # BPF opcodes
 use constant {
     _BPF_LD_W_ABS  => 0x20,   # BPF_LD  | BPF_W | BPF_ABS
+    _BPF_ALU_AND_K => 0x54,   # BPF_ALU | BPF_AND | BPF_K
     _BPF_JMP_JEQ_K => 0x15,   # BPF_JMP | BPF_JEQ | BPF_K
+    _BPF_JMP_JGT_K => 0x25,   # BPF_JMP | BPF_JGT | BPF_K
     _BPF_JMP_JGE_K => 0x35,   # BPF_JMP | BPF_JGE | BPF_K
     _BPF_JMP_JA    => 0x05,   # BPF_JMP | BPF_JA
     _BPF_RET_K     => 0x06,   # BPF_RET | BPF_K
@@ -2407,6 +2409,129 @@ use constant {
     _AUDIT_ARCH_X86_64  => 0xc000003e,
     _AUDIT_ARCH_AARCH64 => 0xc00000b7,
 };
+
+# Generate BPF instructions for a single seccomp rule.
+# For rules without args: 2 instructions (JEQ nr + RET action).
+# For rules with args: checks syscall number, then evaluates arg conditions
+# (same arg index = OR, different arg indexes = AND), returns action on match
+# or reloads syscall number and falls through to next rule.
+#
+# Assumes accumulator contains the syscall number on entry.
+sub _gen_seccomp_rule_bpf {
+    my ($nr, $ret, $args) = @_;
+
+    # Simple rule: no args
+    unless (@$args) {
+        return (
+            pack('SCCL', _BPF_JMP_JEQ_K, 0, 1, $nr),
+            pack('SCCL', _BPF_RET_K,     0, 0, $ret),
+        );
+    }
+
+    # Complex rule with argument conditions.
+    # Group conditions by arg index: same index = OR, different = AND.
+    my %by_idx;
+    push @{$by_idx{$_->{index}}}, $_ for @$args;
+    my @group_idxs = sort { $a <=> $b } keys %by_idx;
+
+    # Build body instructions using symbolic jump targets, then resolve.
+    # Targets: 'fail' → LD [0] at end, 'pass' → fall through (0),
+    #          "gp:N" → start of the Nth+1 group (or RET for last group).
+    my @body;           # [{code, k, jt, jf}]
+    my @group_starts;   # absolute position of each group's first insn in @body
+
+    for my $gi (0..$#group_idxs) {
+        my $idx = $group_idxs[$gi];
+        my @conds = @{$by_idx{$idx}};
+        my $arg_off = 16 + $idx * 8;   # seccomp_data.args[idx], low 32 bits
+        my $gp = "gp:$gi";             # group-pass marker
+
+        $group_starts[$gi] = scalar @body;
+
+        # Load the argument
+        push @body, { code => _BPF_LD_W_ABS, k => $arg_off, jt => 0, jf => 0 };
+
+        for my $ci (0..$#conds) {
+            my $c     = $conds[$ci];
+            my $op    = $c->{op} // 'SCMP_CMP_EQ';
+            my $val   = $c->{value}    // 0;
+            my $val2  = $c->{valueTwo} // 0;
+            my $is_last = ($ci == $#conds);
+
+            if ($op eq 'SCMP_CMP_MASKED_EQ') {
+                # (arg & value) == valueTwo — needs ALU AND + JEQ
+                push @body, { code => _BPF_ALU_AND_K, k => $val, jt => 0, jf => 0 };
+                if ($is_last) {
+                    push @body, { code => _BPF_JMP_JEQ_K, k => $val2, jt => 'pass', jf => 'fail' };
+                } else {
+                    push @body, { code => _BPF_JMP_JEQ_K, k => $val2, jt => $gp, jf => 'next' };
+                    # AND clobbered accumulator → reload arg for next OR condition
+                    push @body, { code => _BPF_LD_W_ABS, k => $arg_off, jt => 0, jf => 0 };
+                }
+            } else {
+                # Determine BPF opcode and whether to swap jt/jf
+                my ($opcode, $swap) = _seccomp_cmp_opcode($op);
+                my ($jt_sym, $jf_sym);
+                if ($is_last) {
+                    $jt_sym = $swap ? 'fail' : 'pass';
+                    $jf_sym = $swap ? 'pass' : 'fail';
+                } else {
+                    $jt_sym = $swap ? 'next' : $gp;
+                    $jf_sym = $swap ? $gp    : 'next';
+                }
+                push @body, { code => $opcode, k => $val, jt => $jt_sym, jf => $jf_sym };
+            }
+        }
+    }
+
+    # Append RET + LD-reload (fail target)
+    my $ret_pos  = scalar @body;
+    push @body, { code => _BPF_RET_K,     k => $ret, jt => 0, jf => 0 };
+    my $fail_pos = scalar @body;
+    push @body, { code => _BPF_LD_W_ABS,  k => 0,    jt => 0, jf => 0 };  # reload nr
+
+    # Resolve group-pass positions
+    my %gp_pos;
+    for my $gi (0..$#group_idxs) {
+        $gp_pos{"gp:$gi"} = ($gi < $#group_idxs) ? $group_starts[$gi + 1] : $ret_pos;
+    }
+
+    # Resolve symbolic targets to relative offsets
+    my @insns;
+    my $body_len = scalar @body;
+    push @insns, pack('SCCL', _BPF_JMP_JEQ_K, 0, $body_len, $nr);  # NR check
+
+    for my $i (0..$#body) {
+        my $e = $body[$i];
+        my $jt = $e->{jt};
+        my $jf = $e->{jf};
+
+        for my $ref (\$jt, \$jf) {
+            if    (!defined $$ref || $$ref eq '0' || $$ref eq 'next' || $$ref eq 'pass') { $$ref = 0; }
+            elsif ($$ref eq 'fail')                  { $$ref = $fail_pos - $i - 1; }
+            elsif (exists $gp_pos{$$ref})             { $$ref = $gp_pos{$$ref} - $i - 1; }
+            # else: already numeric
+        }
+
+        push @insns, pack('SCCL', $e->{code}, $jt + 0, $jf + 0, $e->{k} // 0);
+    }
+
+    return @insns;
+}
+
+# Map OCI seccomp comparison operators to BPF opcodes.
+# Returns ($opcode, $swap) where $swap=1 means the true/false targets
+# must be swapped (for NE, LE, LT which invert the underlying check).
+sub _seccomp_cmp_opcode {
+    my ($op) = @_;
+    return (_BPF_JMP_JEQ_K, 0) if $op eq 'SCMP_CMP_EQ';
+    return (_BPF_JMP_JEQ_K, 1) if $op eq 'SCMP_CMP_NE';
+    return (_BPF_JMP_JGE_K, 0) if $op eq 'SCMP_CMP_GE';
+    return (_BPF_JMP_JGT_K, 0) if $op eq 'SCMP_CMP_GT';
+    return (_BPF_JMP_JGT_K, 1) if $op eq 'SCMP_CMP_LE';
+    return (_BPF_JMP_JGE_K, 1) if $op eq 'SCMP_CMP_LT';
+    return (_BPF_JMP_JEQ_K, 0);  # default: EQ
+}
 
 sub apply_seccomp_minimal {
     my ($seccomp) = @_;
@@ -2420,24 +2545,34 @@ sub apply_seccomp_minimal {
     my $default_ret = _seccomp_action_val($default_str, $default_errno_ret)
         // do { warn "nacre: seccomp: unknown default action $default_str\n"; return };
 
-    # Collect (syscall_nr → ret_val) pairs whose action differs from default
+    # Collect rules: {nr, ret, args => [{index, value, valueTwo, op}]}
     my @rules;
     for my $rule (@{$seccomp->{syscalls} // []}) {
         my $act = $rule->{action} // $default_str;
-        my $ret;
 
         # For SCMP_ACT_ERRNO: check rule's errnoRet, then defaultErrnoRet, then EPERM(1)
         my $errno_val = $rule->{errnoRet} // $default_errno_ret;
-        $ret = _seccomp_action_val($act, $errno_val);
+        my $ret = _seccomp_action_val($act, $errno_val);
         next unless defined $ret;
         next if $ret == $default_ret;   # same as default — skip
+
+        my @rule_args;
+        for my $a (@{$rule->{args} // []}) {
+            push @rule_args, {
+                index    => $a->{index}    // 0,
+                value    => $a->{value}    // 0,
+                valueTwo => $a->{valueTwo} // 0,
+                op       => $a->{op}       // 'SCMP_CMP_EQ',
+            };
+        }
+
         for my $name (@{$rule->{names} // []}) {
             my $nr = _resolve_seccomp_syscall($name);
             unless (defined $nr) {
                 warn "nacre: seccomp: unknown syscall '$name', skipping\n";
                 next;
             }
-            push @rules, [$nr, $ret];
+            push @rules, { nr => $nr, ret => $ret, args => \@rule_args };
         }
     }
 
@@ -2468,11 +2603,9 @@ sub apply_seccomp_minimal {
         push @insns, pack('SCCL', _BPF_RET_K,     0, 0, $enosys_val); # return ERRNO(ENOSYS)
     }
 
-    # 3. Per-rule checks — each rule is two instructions (JEQ + RET)
+    # 3. Per-rule BPF blocks (with argument-based filtering support)
     for my $r (@rules) {
-        my ($nr, $ret) = @$r;
-        push @insns, pack('SCCL', _BPF_JMP_JEQ_K, 0, 1, $nr);      # if nr==X fall-through, else skip
-        push @insns, pack('SCCL', _BPF_RET_K,     0, 0, $ret);      # return action
+        push @insns, _gen_seccomp_rule_bpf($r->{nr}, $r->{ret}, $r->{args});
     }
 
     # 4. Default action
@@ -4582,9 +4715,18 @@ sub cmd_start {
     $state->{status} = 'running';
     save_state($root, $state);
 
-    # Run poststart hooks ($spec already loaded above)
+    # Run poststart hooks ($spec already loaded above).
+    # A failed poststart hook kills the container and returns an error
+    # (matching runc behaviour — the container HAS started, but the run
+    # command reports failure).
     if ($spec->{hooks}) {
-        run_hooks($spec->{hooks}{poststart}, $state, type => 'poststart');
+        eval {
+            run_hooks($spec->{hooks}{poststart}, $state, must_succeed => 1, type => 'poststart');
+        };
+        if ($@) {
+            eval { kill 9, $state->{pid} if $state->{pid}; };
+            die $@;
+        }
     }
 }
 
@@ -4864,10 +5006,14 @@ sub cmd_run {
 
         POSIX::close($pty_master_fd);
 
-        # Ensure we reap init even if SIGCHLD was missed (race between
-        # cmd_start and handler installation).
-        unless ($done) {
-            my $w = waitpid($init_pid, 0);
+        # Always reap init — PTY EOF can set $done before SIGCHLD
+        # delivers the exit code, so we must collect it here regardless.
+        {
+            my $w = waitpid($init_pid, WNOHANG);
+            if ($w <= 0) {
+                # Child still running or not yet reaped — block for it.
+                $w = waitpid($init_pid, 0);
+            }
             if ($w == $init_pid) {
                 if (WIFEXITED($?)) {
                     $exit_code = WEXITSTATUS($?);
