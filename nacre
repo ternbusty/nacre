@@ -272,7 +272,13 @@ my $JSON_COMPACT = JSON::PP->new->utf8->canonical->allow_nonref;
 # Utility functions
 # ═══════════════════════════════════════════════════════════════════════
 
-sub fatal { die "nacre: @_\n"; }
+sub fatal {
+    # Reset $! and $? so that die's exit code is always 255,
+    # not a leftover errno from the last syscall.
+    $! = 0;
+    $? = 0;
+    die "nacre: @_\n";
+}
 
 sub write_file {
     my ($path, $content) = @_;
@@ -1032,6 +1038,7 @@ sub validate_capabilities {
     # OCI spec: "Any value which cannot be mapped to a relevant kernel
     # interface MUST cause an error."
     my ($spec) = @_;
+    return unless $spec->{process};  # avoid auto-vivifying {process}
     my $caps = $spec->{process}{capabilities} // return;
     for my $set (qw(bounding effective permitted inheritable ambient)) {
         for my $name (@{$caps->{$set} // []}) {
@@ -1868,6 +1875,7 @@ sub validate_rlimits {
     # OCI spec: "The runtime MUST generate an error for any values
     # which cannot be mapped to a relevant kernel interface."
     my ($spec) = @_;
+    return unless $spec->{process};  # avoid auto-vivifying {process}
     my $rlimits = $spec->{process}{rlimits} // return;
     for my $rl (@$rlimits) {
         exists $RLIMIT_MAP{$rl->{type}}
@@ -2403,9 +2411,24 @@ sub cmd_create {
         # Create notify listener
         my $notify_srv = create_notify_listener($notify_path);
 
-        # Run the init process
-        run_init_process($spec, $rootfs, $notify_srv, $main_w_fd, $init_r_fd, $cgpath, $id, $bundle, $pts_fd, $init_debug_fd);
-        _exit(1);  # Should not reach here
+        # Run the init process (eval captures die from fatal so we can
+        # report the actual error to the parent through the channel).
+        eval {
+            run_init_process($spec, $rootfs, $notify_srv, $main_w_fd, $init_r_fd, $cgpath, $id, $bundle, $pts_fd, $init_debug_fd);
+        };
+        if ($@) {
+            my $err = "$@";
+            chomp $err;
+            # Write error to debug log
+            if (defined $init_debug_fd && $init_debug_fd >= 0) {
+                my $msg = "init_process FATAL: $err\n";
+                POSIX::write($init_debug_fd, $msg, length($msg));
+            }
+            # Send error to parent through channel so it appears in the
+            # error message that the runtime prints to stderr.
+            eval { channel_send($main_w_fd, { type => 'init_error', error => $err }); };
+        }
+        _exit(1);
     }
 
     # === Parent process ===
@@ -2414,6 +2437,7 @@ sub cmd_create {
 
     # Handle messages from child
     my $init_pid;
+    my $init_error;
     my $mapping_written = 0;
     my $init_ready = 0;
 
@@ -2441,6 +2465,11 @@ sub cmd_create {
             $init_ready = 1;
             last;
         }
+        elsif ($msg->{type} eq 'init_error') {
+            # Init process reported a fatal error — store it for the
+            # error message we'll emit below.
+            $init_error = $msg->{error} // 'unknown';
+        }
     }
 
     # Reap intermediate child
@@ -2453,7 +2482,8 @@ sub cmd_create {
         # Init process died during setup — try to get exit status
         my $w = waitpid($init_pid, WNOHANG);
         my $exit_msg = ($w > 0) ? " (exit status " . ($? >> 8) . ")" : "";
-        fatal("init process died during container setup${exit_msg}");
+        my $err_detail = $init_error ? ": $init_error" : "";
+        fatal("init process died during container setup${exit_msg}${err_detail}");
     }
 
     # If cgroup wasn't set up yet (no CLONE_NEWCGROUP path)
