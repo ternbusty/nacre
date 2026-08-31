@@ -2400,15 +2400,14 @@ sub cmd_create {
             close $dfh;
         };
 
-        # For detached containers (create, not run), close stdout/stderr so
-        # that shell callers like output=$(...) don't hang waiting for us.
-        # When a PTY is set up the slave will replace stdio before exec;
-        # otherwise redirect to /dev/null.  For 'run' (foreground), keep
-        # the parent's stdio so the user sees container output.
+        # Detach stdin so the init never blocks on terminal reads.
+        # Keep stdout/stderr as inherited from the caller — the OCI
+        # test harness (runtime-tools) redirects the runtime's stdout
+        # to a file and reads it back via ReadStandardStreams, so the
+        # container process's output must flow through the inherited fd.
+        # For 'run' (foreground), all three stay connected.
         if (!$p{foreground}) {
-            open STDIN,  '<', '/dev/null';
-            open STDOUT, '>', '/dev/null';
-            open STDERR, '>', '/dev/null';
+            open STDIN, '<', '/dev/null';
         }
 
         # Unshare cgroup namespace
