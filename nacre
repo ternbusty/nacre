@@ -1557,6 +1557,9 @@ sub apply_mounts {
     # Track /dev ro remount: defer MS_RDONLY on /dev until after device creation
     my $dev_needs_ro = 0;
 
+    # Track which destination directories pre-existed before ensure_dir
+    my %dest_preexisted;
+
     for my $m (@{$spec->{mounts} // []}) {
         my $dest = "$rootfs$m->{destination}";
         my $mount_src = $m->{source} // '';
@@ -1578,7 +1581,11 @@ sub apply_mounts {
                 close $fh if $fh;
             }
         } else {
+            # Track whether the directory existed before ensure_dir creates it.
+            # We only inherit tmpfs mode from pre-existing directories.
+            my $dest_preexisted = -d $dest;
             ensure_dir($dest);
+            $dest_preexisted{$dest} = $dest_preexisted;
         }
 
         # Filter out OCI-specific pseudo-options and recursive mount attrs
@@ -1611,8 +1618,11 @@ sub apply_mounts {
         }
 
         # tmpfs mode= inherit: if mounting tmpfs without explicit mode=
-        # in the options, inherit the existing directory's permissions
-        if ($type eq 'tmpfs' && -d $dest && $data !~ /\bmode=/) {
+        # in the options, inherit the existing directory's permissions.
+        # Only inherit from pre-existing directories — directories freshly
+        # created by ensure_dir have mode 0755 which is just the mkdir default,
+        # not a user intent.  Let the kernel use its tmpfs default (1777).
+        if ($type eq 'tmpfs' && $dest_preexisted{$dest} && $data !~ /\bmode=/) {
             my @st = stat($dest);
             if (@st) {
                 my $mode = sprintf('%o', $st[2] & 07777);
@@ -1849,6 +1859,10 @@ sub apply_rootfs_propagation {
     my ($spec) = @_;
     my $propagation = $spec->{linux}{rootfsPropagation} // 'rslave';
     my $prop_flags = $PROPAGATION_FLAGS{$propagation} // (MS_SLAVE | MS_REC);
+    # First clear all inherited propagation (especially slave/shared)
+    # by making the mount private.  Without this, applying MS_SHARED
+    # on a slave mount results in "shared,slave" instead of just "shared".
+    do_mount('', '/', '', MS_PRIVATE | MS_REC, '');
     do_mount('', '/', '', $prop_flags, '')
         or fatal("mount propagation ($propagation) /: $!");
 }
@@ -2893,6 +2907,39 @@ sub setup_pty_console {
     return $dup_fd;
 }
 
+# Set a PTY fd to raw mode (cfmakeraw equivalent).
+# Disables OPOST/ONLCR so \n is not converted to \r\n, ECHO so input
+# is not reflected, and line-editing (ICANON) so reads return immediately.
+sub pty_set_raw {
+    my ($fd) = @_;
+    # TCGETS = 0x5401, TCSETS = 0x5402 on Linux x86_64/aarch64
+    use constant TCGETS_C => 0x5401;
+    use constant TCSETS_C => 0x5402;
+    # struct termios: 4 x u32 (c_iflag, c_oflag, c_cflag, c_lflag) + u8 c_line + 19 x u8 c_cc + pad
+    # total = 16 + 1 + 19 + pad = 60 bytes on Linux
+    my $termios = "\0" x 60;
+    if (open my $fh, '+<&', $fd) {
+        ioctl($fh, TCGETS_C, $termios) or do { close $fh; return; };
+        my ($iflag, $oflag, $cflag, $lflag) = unpack('LLLL', $termios);
+        # Clear input flags: IGNBRK, BRKINT, PARMRK, ISTRIP, INLCR, IGNCR, ICRNL, IXON
+        $iflag &= ~(0x001 | 0x002 | 0x008 | 0x020 | 0x040 | 0x080 | 0x100 | 0x400);
+        # Clear output flags: OPOST
+        $oflag &= ~0x001;
+        # Clear local flags: ECHO, ECHONL, ICANON, ISIG, IEXTEN
+        $lflag &= ~(0x008 | 0x040 | 0x002 | 0x001 | 0x8000);
+        # Clear char size, set CS8
+        $cflag &= ~0x030;   # ~CSIZE
+        $cflag |=  0x030;   # CS8
+        # VMIN=1, VTIME=0
+        substr($termios, 0, 16, pack('LLLL', $iflag, $oflag, $cflag, $lflag));
+        my $cc_offset = 16 + 1;  # after c_line byte
+        substr($termios, $cc_offset + 6, 1, pack('C', 1));  # VMIN
+        substr($termios, $cc_offset + 5, 1, pack('C', 0));  # VTIME
+        ioctl($fh, TCSETS_C, $termios);
+        close $fh;
+    }
+}
+
 # ═══════════════════════════════════════════════════════════════════════
 # Process Security
 # ═══════════════════════════════════════════════════════════════════════
@@ -3692,8 +3739,9 @@ sub run_init_process {
         POSIX::close($seccomp_notify_fd);
         # Wait for parent to confirm listener connection
         my $resp = channel_recv($main_chan_r);
-        if (!$resp || $resp->{type} ne 'notify_fd_done') {
-            fatal("seccomp notify: parent failed to connect listener");
+        if (!$resp || $resp->{type} eq 'notify_fd_error') {
+            my $err = $resp ? ($resp->{error} // 'unknown') : 'no response';
+            fatal("failed to connect with seccomp agent: $err");
         }
     }
 
@@ -3902,16 +3950,33 @@ sub cmd_create {
     validate_memory_policy($spec);
 
     # Validate: seccomp SCMP_ACT_NOTIFY requires a non-empty listenerPath
+    # and certain syscalls cannot be intercepted via NOTIFY.
     if (my $seccomp = $spec->{linux}{seccomp}) {
         my $has_notify = 0;
         for my $rule (@{$seccomp->{syscalls} // []}) {
-            $has_notify = 1 if ($rule->{action} // '') eq 'SCMP_ACT_NOTIFY';
+            if (($rule->{action} // '') eq 'SCMP_ACT_NOTIFY') {
+                $has_notify = 1;
+                # write(2) cannot be used with NOTIFY — the fd number is
+                # communicated to the parent via write(), creating a deadlock.
+                for my $name (@{$rule->{names} // []}) {
+                    fatal("SCMP_ACT_NOTIFY cannot be used for the write syscall")
+                        if $name eq 'write';
+                }
+            }
         }
         $has_notify = 1 if ($seccomp->{defaultAction} // '') eq 'SCMP_ACT_NOTIFY';
         if ($has_notify) {
             my $lp = $seccomp->{listenerPath} // '';
-            fatal("seccomp SCMP_ACT_NOTIFY requires a non-empty listenerPath")
+            fatal("SCMP_ACT_NOTIFY requires a non-empty listenerPath")
                 if $lp eq '';
+        }
+    }
+
+    # Validate: SCHED_DEADLINE cannot be used with cpuset (AllowedCPUs)
+    if (my $sched = $spec->{process}{scheduler}) {
+        my $cpus = $spec->{linux}{resources}{cpu}{cpus} // '';
+        if ($cpus ne '' && ($sched->{policy} // '') eq 'SCHED_DEADLINE') {
+            fatal("process scheduler can't be used together with AllowedCPUs");
         }
     }
 
@@ -4230,10 +4295,33 @@ sub cmd_create {
                 my $listener_meta = $spec->{linux}{seccomp}{listenerMetadata} // '';
                 if ($listener_path ne '') {
                     eval {
-                        send_fd_via_socket($listener_path, $notify_fd, $listener_meta);
+                        # Build ContainerProcessState JSON per OCI spec.
+                        # The seccompagent expects this as the data payload
+                        # alongside the fd via SCM_RIGHTS.
+                        my $container_state = {
+                            ociVersion => $spec->{ociVersion} // '1.2.0',
+                            fds        => ['seccompFd'],
+                            pid        => $init_pid + 0,
+                            metadata   => $listener_meta,
+                            state      => {
+                                ociVersion  => $spec->{ociVersion} // '1.2.0',
+                                id          => $id // '',
+                                status      => 'running',
+                                pid         => $init_pid + 0,
+                                bundle      => $bundle // '',
+                                annotations => $spec->{annotations} // {},
+                            },
+                        };
+                        my $payload = encode_json($container_state);
+                        send_fd_via_socket($listener_path, $notify_fd, $payload);
                     };
                     if ($@) {
-                        warn "nacre: seccomp notify: failed to send fd to listener: $@\n";
+                        my $err = "$@";
+                        chomp $err;
+                        warn "nacre: failed to connect with seccomp agent at $listener_path: $err\n";
+                        POSIX::close($notify_fd);
+                        channel_send($init_w_fd, { type => 'notify_fd_error', error => $err });
+                        next;
                     }
                 }
                 POSIX::close($notify_fd);
@@ -4430,8 +4518,23 @@ sub cmd_kill {
         $signum = $SIG_NUM{uc($signal)} // fatal("unknown signal: $signal");
     }
 
-    if ($all && $state->{cgroupPath}) {
-        # Kill all processes in cgroup
+    # For SIGKILL: use cgroup.kill (cgroup v2) to atomically kill all
+    # processes in the container.  This is essential when the container
+    # shares the host PID namespace (no init cascade).
+    if ($signum == 9 && $state->{cgroupPath}) {
+        # Try cgroup.kill first (kernel 5.14+)
+        my $cg_kill_ok = eval { cg_write($state->{cgroupPath}, 'cgroup.kill', '1'); 1 };
+        unless ($cg_kill_ok) {
+            # Fallback: freeze + signal all + thaw
+            eval { cg_write($state->{cgroupPath}, 'cgroup.freeze', '1'); };
+            my @pids = cgroup_pids($state->{cgroupPath});
+            for my $pid (@pids) {
+                kill $signum, $pid;
+            }
+            eval { cg_write($state->{cgroupPath}, 'cgroup.freeze', '0'); };
+        }
+    } elsif ($all && $state->{cgroupPath}) {
+        # Kill all processes in cgroup (--all flag)
         my @pids = cgroup_pids($state->{cgroupPath});
         for my $pid (@pids) {
             kill $signum, $pid;
@@ -4559,6 +4662,10 @@ sub cmd_run {
                 }
             }
         };
+
+        # Set PTY to raw mode (disable OPOST/ONLCR — prevents \n→\r\n
+        # conversion that corrupts captured output).
+        pty_set_raw($pty_master_fd);
 
         # Put master in non-blocking mode
         my $fl = fcntl_getfl($pty_master_fd);
@@ -4741,7 +4848,19 @@ sub cmd_list {
     }
 
     if ($format eq 'json') {
-        print $JSON->encode([map { oci_state_json($_) } @containers]);
+        # JSON list output: compact, field order matches runc
+        # (ociVersion, id, pid, status, bundle, rootfs, created)
+        my @entries;
+        for my $c (sort { $a->{id} cmp $b->{id} } @containers) {
+            my $s = oci_state_json($c);
+            my @pairs;
+            for my $key (qw(ociVersion id pid status bundle rootfs created)) {
+                next unless defined $s->{$key};
+                push @pairs, $JSON_COMPACT->encode($key) . ':' . $JSON_COMPACT->encode($s->{$key});
+            }
+            push @entries, '{' . join(',', @pairs) . '}';
+        }
+        print '[' . join(',', @entries) . "]\n";
         return;
     }
 
@@ -4795,6 +4914,9 @@ sub exec_tty_relay {
 
     # Relay I/O between PTY master and our stdin/stdout.
     # This runs until the child process exits.
+
+    # Set PTY to raw mode (disable OPOST/ONLCR — \n should not become \r\n)
+    pty_set_raw($master_fd);
 
     # Put PTY master in non-blocking mode
     my $fl = fcntl_getfl($master_fd);
@@ -5226,11 +5348,15 @@ sub cmd_exec {
         }
 
         # Apply iopriority/scheduler from process.json if given,
-        # otherwise inherit from init (which already set them from config.json)
-        if ($exec_proc) {
+        # otherwise apply from config.json (exec doesn't inherit from
+        # init — it's a new process joining the container's namespaces).
+        if ($exec_proc && ($exec_proc->{scheduler} || $exec_proc->{ioPriority})) {
             my $fake_spec = { process => $exec_proc };
             apply_iopriority($fake_spec);
             apply_scheduler($fake_spec);
+        } else {
+            apply_iopriority($spec);
+            apply_scheduler($spec);
         }
 
         # Apply capabilities: always apply the container's capability
