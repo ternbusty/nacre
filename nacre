@@ -1675,27 +1675,22 @@ sub run_hooks {
 sub run_init_process {
     my ($spec, $rootfs, $notify_fd, $main_chan_w, $main_chan_r, $cgpath, $id, $bundle) = @_;
 
-    # DEBUG: direct mount test before prepare_rootfs
+    # DEBUG: test do_mount directly before prepare_rootfs
     {
         warn "DEBUG: direct mount test - PID=$$ uid=$< euid=$>\n";
-        warn "DEBUG: / exists=" . (-d '/' ? 'yes' : 'no') . "\n";
-        my $nr  = SYS_mount + 0;
-        my $fl  = (MS_SLAVE | MS_REC) + 0;
-        my $tgt = "/\0";
-        warn sprintf("DEBUG: calling syscall(%d, 0, tgt, 0, %d, 0) directly\n", $nr, $fl);
-        my $r = syscall($nr, 0, $tgt, 0, $fl, 0);
+        # Test do_mount with the same args prepare_rootfs uses
+        warn "DEBUG: calling do_mount('', '/', '', MS_SLAVE|MS_REC, '')\n";
+        my $ok = do_mount('', '/', '', MS_SLAVE | MS_REC, '');
         my $e = int($!);
-        warn "DEBUG: direct mount result: r=$r errno=$e ($!)\n";
-        # Also try with undef
-        warn "DEBUG: trying with empty-string source (old way)\n";
-        my $r2 = syscall($nr, "\0", $tgt, "\0", $fl, "\0");
-        my $e2 = int($!);
-        warn "DEBUG: empty-string mount result: r2=$r2 errno=$e2 ($!)\n";
-        # Try calling mount(2) via system
-        warn "DEBUG: trying system mount --make-rslave /\n";
-        system("mount --make-rslave / 2>&1") == 0
-            ? warn "DEBUG: system mount succeeded\n"
-            : warn "DEBUG: system mount failed rc=$?\n";
+        warn "DEBUG: do_mount result: ok=$ok errno=$e ($!)\n";
+        if (!$ok) {
+            # Try direct syscall for comparison
+            my $nr  = SYS_mount + 0;
+            my $fl  = (MS_SLAVE | MS_REC) + 0;
+            my $tgt = "/\0";
+            my $r = syscall($nr, 0, $tgt, 0, $fl, 0);
+            warn "DEBUG: direct syscall result: r=$r errno=" . int($!) . " ($!)\n";
+        }
     }
 
     # Setup rootfs (mounts, devices, symlinks)
