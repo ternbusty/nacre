@@ -338,6 +338,27 @@ sub load_spec {
     return $spec;
 }
 
+sub cache_spec {
+    # OCI spec: updates to config.json after create MUST NOT affect the
+    # container.  Snapshot the spec into the state directory.
+    my ($root, $id, $spec) = @_;
+    my $dir = state_dir($root, $id);
+    ensure_dir($dir);
+    write_file_atomic("$dir/config.json", $JSON->encode($spec));
+}
+
+sub load_cached_spec {
+    # Load the spec snapshot from create time, falling back to the
+    # bundle's config.json for backwards compatibility.
+    my ($root, $id, $bundle) = @_;
+    my $cached = state_dir($root, $id) . '/config.json';
+    my $raw = read_file($cached);
+    if (defined $raw) {
+        return $JSON->decode($raw);
+    }
+    return load_spec($bundle);
+}
+
 sub default_spec {
     return {
         ociVersion => '1.2.0',
@@ -2210,6 +2231,10 @@ sub cmd_create {
     validate_capabilities($spec);
     validate_rlimits($spec);
 
+    # Snapshot config.json — OCI spec: "Any updates to config.json
+    # after this step MUST NOT affect the container."
+    cache_spec($root, $id, $spec);
+
     my $rootfs = $spec->{root}{path} // 'rootfs';
     $rootfs = "$bundle/$rootfs" unless $rootfs =~ m{^/};
     fatal("rootfs '$rootfs' does not exist") unless -d $rootfs;
@@ -2234,10 +2259,13 @@ sub cmd_create {
         $has_pidns  = 1 if $ns->{type} eq 'pid';
     }
 
-    # Always create a mount namespace — pivot_root and rootfs setup
+    # Ensure a mount namespace exists — pivot_root and rootfs setup
     # modify the mount tree and would corrupt the caller's filesystem
-    # if done in a shared mount namespace.
-    $clone_flags |= CLONE_NEWNS;
+    # without one.  Only add CLONE_NEWNS if the spec doesn't already
+    # configure a mount namespace (either by creation or join-by-path).
+    unless (grep { $_->{type} eq 'mount' } @$namespaces) {
+        $clone_flags |= CLONE_NEWNS;
+    }
 
     # Create IPC channels
     my ($main_r_fd, $main_w_fd, $main_r_fh, $main_w_fh) = create_channel();
@@ -2481,21 +2509,25 @@ sub cmd_start {
     fatal("container '$id' is not in 'created' state (is '$state->{status}')")
         unless $state->{status} eq 'created';
 
-    # OCI spec: start MUST generate an error if process was not set
-    my $spec = eval { load_spec($state->{bundle}) };
-    fatal("cannot load config.json from bundle '$state->{bundle}': $@")
-        unless $spec;
+    # OCI spec: start MUST generate an error if process was not set.
+    # Use the cached spec snapshot from create time (config.json
+    # modifications after create MUST NOT affect the container).
+    my $spec = eval { load_cached_spec($root, $id, $state->{bundle}) };
+    fatal("cannot load config: $@") unless $spec;
     unless ($spec->{process} && $spec->{process}{args} && @{$spec->{process}{args}}) {
         # Kill the init process so the container transitions to "stopped"
         # and can be cleaned up.  cmd_create runs a fallback init even
         # when process is unset; leaving it alive would strand the
-        # container in "created" state forever.
-        if ($state->{pid} && $state->{pid} > 0) {
-            kill(9, $state->{pid});
-        }
-        $state->{status} = 'stopped';
-        $state->{pid} = 0;
-        save_state($root, $state);
+        # container in "created" state forever.  Wrap in eval so cleanup
+        # failures don't change the exit code from fatal().
+        eval {
+            if (my $pid = $state->{pid}) {
+                kill(9, $pid) if $pid > 0;
+            }
+            $state->{status} = 'stopped';
+            $state->{pid} = 0;
+            save_state($root, $state);
+        };
         fatal("process is not set in config.json — cannot start container");
     }
 
@@ -2599,8 +2631,8 @@ sub cmd_delete {
         cgroup_cleanup($state->{cgroupPath});
     }
 
-    # Run poststop hooks
-    my $spec = eval { load_spec($state->{bundle}) };
+    # Run poststop hooks (use cached spec from create time)
+    my $spec = eval { load_cached_spec($root, $id, $state->{bundle}) };
     if ($spec && $spec->{hooks}) {
         run_hooks($spec->{hooks}{poststop}, $state);
     }
@@ -2788,7 +2820,7 @@ sub cmd_exec {
         unless $state->{status} eq 'running';
 
     my $init_pid = $state->{pid};
-    my $spec = load_spec($state->{bundle});
+    my $spec = load_cached_spec($root, $id, $state->{bundle});
 
     # Open namespace fds
     my @ns_order = qw(user mnt uts ipc net pid cgroup);
