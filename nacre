@@ -813,11 +813,11 @@ my %PROPAGATION_FLAGS = (
 sub prepare_rootfs {
     my ($spec, $rootfs) = @_;
 
-    # Apply rootfs propagation from spec (default: rslave)
-    my $propagation = $spec->{linux}{rootfsPropagation} // 'rslave';
-    my $prop_flags = $PROPAGATION_FLAGS{$propagation} // (MS_SLAVE | MS_REC);
-    do_mount('', '/', '', $prop_flags, '')
-        or fatal("mount propagation ($propagation) /: $!");
+    # During setup, use slave propagation to prevent mount events from
+    # leaking to the parent mount namespace.  The spec's requested
+    # propagation is applied AFTER pivot_root (see apply_rootfs_propagation).
+    do_mount('', '/', '', MS_SLAVE | MS_REC, '')
+        or fatal("mount propagation (setup) /: $!");
 
     # Bind mount rootfs on itself
     do_mount($rootfs, $rootfs, '', MS_BIND | MS_REC, '')
@@ -965,6 +965,17 @@ sub apply_pivot_root {
     chdir('/') or fatal("chdir /: $!");
 }
 
+sub apply_rootfs_propagation {
+    # Apply the spec's rootfsPropagation AFTER pivot_root, so setup
+    # operations (bind mounts, device creation) run under safe slave
+    # propagation and the final container root gets the requested type.
+    my ($spec) = @_;
+    my $propagation = $spec->{linux}{rootfsPropagation} // 'rslave';
+    my $prop_flags = $PROPAGATION_FLAGS{$propagation} // (MS_SLAVE | MS_REC);
+    do_mount('', '/', '', $prop_flags, '')
+        or fatal("mount propagation ($propagation) /: $!");
+}
+
 sub apply_masked_paths {
     my ($paths) = @_;
     for my $p (@{$paths // []}) {
@@ -995,6 +1006,19 @@ sub set_rootfs_readonly {
 # ═══════════════════════════════════════════════════════════════════════
 # Capabilities
 # ═══════════════════════════════════════════════════════════════════════
+
+sub validate_capabilities {
+    # OCI spec: "Any value which cannot be mapped to a relevant kernel
+    # interface MUST cause an error."
+    my ($spec) = @_;
+    my $caps = $spec->{process}{capabilities} // return;
+    for my $set (qw(bounding effective permitted inheritable ambient)) {
+        for my $name (@{$caps->{$set} // []}) {
+            exists $CAP_NUM{$name}
+                or fatal("unknown capability '$name' in $set set");
+        }
+    }
+}
 
 sub apply_capabilities_bounding {
     # Phase 1: Drop bounding caps and set KEEPCAPS.
@@ -1819,6 +1843,17 @@ my %RLIMIT_MAP = (
     RLIMIT_STACK      => 3,
 );
 
+sub validate_rlimits {
+    # OCI spec: "The runtime MUST generate an error for any values
+    # which cannot be mapped to a relevant kernel interface."
+    my ($spec) = @_;
+    my $rlimits = $spec->{process}{rlimits} // return;
+    for my $rl (@$rlimits) {
+        exists $RLIMIT_MAP{$rl->{type}}
+            or fatal("unknown rlimit type '$rl->{type}'");
+    }
+}
+
 sub apply_rlimits {
     my ($spec) = @_;
     my $rlimits = $spec->{process}{rlimits} // return;
@@ -1946,6 +1981,9 @@ sub run_init_process {
 
     # pivot_root
     apply_pivot_root($rootfs);
+
+    # Apply the spec's rootfs propagation now that we're inside the new root
+    apply_rootfs_propagation($spec);
 
     # Hostname — call syscall() directly (mixed string/integer args)
     if (my $hostname = $spec->{hostname}) {
@@ -2166,6 +2204,12 @@ sub cmd_create {
     }
 
     my $spec = load_spec($bundle);
+
+    # Validate early — OCI spec requires errors for values that cannot
+    # be mapped to kernel interfaces.
+    validate_capabilities($spec);
+    validate_rlimits($spec);
+
     my $rootfs = $spec->{root}{path} // 'rootfs';
     $rootfs = "$bundle/$rootfs" unless $rootfs =~ m{^/};
     fatal("rootfs '$rootfs' does not exist") unless -d $rootfs;
@@ -2189,6 +2233,11 @@ sub cmd_create {
         $has_userns = 1 if $ns->{type} eq 'user';
         $has_pidns  = 1 if $ns->{type} eq 'pid';
     }
+
+    # Always create a mount namespace — pivot_root and rootfs setup
+    # modify the mount tree and would corrupt the caller's filesystem
+    # if done in a shared mount namespace.
+    $clone_flags |= CLONE_NEWNS;
 
     # Create IPC channels
     my ($main_r_fd, $main_w_fd, $main_r_fh, $main_w_fh) = create_channel();
@@ -2256,8 +2305,12 @@ sub cmd_create {
             $ret == 0 or fatal(sprintf("unshare(0x%x): $!", $unshare_flags));
         }
 
-        # Fork again for PID namespace (child becomes PID 1 in new PID ns)
-        if ($has_pidns) {
+        # Fork again for PID namespace (child becomes PID 1 in new PID ns).
+        # Only unshare when creating a NEW PID namespace ($clone_flags has
+        # the flag set).  If the spec joins an existing PID namespace via
+        # path, setns() already handled it above — calling unshare here
+        # would fail with EINVAL.
+        if ($clone_flags & CLONE_NEWPID) {
             my $nr  = SYS_unshare + 0;
             my $flg = CLONE_NEWPID + 0;
             my $ret;
@@ -2432,8 +2485,19 @@ sub cmd_start {
     my $spec = eval { load_spec($state->{bundle}) };
     fatal("cannot load config.json from bundle '$state->{bundle}': $@")
         unless $spec;
-    fatal("process is not set in config.json — cannot start container")
-        unless $spec->{process} && $spec->{process}{args} && @{$spec->{process}{args}};
+    unless ($spec->{process} && $spec->{process}{args} && @{$spec->{process}{args}}) {
+        # Kill the init process so the container transitions to "stopped"
+        # and can be cleaned up.  cmd_create runs a fallback init even
+        # when process is unset; leaving it alive would strand the
+        # container in "created" state forever.
+        if ($state->{pid} && $state->{pid} > 0) {
+            kill(9, $state->{pid});
+        }
+        $state->{status} = 'stopped';
+        $state->{pid} = 0;
+        save_state($root, $state);
+        fatal("process is not set in config.json — cannot start container");
+    }
 
     # Connect to notify socket
     my $notify_path = state_dir($root, $id) . '/notify.sock';
