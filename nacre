@@ -3721,9 +3721,8 @@ sub cmd_run {
                 my $ws = "\0" x 8;
                 ioctl(STDIN, TIOCGWINSZ, $ws);
                 # Forward winsize to the PTY master via sysopen+ioctl on the fd
-                if (open my $mfh, '+<&=', $pty_master_fd) {
+                if (open my $mfh, '+<&', $pty_master_fd) {
                     ioctl($mfh, TIOCSWINSZ, $ws);
-                    # Don't close — it's a dup alias for the raw fd
                 }
             }
         };
@@ -3792,6 +3791,19 @@ sub cmd_run {
         }
 
         POSIX::close($pty_master_fd);
+
+        # Ensure we reap init even if SIGCHLD was missed (race between
+        # cmd_start and handler installation).
+        unless ($done) {
+            my $w = waitpid($init_pid, 0);
+            if ($w == $init_pid) {
+                if (WIFEXITED($?)) {
+                    $exit_code = WEXITSTATUS($?);
+                } elsif (WIFSIGNALED($?)) {
+                    $exit_code = 128 + WTERMSIG($?);
+                }
+            }
+        }
 
         # Restore stdin
         fcntl_setfl($stdin_fd, $stdin_fl) if defined $stdin_fl;
@@ -3891,7 +3903,7 @@ sub cmd_list {
     # Default root that doesn't exist is fine — just show empty list
 
     if ($quiet) {
-        print "$_->{id}\n" for @containers;
+        print "$_->{id}\n" for sort { $a->{id} cmp $b->{id} } @containers;
         return;
     }
 
@@ -4047,7 +4059,9 @@ sub exec_tty_relay {
 sub fcntl_getfl {
     my ($fd) = @_;
     return undef unless defined $fd;
-    open my $fh, '+<&=', $fd or return undef;
+    # Use +<& (dup) instead of +<&= to avoid closing the original fd
+    # when $fh goes out of scope.
+    open my $fh, '+<&', $fd or return undef;
     my $fl = fcntl($fh, Fcntl::F_GETFL(), 0);
     return defined $fl ? ($fl + 0) : undef;
 }
@@ -4055,7 +4069,7 @@ sub fcntl_getfl {
 sub fcntl_setfl {
     my ($fd, $fl) = @_;
     return undef unless defined $fd;
-    open my $fh, '+<&=', $fd or return undef;
+    open my $fh, '+<&', $fd or return undef;
     return fcntl($fh, Fcntl::F_SETFL(), $fl);
 }
 
@@ -4904,6 +4918,10 @@ sub main {
             }
         }
         @ARGV = @before;
+        # Stop option parsing at the first non-option (the container id)
+        # so that command flags (e.g. chrt -p 1) are not consumed as
+        # nacre exec flags.
+        Getopt::Long::Configure('require_order');
         GetOptions(
             'cwd=s'             => \$exec_cwd,
             'env|e=s'           => \@exec_env,
@@ -4918,6 +4936,7 @@ sub main {
             'additional-gids=i' => \@additional_gids,
             'cap=s'             => \@cap_add,
         );
+        Getopt::Long::Configure('permute');
         my $id = shift @ARGV // fatal("container id required");
         @exec_cmd = @ARGV unless @exec_cmd;
         cmd_exec(id => $id, root => $root, command => \@exec_cmd,
