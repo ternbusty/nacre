@@ -182,7 +182,7 @@ jobs:
           # Run as root, in a new session, with ALL stdio detached.
           # stdout/stderr go to a log file; the test loop has zero access
           # to the Actions log pipe, so no lingering child can block steps.
-          sudo setsid bash /tmp/run-validation.sh > /tmp/validation-main.log 2>&1 </dev/null
+          sudo -E setsid bash /tmp/run-validation.sh > /tmp/validation-main.log 2>&1 </dev/null
 
           # Display results back into the Actions log
           cat /tmp/validation-main.log
