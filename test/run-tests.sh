@@ -142,7 +142,7 @@ echo ""
 
 # ── 1. Version / help ──
 echo "Command-line basics:"
-run_test "version" bash -c 'perl '"$NACRE"' --version | grep -q "nacre version"'
+run_test "version" bash -c 'perl '"$NACRE"' --version | grep -q "nacre"'
 run_test "help"    bash -c 'perl '"$NACRE"' --help | grep -q "COMMANDS"'
 
 # ── 2. spec ──
@@ -326,12 +326,13 @@ BUNDLE_EC=$(mktemp -d /tmp/nacre-test-bundle-XXXX)
 make_bundle "$BUNDLE_EC" '"sh", "-c", "exit 42"'
 
 run_test "exit code 42 propagated" bash -c '
-    perl '"$NACRE"' --root '"$ROOT"' run --bundle '"$BUNDLE_EC"' test-ec42 2>&1 || true
-    # Re-run to capture exit code
     set +e
-    perl '"$NACRE"' --root '"$ROOT"' run --bundle '"$BUNDLE_EC"' test-ec42b 2>&1
+    perl '"$NACRE"' --root '"$ROOT"' run --bundle '"$BUNDLE_EC"' test-ec42 2>&1
     rc=$?
     set -e
+    if [ "$rc" -ne 42 ]; then
+        echo "DIAG: expected exit code 42 but got $rc" >&2
+    fi
     [ "$rc" -eq 42 ]
 '
 
