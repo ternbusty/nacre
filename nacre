@@ -2773,9 +2773,15 @@ sub cmd_run {
         if ($wr == 0) {
             # Parse siginfo_t: si_signo at offset 0 (int), si_errno at 4,
             # si_code at 8, _si_pid at 12, _si_uid at 16, si_status at 20
+            my $si_signo  = unpack('i', substr($siginfo, 0, 4));
+            my $si_errno  = unpack('i', substr($siginfo, 4, 4));
             my $si_code   = unpack('i', substr($siginfo, 8, 4));
+            my $si_pid    = unpack('i', substr($siginfo, 12, 4));
+            my $si_uid    = unpack('I', substr($siginfo, 16, 4));
             my $si_status = unpack('i', substr($siginfo, 20, 4));
-            $run_dbg->("waitid result: si_code=$si_code si_status=$si_status");
+            $run_dbg->("waitid siginfo: signo=$si_signo errno=$si_errno code=$si_code pid=$si_pid uid=$si_uid status=$si_status");
+            # Also dump raw hex of first 32 bytes for verification
+            $run_dbg->("siginfo hex: " . unpack('H*', substr($siginfo, 0, 32)));
             if ($si_code == 1) {  # CLD_EXITED
                 $exit_code = $si_status;
             } else {
