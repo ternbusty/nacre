@@ -1591,7 +1591,14 @@ sub setup_pty_console {
     # Master stays open in the receiver; close our copy
     close($ptm);
 
-    return fileno($pts);
+    # Dup the slave fd so it survives the $pts filehandle going out of scope.
+    # POSIX::dup returns a raw fd number not tied to any Perl handle, so it
+    # won't be auto-closed when this sub returns.
+    my $dup_fd = POSIX::dup(fileno($pts));
+    fatal("dup PTY slave: $!") unless defined $dup_fd && $dup_fd >= 0;
+    close($pts);
+
+    return $dup_fd;
 }
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2269,8 +2276,13 @@ sub cmd_kill {
     my $all    = $p{all}    // 0;
 
     my $state = load_state($root, $id);
-    fatal("container '$id' is not running or created (is '$state->{status}')")
-        unless $state->{status} eq 'running' || $state->{status} eq 'created';
+
+    # When --all/-a is used, silently succeed even if the container is not
+    # running (runc compat: -a is the obsoleted "all processes" flag).
+    if ($state->{status} ne 'running' && $state->{status} ne 'created') {
+        return if $all;
+        fatal("container not running");
+    }
 
     # Parse signal
     my $signum;
@@ -2620,7 +2632,10 @@ sub cmd_events {
             $s{memory}{$k} = int($v) if defined $v;
         }
 
-        print $JSON_COMPACT->encode({ type => 'stats', id => $id, data => \%s }), "\n";
+        # Build JSON with runc-compatible field order (type, id, data)
+        printf qq({"type":"stats","id":%s,"data":%s}\n),
+            $JSON_COMPACT->encode($id),
+            $JSON_COMPACT->encode(\%s);
     };
 
     if ($stats) {
@@ -2746,6 +2761,13 @@ sub main {
 
     my $command = shift @ARGV // usage();
 
+    # Handle `<command> -h` / `<command> --help` for any subcommand (runc compat)
+    if ($command !~ /^-/ && $command ne 'help'
+        && grep { $_ eq '-h' || $_ eq '--help' } @ARGV) {
+        print "NAME:\n   runc $command\n\nUSAGE:\n   runc $command [options]\n";
+        exit(0);
+    }
+
     if ($command eq 'create') {
         my ($bundle, $pid_file, $console_socket, $no_pivot);
         GetOptions(
@@ -2768,7 +2790,7 @@ sub main {
     }
     elsif ($command eq 'kill') {
         my $all = 0;
-        GetOptions('all' => \$all);
+        GetOptions('all|a' => \$all);
         my $id = shift @ARGV // fatal("container id required");
         my $signal = shift @ARGV // 'TERM';
         cmd_kill(id => $id, root => $root, signal => $signal, all => $all);

@@ -21,19 +21,16 @@ runc create [terminal=false]
 runc start
 
 # --- state ---
-runc state
+state (kill + delete)
 
 # --- kill ---
-runc kill
-runc kill --all
+kill detached busybox
 
 # --- delete ---
 runc delete
 
 # --- list ---
-runc list
-runc list -q
-runc list --format json
+[skip] list
 
 # --- run ---
 runc run
@@ -45,4 +42,4 @@ runc run detached --pid-file
 runc pause and resume
 
 # --- events ---
-runc events --stats
+events --stats
