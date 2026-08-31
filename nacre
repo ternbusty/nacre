@@ -20,50 +20,107 @@ use Errno qw(EINTR EAGAIN EWOULDBLOCK ENOENT EEXIST EBUSY EPERM ENOSYS EACCES EO
 # Constants
 # ═══════════════════════════════════════════════════════════════════════
 
-# -- Syscall numbers (x86_64) --
-use constant {
-    SYS_mount           => 165,
-    SYS_umount2         => 166,
-    SYS_pivot_root      => 155,
-    SYS_unshare         => 272,
-    SYS_setns           => 308,
-    SYS_clone           => 56,
-    SYS_clone3          => 435,
-    SYS_prctl           => 157,
-    SYS_capget          => 125,
-    SYS_capset          => 126,
-    SYS_mknod           => 133,
-    SYS_mknodat         => 259,
-    SYS_seccomp         => 317,
-    SYS_bpf             => 321,
-    SYS_pidfd_open      => 434,
-    SYS_close_range     => 436,
-    SYS_sethostname     => 170,
-    SYS_setdomainname   => 171,
-    SYS_setgroups       => 116,
-    SYS_prlimit64       => 302,
-    SYS_ioprio_set      => 251,
-    SYS_sched_setattr   => 314,
-    SYS_sched_setaffinity => 203,
-    SYS_set_mempolicy   => 238,
-    SYS_keyctl          => 250,
-    SYS_add_key         => 248,
-    SYS_memfd_create    => 319,
-    SYS_open_tree       => 428,
-    SYS_move_mount      => 429,
-    SYS_mount_setattr   => 442,
-    SYS_fsopen          => 430,
-    SYS_fsconfig        => 431,
-    SYS_fsmount         => 432,
-    SYS_sendmsg         => 46,
-    SYS_recvmsg         => 47,
-    SYS_epoll_create1   => 291,
-    SYS_epoll_ctl       => 233,
-    SYS_epoll_wait      => 232,
-    SYS_inotify_init1   => 294,
-    SYS_inotify_add_watch => 254,
-    SYS_waitid          => 247,
-};
+# -- Syscall numbers (architecture-dependent) --
+# Detect architecture and use the correct syscall numbers.
+# x86_64 uses its own legacy table; aarch64/others use the generic table.
+BEGIN {
+    # Attempt to determine arch from Config at compile time
+    require Config;
+    my $a = $Config::Config{archname} // '';
+    my $x86 = ($a =~ /x86_64|amd64/i) ? 1 : 0;
+
+    if ($x86) {
+        # x86_64 syscall numbers
+        eval 'use constant {
+            SYS_mount             => 165,
+            SYS_umount2           => 166,
+            SYS_pivot_root        => 155,
+            SYS_unshare           => 272,
+            SYS_setns             => 308,
+            SYS_clone             => 56,
+            SYS_clone3            => 435,
+            SYS_prctl             => 157,
+            SYS_capget            => 125,
+            SYS_capset            => 126,
+            SYS_mknod             => 133,
+            SYS_mknodat           => 259,
+            SYS_seccomp           => 317,
+            SYS_bpf               => 321,
+            SYS_pidfd_open        => 434,
+            SYS_close_range       => 436,
+            SYS_sethostname       => 170,
+            SYS_setdomainname     => 171,
+            SYS_setgroups         => 116,
+            SYS_prlimit64         => 302,
+            SYS_ioprio_set        => 251,
+            SYS_sched_setattr     => 314,
+            SYS_sched_setaffinity => 203,
+            SYS_set_mempolicy     => 238,
+            SYS_keyctl            => 250,
+            SYS_add_key           => 248,
+            SYS_memfd_create      => 319,
+            SYS_open_tree         => 428,
+            SYS_move_mount        => 429,
+            SYS_mount_setattr     => 442,
+            SYS_fsopen            => 430,
+            SYS_fsconfig          => 431,
+            SYS_fsmount           => 432,
+            SYS_sendmsg           => 46,
+            SYS_recvmsg           => 47,
+            SYS_epoll_create1     => 291,
+            SYS_epoll_ctl         => 233,
+            SYS_epoll_wait        => 232,
+            SYS_inotify_init1     => 294,
+            SYS_inotify_add_watch => 254,
+            SYS_waitid            => 247,
+        }; 1' or die $@;
+    } else {
+        # aarch64 / generic syscall numbers (asm-generic/unistd.h)
+        eval 'use constant {
+            SYS_mount             => 40,
+            SYS_umount2           => 39,
+            SYS_pivot_root        => 41,
+            SYS_unshare           => 97,
+            SYS_setns             => 268,
+            SYS_clone             => 220,
+            SYS_clone3            => 435,
+            SYS_prctl             => 167,
+            SYS_capget            => 90,
+            SYS_capset            => 91,
+            SYS_mknod             => -1,
+            SYS_mknodat           => 33,
+            SYS_seccomp           => 277,
+            SYS_bpf               => 280,
+            SYS_pidfd_open        => 434,
+            SYS_close_range       => 436,
+            SYS_sethostname       => 161,
+            SYS_setdomainname     => 162,
+            SYS_setgroups         => 159,
+            SYS_prlimit64         => 261,
+            SYS_ioprio_set        => 30,
+            SYS_sched_setattr     => 274,
+            SYS_sched_setaffinity => 122,
+            SYS_set_mempolicy     => 237,
+            SYS_keyctl            => 219,
+            SYS_add_key           => 217,
+            SYS_memfd_create      => 279,
+            SYS_open_tree         => 428,
+            SYS_move_mount        => 429,
+            SYS_mount_setattr     => 442,
+            SYS_fsopen            => 430,
+            SYS_fsconfig          => 431,
+            SYS_fsmount           => 432,
+            SYS_sendmsg           => 211,
+            SYS_recvmsg           => 212,
+            SYS_epoll_create1     => 20,
+            SYS_epoll_ctl         => 21,
+            SYS_epoll_wait        => -1,
+            SYS_inotify_init1     => 26,
+            SYS_inotify_add_watch => 27,
+            SYS_waitid            => 95,
+        }; 1' or die $@;
+    }
+}
 
 # -- Clone / Namespace flags --
 use constant {
@@ -795,8 +852,15 @@ sub create_devices {
         unlink $dest;
         my $dev_num = ($dev->{major} << 8) | $dev->{minor};
         my $ftype = $dev->{type} eq 'b' ? S_IFBLK : S_IFCHR;
-        my $ret = do_syscall(SYS_mknod,
-            $dest . "\0", $ftype | ($dev->{mode} & 0o7777), $dev_num);
+        my $ret;
+        if (SYS_mknod > 0) {
+            $ret = do_syscall(SYS_mknod,
+                $dest . "\0", $ftype | ($dev->{mode} & 0o7777), $dev_num);
+        } else {
+            # aarch64: use mknodat with AT_FDCWD (-100)
+            $ret = do_syscall(SYS_mknodat, -100,
+                $dest . "\0", $ftype | ($dev->{mode} & 0o7777), $dev_num);
+        }
         if ($ret != 0) {
             # Non-fatal in user namespaces
             next;
@@ -2561,9 +2625,12 @@ sub main {
     elsif ($command eq '--help' || $command eq '-h' || $command eq 'help') {
         usage();
     }
-    elsif ($command eq '--version' || $command eq '-v') {
+    elsif ($command eq '--version' || $command eq '-v' || $command eq 'version') {
+        use Config;
         print "nacre version 0.1.0\n";
         print "spec: 1.2.0\n";
+        print "arch: $Config{archname}\n";
+        print "SYS_unshare: " . SYS_unshare . "\n";
     }
     else {
         fatal("unknown command: $command");

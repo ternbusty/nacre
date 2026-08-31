@@ -24,6 +24,27 @@ jobs:
           WRAPPER
           sudo chmod +x /opt/nacre/bin
 
+      - name: System diagnostics
+        run: |
+          echo "=== Architecture ==="
+          uname -m
+          uname -a
+          echo "=== Perl ==="
+          perl -v | head -5
+          perl -e 'use Config; print "archname=$Config{archname}\n"'
+          echo "=== Nacre version ==="
+          perl /opt/nacre/nacre version 2>&1 || true
+          echo "=== syscall() sanity check ==="
+          perl -e '
+            use Config;
+            my $arch = $Config{archname};
+            my $sys_getpid = ($arch =~ /x86_64|amd64/i) ? 39 : 172;
+            my $pid = syscall($sys_getpid);
+            print "arch=$arch\n";
+            print "sys_getpid=$sys_getpid result=$pid real=$$\n";
+            print "match=" . ($pid == $$ ? "YES" : "NO") . "\n";
+          '
+
       - name: Install Go and dependencies
         run: |
           sudo apt-get update || true
