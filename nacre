@@ -1855,10 +1855,27 @@ sub cmd_create {
             fatal("mapping failed") unless $resp && $resp->{type} eq 'mapping_done';
         }
 
-        # Unshare remaining namespaces (not PID, not cgroup)
+        # Unshare remaining namespaces (not PID, not cgroup).
+        # Try all at once; if that fails, fall back to one-at-a-time to
+        # isolate which namespace is the problem and to handle kernels or
+        # environments that only support individual unshare calls.
         if ($unshare_flags) {
-            do_syscall_int(SYS_unshare, $unshare_flags)
-                == 0 or fatal("unshare(0x" . sprintf('%x', $unshare_flags) . "): $!");
+            if (do_syscall_int(SYS_unshare, $unshare_flags) != 0) {
+                my @ordered = (
+                    [CLONE_NEWUSER,  'user'],
+                    [CLONE_NEWNS,    'mount'],
+                    [CLONE_NEWUTS,   'uts'],
+                    [CLONE_NEWIPC,   'ipc'],
+                    [CLONE_NEWNET,   'net'],
+                    [CLONE_NEWTIME,  'time'],
+                );
+                for my $pair (@ordered) {
+                    my ($flag, $name) = @$pair;
+                    next unless $unshare_flags & $flag;
+                    do_syscall_int(SYS_unshare, $flag)
+                        == 0 or fatal("unshare $name: $!");
+                }
+            }
         }
 
         # Fork again for PID namespace (child becomes PID 1 in new PID ns)
