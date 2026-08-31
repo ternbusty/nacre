@@ -4,8 +4,9 @@ use strict;
 use warnings;
 use POSIX qw(setsid _exit dup2 mkfifo WNOHANG WIFEXITED WEXITSTATUS
              WIFSIGNALED WTERMSIG :sys_wait_h :signal_h :errno_h);
-use Socket qw(AF_UNIX SOCK_STREAM SOCK_SEQPACKET SOL_SOCKET SCM_RIGHTS
-              pack_sockaddr_un PF_UNIX MSG_DONTWAIT);
+use Socket qw(AF_UNIX AF_INET SOCK_STREAM SOCK_DGRAM SOCK_SEQPACKET SOL_SOCKET SCM_RIGHTS
+              pack_sockaddr_un PF_UNIX MSG_DONTWAIT
+              inet_aton inet_ntoa inet_pton inet_ntop);
 use JSON::PP;
 use File::Basename qw(basename dirname);
 use File::Path qw(make_path remove_tree);
@@ -13,6 +14,7 @@ use Fcntl qw(:flock :mode :seek O_RDONLY O_WRONLY O_RDWR O_CREAT
              O_TRUNC O_EXCL O_NONBLOCK O_DIRECTORY O_NOFOLLOW O_NOCTTY
              F_GETFD F_SETFD FD_CLOEXEC);
 use constant O_CLOEXEC => 0o2000000;
+use constant O_PATH    => 0o10000000;
 use Getopt::Long qw(:config pass_through no_auto_abbrev);
 use Cwd qw(abs_path getcwd);
 use Errno qw(EINTR EAGAIN EWOULDBLOCK ENOENT EEXIST EBUSY EPERM ENOSYS EACCES EOVERFLOW);
@@ -224,15 +226,21 @@ use constant {
 
 # -- mount_setattr flags (kernel 5.12+) --
 use constant {
-    AT_RECURSIVE       => 0x8000,
-    MOUNT_ATTR_RDONLY  => 0x00000001,
-    MOUNT_ATTR_NOSUID  => 0x00000002,
-    MOUNT_ATTR_NODEV   => 0x00000004,
-    MOUNT_ATTR_NOEXEC  => 0x00000008,
-    MOUNT_ATTR_NOATIME    => 0x00000010,
+    AT_RECURSIVE        => 0x8000,
+    AT_EMPTY_PATH       => 0x1000,
+    MOUNT_ATTR_RDONLY   => 0x00000001,
+    MOUNT_ATTR_NOSUID   => 0x00000002,
+    MOUNT_ATTR_NODEV    => 0x00000004,
+    MOUNT_ATTR_NOEXEC   => 0x00000008,
+    MOUNT_ATTR_NOATIME     => 0x00000010,
     MOUNT_ATTR_STRICTATIME => 0x00000020,
     MOUNT_ATTR_NODIRATIME  => 0x00000080,
     MOUNT_ATTR__ATIME      => 0x00000070,  # mask for atime settings
+    MOUNT_ATTR_NOSYMFOLLOW => 0x00200000,
+    MOUNT_ATTR_IDMAP       => 0x00100000,
+    OPEN_TREE_CLONE     => 1,
+    OPEN_TREE_CLOEXEC   => 0x80000,
+    MOVE_MOUNT_F_EMPTY_PATH => 0x00000004,
 };
 
 # -- PTY / terminal ioctls --
@@ -876,6 +884,287 @@ sub convert_cpu_shares {
 }
 
 # ═══════════════════════════════════════════════════════════════════════
+# Network Device (netlink)
+# ═══════════════════════════════════════════════════════════════════════
+
+use constant {
+    AF_NETLINK          => 16,
+    NETLINK_ROUTE       => 0,
+    RTM_SETLINK         => 19,
+    RTM_NEWADDR         => 20,
+    RTM_GETADDR         => 22,
+    NLMSG_DONE          => 3,
+    NLMSG_ERROR         => 2,
+    NLM_F_REQUEST       => 1,
+    NLM_F_ACK           => 4,
+    NLM_F_DUMP          => 0x300,
+    NLM_F_CREATE        => 0x400,
+    NLM_F_EXCL          => 0x200,
+    IFLA_IFNAME         => 3,
+    IFLA_NET_NS_PID     => 19,
+    IFLA_MTU            => 4,
+    IFLA_ADDRESS        => 1,   # hardware address attribute
+    IFA_ADDRESS_ATTR    => 1,   # IFA_ADDRESS in ifaddrmsg context
+    IFA_LOCAL           => 2,
+    IFA_FLAGS           => 8,
+    IFA_F_PERMANENT     => 0x80,
+    RT_SCOPE_UNIVERSE   => 0,
+    IFF_UP              => 1,
+    SIOCGIFINDEX        => 0x8933,
+    SIOCGIFHWADDR       => 0x8927,
+    SIOCSIFHWADDR       => 0x8924,
+    SIOCSIFMTU          => 0x8922,
+    AF_INET             => 2,
+    AF_INET6            => 10,
+};
+
+# Send a netlink message and wait for ACK
+sub send_netlink {
+    my ($msg) = @_;
+    socket(my $sock, AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE)
+        or fatal("netlink socket: $!");
+    # bind with nl_family=AF_NETLINK, pad=0, nl_pid=0, nl_groups=0
+    my $sa = pack('S x2 L L', AF_NETLINK, 0, 0);
+    bind($sock, $sa) or fatal("netlink bind: $!");
+    send($sock, $msg, 0) or fatal("netlink send: $!");
+    my $ack = '';
+    recv($sock, $ack, 1024, 0) or fatal("netlink recv: $!");
+    close $sock;
+    # Parse nlmsghdr: len(4) type(2) flags(2) seq(4) pid(4)
+    my ($len, $type, $flags, $seq, $pid) = unpack('L S S L L', $ack);
+    if ($type == NLMSG_ERROR) {
+        my $error = unpack('l', substr($ack, 16, 4));
+        fatal("netlink error: " . ($error == 0 ? 'ok' : POSIX::strerror(-$error)))
+            if $error != 0;
+    }
+}
+
+# Get interface index by name
+sub get_ifindex {
+    my ($ifname) = @_;
+    socket(my $sock, AF_INET, SOCK_DGRAM, 0) or fatal("socket: $!");
+    # struct ifreq: 16-byte name + 16-byte data (ifr_ifindex at offset 16)
+    my $ifreq = pack('a16 x16', $ifname);
+    ioctl($sock, SIOCGIFINDEX, $ifreq) or fatal("ioctl SIOCGIFINDEX $ifname: $!");
+    close $sock;
+    return unpack('x16 l', $ifreq);
+}
+
+# Move a network device to another namespace by PID
+sub netlink_move_to_ns {
+    my ($ifindex, $ns_pid) = @_;
+    # nlmsghdr(16) + ifinfomsg(16) + rtattr IFLA_NET_NS_PID(8) = 40
+    my $msg = pack('L S S L L',  # nlmsghdr
+                   40, RTM_SETLINK, NLM_F_REQUEST | NLM_F_ACK, 1, 0)
+            . pack('C x S l L L',  # ifinfomsg
+                   0, 0, $ifindex, 0, 0)
+            . pack('S S L',  # rtattr IFLA_NET_NS_PID
+                   8, IFLA_NET_NS_PID, $ns_pid);
+    send_netlink($msg);
+}
+
+# Rename a network device
+sub netlink_rename {
+    my ($ifindex, $new_name) = @_;
+    my $name_data = pack('Z*', $new_name);
+    my $attr_len = 4 + length($name_data);
+    my $padded_len = ($attr_len + 3) & ~3;
+    my $total = 16 + 16 + $padded_len;  # nlmsghdr + ifinfomsg + attr
+    my $msg = pack('L S S L L', $total, RTM_SETLINK, NLM_F_REQUEST | NLM_F_ACK, 1, 0)
+            . pack('C x S l L L', 0, 0, $ifindex, 0, 0)
+            . pack('S S', $attr_len, IFLA_IFNAME)
+            . $name_data
+            . ("\0" x ($padded_len - $attr_len));
+    send_netlink($msg);
+}
+
+# Set interface UP
+sub netlink_set_up {
+    my ($ifindex) = @_;
+    my $msg = pack('L S S L L', 32, RTM_SETLINK, NLM_F_REQUEST | NLM_F_ACK, 1, 0)
+            . pack('C x S l L L', 0, 0, $ifindex, IFF_UP, IFF_UP);
+    send_netlink($msg);
+}
+
+# Set MTU via ioctl
+sub set_mtu {
+    my ($ifname, $mtu) = @_;
+    socket(my $sock, AF_INET, SOCK_DGRAM, 0) or fatal("socket: $!");
+    my $ifreq = pack('a16 l x12', $ifname, $mtu);
+    ioctl($sock, SIOCSIFMTU, $ifreq) or fatal("ioctl SIOCSIFMTU $ifname: $!");
+    close $sock;
+}
+
+# Set MAC address via ioctl
+sub set_mac_address {
+    my ($ifname, $mac_str) = @_;
+    my @bytes = map { hex } split /:/, $mac_str;
+    fatal("invalid MAC: $mac_str") unless @bytes == 6;
+    socket(my $sock, AF_INET, SOCK_DGRAM, 0) or fatal("socket: $!");
+    # struct sockaddr: sa_family(2) + sa_data(14)
+    my $sa = pack('S C6 x8', 1, @bytes);  # ARPHRD_ETHER = 1
+    my $ifreq = pack('a16 a16', $ifname, $sa);
+    ioctl($sock, SIOCSIFHWADDR, $ifreq) or fatal("ioctl SIOCSIFHWADDR $ifname: $!");
+    close $sock;
+}
+
+# Add an IP address to an interface via netlink
+sub netlink_add_addr {
+    my ($ifindex, $addr_str) = @_;
+    # Parse "1.2.3.4/24" or "fe80::1/64"
+    my ($addr, $prefix) = split m{/}, $addr_str;
+    $prefix //= ($addr =~ /:/) ? 128 : 32;
+    my $family = ($addr =~ /:/) ? AF_INET6 : AF_INET;
+    my $addr_bytes = ($family == AF_INET6)
+        ? inet_pton(AF_INET6, $addr)
+        : inet_aton($addr);
+    fatal("invalid address: $addr") unless defined $addr_bytes;
+    my $addr_len = length $addr_bytes;
+    my $attr_len = 4 + $addr_len;
+    my $padded_attr = ($attr_len + 3) & ~3;
+    # Two attrs: IFA_LOCAL + IFA_ADDRESS
+    my $total = 16 + 8 + $padded_attr * 2;
+    my $msg = pack('L S S L L', $total,
+                   RTM_NEWADDR, NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, 1, 0)
+            . pack('C C C C l',  # ifaddrmsg
+                   $family, $prefix, 0, RT_SCOPE_UNIVERSE, $ifindex)
+            . pack('S S', $attr_len, IFA_LOCAL)
+            . $addr_bytes . ("\0" x ($padded_attr - $attr_len))
+            . pack('S S', $attr_len, IFA_ADDRESS_ATTR)
+            . $addr_bytes . ("\0" x ($padded_attr - $attr_len));
+    send_netlink($msg);
+}
+
+# List permanent global addresses on an interface (for saving before move)
+sub netlink_list_addrs {
+    my ($ifindex) = @_;
+    socket(my $sock, AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE)
+        or fatal("netlink socket: $!");
+    my $sa = pack('S x2 L L', AF_NETLINK, 0, 0);
+    bind($sock, $sa) or fatal("netlink bind: $!");
+    # RTM_GETADDR dump request
+    my $req = pack('L S S L L', 24, RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, 1, 0)
+            . pack('C C C C l', 0, 0, 0, 0, 0);  # ifaddrmsg (all zeros)
+    send($sock, $req, 0) or fatal("netlink send: $!");
+    my @addrs;
+    my $buf;
+    while (1) {
+        $buf = '';
+        recv($sock, $buf, 65536, 0) or last;
+        my $offset = 0;
+        while ($offset + 16 <= length($buf)) {
+            my ($len, $type, $flags, $seq, $pid) = unpack('L S S L L', substr($buf, $offset, 16));
+            last if $len < 16 || $offset + $len > length($buf);
+            last if $type == NLMSG_DONE;
+            if ($type == RTM_NEWADDR && $len >= 24) {
+                my ($ifa_family, $ifa_prefixlen, $ifa_flags, $ifa_scope, $ifa_index) =
+                    unpack('C C C C l', substr($buf, $offset + 16, 8));
+                if ($ifa_index == $ifindex && $ifa_scope == RT_SCOPE_UNIVERSE) {
+                    # Parse rtattrs to find IFA_LOCAL or IFA_ADDRESS and IFA_FLAGS
+                    my $attr_off = $offset + 24;
+                    my ($addr_data, $ext_flags);
+                    while ($attr_off + 4 <= $offset + $len) {
+                        my ($rta_len, $rta_type) = unpack('S S', substr($buf, $attr_off, 4));
+                        last if $rta_len < 4;
+                        my $data = substr($buf, $attr_off + 4, $rta_len - 4);
+                        if ($rta_type == IFA_LOCAL || ($rta_type == IFA_ADDRESS_ATTR && !defined $addr_data)) {
+                            $addr_data = $data;
+                        } elsif ($rta_type == IFA_FLAGS) {
+                            $ext_flags = unpack('L', $data) if length($data) >= 4;
+                        }
+                        $attr_off += ($rta_len + 3) & ~3;
+                    }
+                    my $final_flags = defined $ext_flags ? $ext_flags : $ifa_flags;
+                    if (defined $addr_data && ($final_flags & IFA_F_PERMANENT)) {
+                        push @addrs, {
+                            family    => $ifa_family,
+                            prefix    => $ifa_prefixlen,
+                            addr_data => $addr_data,
+                        };
+                    }
+                }
+            }
+            $offset += ($len + 3) & ~3;
+        }
+        # Check if we got NLMSG_DONE
+        last if $type == NLMSG_DONE;
+    }
+    close $sock;
+    return @addrs;
+}
+
+# Move network devices into the container's network namespace.
+# Called from the main (parent) process.
+sub move_net_devices {
+    my ($netdevs, $ns_pid) = @_;
+    for my $host_name (sort keys %$netdevs) {
+        my $dev = $netdevs->{$host_name};
+        log_debug("netdev: moving $host_name to ns of PID $ns_pid");
+        my $ifindex = eval { get_ifindex($host_name) };
+        fatal("netdev: interface '$host_name' not found: $@") if $@;
+        # Save permanent global addresses before moving
+        my @saved_addrs = eval { netlink_list_addrs($ifindex) };
+        netlink_move_to_ns($ifindex, $ns_pid);
+        # After moving, re-add addresses and bring up the interface
+        # inside the container's network namespace via setns.
+        if (@saved_addrs || $dev->{addresses}) {
+            # Open our own netns for later restore
+            sysopen(my $host_ns, '/proc/self/ns/net', O_RDONLY)
+                or fatal("open host netns: $!");
+            # Enter container netns
+            sysopen(my $ctr_ns, "/proc/$ns_pid/ns/net", O_RDONLY)
+                or fatal("open container netns: $!");
+            my $nr = SYS_setns + 0;
+            my $fd = fileno($ctr_ns) + 0;
+            my $fl = CLONE_NEWNET + 0;
+            syscall($nr, $fd, $fl) == 0 or fatal("setns container netns: $!");
+            close $ctr_ns;
+            # Look up new interface index (might differ after move)
+            my $ctr_name = $dev->{name} // $host_name;
+            my $new_idx = eval { get_ifindex($host_name) };  # still has old name
+            if (defined $new_idx) {
+                # Re-add saved addresses
+                for my $a (@saved_addrs) {
+                    my $addr_str;
+                    if ($a->{family} == AF_INET) {
+                        $addr_str = inet_ntoa($a->{addr_data});
+                    } elsif ($a->{family} == AF_INET6) {
+                        $addr_str = inet_ntop(AF_INET6, $a->{addr_data});
+                    }
+                    if ($addr_str) {
+                        eval { netlink_add_addr($new_idx, "$addr_str/$a->{prefix}") };
+                    }
+                }
+                # Bring link up
+                eval { netlink_set_up($new_idx) };
+            }
+            # Return to host netns
+            $nr = SYS_setns + 0;
+            $fd = fileno($host_ns) + 0;
+            $fl = CLONE_NEWNET + 0;
+            syscall($nr, $fd, $fl) == 0 or fatal("setns host netns: $!");
+            close $host_ns;
+        }
+        # Apply additional config from spec (mtu, macAddress, addresses)
+        # These are applied inside the container netns by the init process
+        # after rename.
+    }
+}
+
+# Rename network devices inside the container (called from init process)
+sub rename_net_devices {
+    my ($netdevs) = @_;
+    for my $host_name (sort keys %$netdevs) {
+        my $dev = $netdevs->{$host_name};
+        my $new_name = $dev->{name} // next;  # no rename needed
+        my $ifindex = eval { get_ifindex($host_name) };
+        next unless defined $ifindex;
+        log_debug("netdev: renaming $host_name -> $new_name (idx=$ifindex)");
+        netlink_rename($ifindex, $new_name);
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
 # Mount / Rootfs
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -936,9 +1225,9 @@ my %RECURSIVE_MOUNT_ATTRS = (
 );
 
 sub do_mount_setattr {
-    my ($dirfd, $path, $flags, $attr_set, $attr_clr) = @_;
+    my ($dirfd, $path, $flags, $attr_set, $attr_clr, $userns_fd) = @_;
     # struct mount_attr { __u64 attr_set, attr_clr, propagation, userns_fd; }
-    my $attr = pack('QQQQ', $attr_set, $attr_clr, 0, 0);
+    my $attr = pack('QQQQ', $attr_set, $attr_clr, 0, $userns_fd // 0);
     my $nr = SYS_mount_setattr + 0;
     my $df = $dirfd + 0;
     my $p  = $path . "\0";
@@ -946,6 +1235,29 @@ sub do_mount_setattr {
     my $sz = length($attr) + 0;
     my $ret;
     do { $ret = syscall($nr, $df, $p, $fl, $attr, $sz) }
+        while ($ret == -1 && $! == EINTR);
+    return $ret == 0;
+}
+
+sub do_open_tree {
+    my ($dirfd, $path, $flags) = @_;
+    my $nr = SYS_open_tree + 0;
+    my $df = $dirfd + 0;
+    my $fl = $flags + 0;
+    my $ret;
+    do { $ret = syscall($nr, $df, $path, $fl) }
+        while ($ret == -1 && $! == EINTR);
+    return $ret;
+}
+
+sub do_move_mount {
+    my ($from_fd, $from_path, $to_fd, $to_path, $flags) = @_;
+    my $nr = SYS_move_mount + 0;
+    my $ffd = $from_fd + 0;
+    my $tfd = $to_fd + 0;
+    my $fl  = $flags + 0;
+    my $ret;
+    do { $ret = syscall($nr, $ffd, $from_path, $tfd, $to_path, $fl) }
         while ($ret == -1 && $! == EINTR);
     return $ret == 0;
 }
@@ -1074,7 +1386,7 @@ sub _copy_dir_contents {
 }
 
 sub prepare_rootfs {
-    my ($spec, $rootfs) = @_;
+    my ($spec, $rootfs, $mount_source_fds, $chan_w, $chan_r) = @_;
 
     # During setup, use slave propagation to prevent mount events from
     # leaking to the parent mount namespace.  The spec's requested
@@ -1087,7 +1399,7 @@ sub prepare_rootfs {
         or fatal("bind mount rootfs: $!");
 
     # Apply spec mounts (returns whether /dev needs deferred ro remount)
-    my $dev_needs_ro = apply_mounts($spec, $rootfs);
+    my $dev_needs_ro = apply_mounts($spec, $rootfs, $mount_source_fds, $chan_w, $chan_r);
 
     # Create default devices via bind mount
     create_devices($rootfs, $spec);
@@ -1102,8 +1414,119 @@ sub prepare_rootfs {
     }
 }
 
+# Build "containerID hostID size\n" mapping string for idmap userns
+sub _build_map_string {
+    my ($maps) = @_;
+    return '' unless ref $maps eq 'ARRAY' && @$maps;
+    return join('', map { "$_->{containerID} $_->{hostID} $_->{size}\n" } @$maps);
+}
+
+# Create a user namespace with specific UID/GID mappings for idmap mounts.
+# Returns the userns fd.
+sub _create_userns_for_idmap {
+    my ($uid_maps, $gid_maps, $chan_w, $chan_r) = @_;
+
+    my $uid_str = _build_map_string($uid_maps);
+    my $gid_str = _build_map_string($gid_maps);
+    $uid_str = "0 0 4294967295\n" if $uid_str eq '';
+    $gid_str = "0 0 4294967295\n" if $gid_str eq '';
+
+    # Create socketpair for passing the userns fd back
+    socketpair(my $p_sock, my $c_sock, AF_UNIX, SOCK_STREAM, 0)
+        or fatal("socketpair: $!");
+
+    # Create sync pipes
+    pipe(my $pr, my $cw) or fatal("pipe: $!");
+    pipe(my $cr, my $pw) or fatal("pipe: $!");
+
+    my $child = fork();
+    fatal("fork: $!") unless defined $child;
+
+    if ($child == 0) {
+        close $p_sock;
+        close $pr;
+        close $pw;
+        # Unshare user namespace
+        my $nr = SYS_unshare + 0;
+        my $fl = CLONE_NEWUSER + 0;
+        syscall($nr, $fl) == 0 or _exit(1);
+        # Signal parent: "ready for mappings"
+        syswrite($cw, "R", 1);
+        close $cw;
+        # Wait for parent to write mappings
+        my $buf;
+        sysread($cr, $buf, 1);
+        close $cr;
+        # Send userns fd to parent via SCM_RIGHTS
+        sysopen(my $ns_fh, '/proc/self/ns/user', O_RDONLY) or _exit(1);
+        send_fd_over_fd(fileno($c_sock), fileno($ns_fh));
+        close $ns_fh;
+        close $c_sock;
+        _exit(0);
+    }
+
+    close $c_sock;
+    close $cw;
+    close $cr;
+    # Wait for child to unshare
+    my $buf;
+    sysread($pr, $buf, 1);
+    close $pr;
+
+    # Write mappings
+    write_file("/proc/$child/setgroups", "deny");
+    write_file("/proc/$child/uid_map", $uid_str);
+    write_file("/proc/$child/gid_map", $gid_str);
+
+    # Signal child: "mappings written"
+    syswrite($pw, "D", 1);
+    close $pw;
+
+    # Receive userns fd
+    my $userns_fd = recv_fd_over_fd(fileno($p_sock));
+    close $p_sock;
+    waitpid($child, 0);
+
+    fatal("failed to receive userns fd for idmap") if $userns_fd < 0;
+    return $userns_fd;
+}
+
+# Create a user namespace from pre-built mapping strings (parent-side).
+sub _create_userns_from_strings {
+    my ($uid_map_str, $gid_map_str) = @_;
+    socketpair(my $p_sock, my $c_sock, AF_UNIX, SOCK_STREAM, 0) or fatal("socketpair: $!");
+    pipe(my $pr, my $cw) or fatal("pipe: $!");
+    pipe(my $cr, my $pw) or fatal("pipe: $!");
+    my $child = fork();
+    fatal("fork: $!") unless defined $child;
+    if ($child == 0) {
+        close $p_sock; close $pr; close $pw;
+        my $nr = SYS_unshare + 0;
+        my $fl = CLONE_NEWUSER + 0;
+        syscall($nr, $fl) == 0 or _exit(1);
+        syswrite($cw, "R", 1); close $cw;
+        my $b; sysread($cr, $b, 1); close $cr;
+        sysopen(my $fh, '/proc/self/ns/user', O_RDONLY) or _exit(1);
+        send_fd_over_fd(fileno($c_sock), fileno($fh));
+        close $fh; close $c_sock;
+        _exit(0);
+    }
+    close $c_sock; close $cw; close $cr;
+    my $b; sysread($pr, $b, 1); close $pr;
+    eval { write_file("/proc/$child/setgroups", "deny") };
+    write_file("/proc/$child/uid_map", $uid_map_str);
+    write_file("/proc/$child/gid_map", $gid_map_str);
+    syswrite($pw, "D", 1); close $pw;
+    my $userns_fd = recv_fd_over_fd(fileno($p_sock));
+    close $p_sock;
+    waitpid($child, 0);
+    fatal("failed to create userns for idmap") if $userns_fd < 0;
+    return $userns_fd;
+}
+
 sub apply_mounts {
-    my ($spec, $rootfs) = @_;
+    my ($spec, $rootfs, $mount_source_fds, $chan_w, $chan_r) = @_;
+    $mount_source_fds //= {};
     log_debug("applying mounts, rootfs=$rootfs");
 
     # Track /dev ro remount: defer MS_RDONLY on /dev until after device creation
@@ -1136,11 +1559,17 @@ sub apply_mounts {
         # Filter out OCI-specific pseudo-options and recursive mount attrs
         my @raw_opts = @{$m->{options} // []};
         my $tmpcopyup = 0;
+        my $has_idmap = 0;
+        my $has_ridmap = 0;
         my @real_opts;
         my @recursive_attrs;  # recursive mount_setattr options
         for my $o (@raw_opts) {
             if ($o eq 'tmpcopyup' || $o eq 'copy') {
                 $tmpcopyup = 1;
+            } elsif ($o eq 'idmap') {
+                $has_idmap = 1;
+            } elsif ($o eq 'ridmap') {
+                $has_ridmap = 1;
             } elsif (exists $RECURSIVE_MOUNT_ATTRS{$o}) {
                 push @recursive_attrs, $o;
             } else {
@@ -1176,9 +1605,18 @@ sub apply_mounts {
         }
 
         if ($flags & MS_BIND) {
-            # Bind mount
-            do_mount($src, $dest, '', $flags, '')
-                or do { warn "nacre: mount bind $dest: $!\n"; next; };
+            # Bind mount — if the source is inaccessible (e.g. after
+            # entering a user namespace), fall back to /proc/self/fd/N
+            # using a pre-opened fd.
+            my $mounted = do_mount($src, $dest, '', $flags, '');
+            if (!$mounted && defined $mount_source_fds->{$mount_src}) {
+                my $fd = $mount_source_fds->{$mount_src};
+                $mounted = do_mount("/proc/self/fd/$fd", $dest, '', $flags, '');
+            }
+            unless ($mounted) {
+                warn "nacre: mount bind $dest: $!\n";
+                next;
+            }
             # Apply remaining flags via remount
             if ($flags & ~(MS_BIND | MS_REC)) {
                 do_mount('', $dest, '', MS_REMOUNT | MS_BIND | ($flags & ~MS_REC), '')
@@ -1210,6 +1648,65 @@ sub apply_mounts {
                 do_mount_setattr(-1, $dest, AT_RECURSIVE, $attr_set, $attr_clr)
                     or warn "nacre: mount_setattr $dest: $!\n";
             }
+        }
+
+        # Apply idmap/ridmap via open_tree + mount_setattr + move_mount
+        if ($has_idmap || $has_ridmap) {
+            my $open_flags = OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC;
+            $open_flags |= AT_RECURSIVE if ($flags & MS_REC);
+            my $tree_fd = do_open_tree(-1, $dest, $open_flags);
+            fatal("open_tree $dest: $!") if $tree_fd < 0;
+
+            # Determine the user namespace fd for the mapping
+            my $userns_fd;
+            my $per_mount_maps = $m->{uidMappings} || $m->{gidMappings};
+            if ($per_mount_maps) {
+                # Per-mount explicit mappings: create a user namespace
+                # with those mappings.
+                $userns_fd = _create_userns_for_idmap(
+                    $m->{uidMappings} // [],
+                    $m->{gidMappings} // [],
+                    $chan_w, $chan_r,
+                );
+            } else {
+                # Implied mapping: use the container's own user namespace.
+                # If we're inside a userns, /proc/self/ns/user is our userns.
+                sysopen(my $ns_fh, '/proc/self/ns/user', O_RDONLY)
+                    or fatal("open /proc/self/ns/user: $!");
+                $userns_fd = fileno($ns_fh);
+                # Keep the fh alive
+                push @{$mount_source_fds->{_fhs}}, $ns_fh;
+            }
+
+            # Apply mount_setattr(MOUNT_ATTR_IDMAP)
+            my $setattr_flags = AT_EMPTY_PATH;
+            $setattr_flags |= AT_RECURSIVE if $has_ridmap;
+            my $ok = do_mount_setattr($tree_fd, "", $setattr_flags,
+                                       MOUNT_ATTR_IDMAP, 0, $userns_fd);
+            if (!$ok) {
+                # If init can't do it (in userns), ask parent
+                if ($chan_w && $! == EPERM) {
+                    channel_send($chan_w, {
+                        type      => 'mount_fd_request',
+                        ridmap    => $has_ridmap ? 1 : 0,
+                        uid_map   => _build_map_string($m->{uidMappings}),
+                        gid_map   => _build_map_string($m->{gidMappings}),
+                        implied   => $per_mount_maps ? 0 : 1,
+                    });
+                    send_fd_over_fd($chan_w, $tree_fd);
+                    my $resp = channel_recv($chan_r);
+                    fatal("mount_setattr idmap failed") unless $resp && $resp->{type} eq 'mount_fd_done';
+                } else {
+                    POSIX::close($tree_fd);
+                    fatal("mount_setattr MOUNT_ATTR_IDMAP $dest: $!");
+                }
+            }
+
+            # Replace original mount with the idmapped one
+            do_umount($dest, MNT_DETACH);
+            do_move_mount($tree_fd, "", -1, $dest, MOVE_MOUNT_F_EMPTY_PATH)
+                or fatal("move_mount $dest: $!");
+            POSIX::close($tree_fd);
         }
 
         # Restore tmpcopyup content
@@ -2892,7 +3389,7 @@ sub run_hooks {
 # ═══════════════════════════════════════════════════════════════════════
 
 sub run_init_process {
-    my ($spec, $rootfs, $notify_fd, $main_chan_w, $main_chan_r, $cgpath, $id, $bundle, $console_socket_path, $debug_fd, $no_pivot, $foreground, $pty_sock_fd) = @_;
+    my ($spec, $rootfs, $notify_fd, $main_chan_w, $main_chan_r, $cgpath, $id, $bundle, $console_socket_path, $debug_fd, $no_pivot, $foreground, $pty_sock_fd, $mount_source_fds) = @_;
 
     my $dbg = sub {
         return unless defined $debug_fd && $debug_fd >= 0;
@@ -2904,8 +3401,15 @@ sub run_init_process {
     log_debug("nsexec container setup");
     log_debug("child process in init()");
 
+    # Rename network devices that were moved into our net namespace
+    # by the main process.  This must happen before rootfs setup
+    # (before pivot_root changes our filesystem view).
+    if (my $netdevs = $spec->{linux}{netDevices}) {
+        rename_net_devices($netdevs);
+    }
+
     # Setup rootfs (mounts, devices, symlinks)
-    prepare_rootfs($spec, $rootfs);
+    prepare_rootfs($spec, $rootfs, $mount_source_fds, $main_chan_w, $main_chan_r);
 
     # Allocate PTY from the container's devpts (set up by prepare_rootfs).
     # This must happen BEFORE pivot_root so the console-socket path is still
@@ -3353,6 +3857,32 @@ sub cmd_create {
         # Set death signal
         do_syscall(SYS_prctl, PR_SET_PDEATHSIG, 9, 0, 0, 0);
 
+        # Pre-open bind mount sources that may become inaccessible once
+        # we enter a user namespace.  We stash file descriptors keyed by
+        # source path; apply_mounts will use /proc/self/fd/$fd instead.
+        my %mount_source_fds;
+        if ($has_userns) {
+            for my $m (@{$spec->{mounts} // []}) {
+                my $src = $m->{source} // next;
+                next if $src eq '';
+                my @opts = @{$m->{options} // []};
+                next unless grep { $_ eq 'bind' || $_ eq 'rbind' } @opts;
+                # Resolve relative source paths against the bundle
+                my $abs_src = $src;
+                if ($abs_src !~ m{^/}) {
+                    $abs_src = "$p{bundle}/$abs_src" if $p{bundle};
+                }
+                next unless -e $abs_src;
+                my $open_flags = O_RDONLY | O_CLOEXEC;
+                $open_flags = O_RDONLY | O_CLOEXEC | O_PATH if -d $abs_src;
+                if (sysopen(my $fh, $abs_src, $open_flags)) {
+                    $mount_source_fds{$src} = fileno($fh);
+                    # Keep $fh alive by stashing in a closure-captured array
+                    push @{$mount_source_fds{_fhs}}, $fh;
+                }
+            }
+        }
+
         # Join specified namespaces
         for my $ns (@join_ns) {
             my $ns_fd;
@@ -3368,8 +3898,9 @@ sub cmd_create {
 
         # Unshare namespaces (except PID — that's handled by fork below)
         my $unshare_flags = $clone_flags & ~CLONE_NEWPID & ~CLONE_NEWCGROUP;
-        if ($has_userns) {
-            # Unshare user namespace first
+        if ($clone_flags & CLONE_NEWUSER) {
+            # Creating a new user namespace: unshare first, then let
+            # parent write UID/GID mappings before proceeding.
             my $nr  = SYS_unshare + 0;
             my $flg = CLONE_NEWUSER + 0;
             my $r;
@@ -3384,6 +3915,9 @@ sub cmd_create {
             my $resp = channel_recv($init_r_fd);
             fatal("mapping failed") unless $resp && $resp->{type} eq 'mapping_done';
         }
+        # Note: when joining an existing userns via path (setns above),
+        # we do NOT unshare NEWUSER — the setns already placed us in the
+        # target userns.  Mappings come from the target userns.
 
         # Unshare remaining namespaces (not PID, not cgroup).
         # Use inline scalar variables for syscall() args — Perl's syscall()
@@ -3473,7 +4007,7 @@ sub cmd_create {
         # Run the init process (eval captures die from fatal so we can
         # report the actual error to the parent through the channel).
         eval {
-            run_init_process($spec, $rootfs, $notify_srv, $main_w_fd, $init_r_fd, $cgpath, $id, $bundle, $console_socket_path, $init_debug_fd, $no_pivot, $p{foreground}, $pty_sock_fd);
+            run_init_process($spec, $rootfs, $notify_srv, $main_w_fd, $init_r_fd, $cgpath, $id, $bundle, $console_socket_path, $init_debug_fd, $no_pivot, $p{foreground}, $pty_sock_fd, \%mount_source_fds);
         };
         if ($@) {
             my $err = "$@";
@@ -3520,6 +4054,35 @@ sub cmd_create {
                 eval { apply_device_cgroup($cgpath, $spec); };
                 channel_send($init_w_fd, { type => 'cgroup_done' });
             }
+        }
+        elsif ($msg->{type} eq 'mount_fd_request') {
+            # Init needs us to apply mount_setattr(MOUNT_ATTR_IDMAP) because
+            # it's inside a user namespace and can't do it itself.
+            my $tree_fd = recv_fd_over_fd($main_r_fd);
+            if ($tree_fd >= 0) {
+                my $userns_fd;
+                my $close_userns = 0;
+                if ($msg->{implied}) {
+                    # Use init process's own user namespace
+                    sysopen(my $ns_fh, "/proc/$init_pid/ns/user", O_RDONLY)
+                        or fatal("open init userns: $!");
+                    $userns_fd = fileno($ns_fh);
+                    my $sf = AT_EMPTY_PATH | ($msg->{ridmap} ? AT_RECURSIVE : 0);
+                    do_mount_setattr($tree_fd, "", $sf, MOUNT_ATTR_IDMAP, 0, $userns_fd)
+                        or warn "nacre: mount_setattr IDMAP (implied): $!\n";
+                    close $ns_fh;
+                } else {
+                    my $uid_map = $msg->{uid_map} || "0 0 4294967295\n";
+                    my $gid_map = $msg->{gid_map} || "0 0 4294967295\n";
+                    $userns_fd = _create_userns_from_strings($uid_map, $gid_map);
+                    my $sf = AT_EMPTY_PATH | ($msg->{ridmap} ? AT_RECURSIVE : 0);
+                    do_mount_setattr($tree_fd, "", $sf, MOUNT_ATTR_IDMAP, 0, $userns_fd)
+                        or warn "nacre: mount_setattr IDMAP: $!\n";
+                    POSIX::close($userns_fd);
+                }
+                POSIX::close($tree_fd);
+            }
+            channel_send($init_w_fd, { type => 'mount_fd_done' });
         }
         elsif ($msg->{type} eq 'seccomp_notify_fd') {
             # Receive the seccomp notify fd from init
@@ -3618,6 +4181,11 @@ sub cmd_create {
         fatal("pidfd_open($init_pid): $!") if $pidfd < 0;
         send_fd_via_socket($p{pidfd_socket}, $pidfd);
         POSIX::close($pidfd);
+    }
+
+    # Move network devices into the container's network namespace
+    if (my $netdevs = $spec->{linux}{netDevices}) {
+        move_net_devices($netdevs, $init_pid);
     }
 
     # Run createRuntime hooks (OCI spec: MUST error if these fail)
@@ -4616,21 +5184,24 @@ sub cmd_exec {
         fatal("exec cgroup '$sub_path': no such file or directory")
             unless -d $sub_path;
         # Write exec process PID to the sub-cgroup
-        write_file("$sub_path/cgroup.procs", "$child\n");
-    } elsif ($container_cgpath && -d $container_cgpath) {
+        eval { write_file("$sub_path/cgroup.procs", "$child\n") };
+        if ($@) {
+            fatal("adding pid $child to cgroups: $sub_path/cgroup.procs: $!");
+        }
+    } elsif ($container_cgpath) {
         # Default: join the container's cgroup.
         # Try the state's cgroup first; if that fails (e.g. init moved
-        # to a sub-cgroup and domain controllers are active), fall back
-        # to wherever the init process actually lives.
-        my $joined = eval { write_file("$container_cgpath/cgroup.procs", "$child\n"); 1 };
+        # to a sub-cgroup, domain controllers are active, or the original
+        # cgroup was deleted), fall back to init's actual cgroup.
+        my $joined = 0;
+        if (-d $container_cgpath) {
+            $joined = eval { write_file("$container_cgpath/cgroup.procs", "$child\n"); 1 } // 0;
+        }
         if (!$joined) {
             # Fall back to init's actual cgroup
             my $init_cg = read_file("/proc/$init_pid/cgroup");
             if (defined $init_cg && $init_cg =~ m{^0::(.+)$}m) {
                 my $rel = $1;
-                # The init's cgroup path is relative to the cgroupfs root.
-                # Compute the host path by finding the cgroup mount root.
-                # For cgroup v2: /sys/fs/cgroup + init_relative_path
                 my $init_cghost = "/sys/fs/cgroup$rel";
                 if (-d $init_cghost) {
                     eval { write_file("$init_cghost/cgroup.procs", "$child\n") };
@@ -4952,7 +5523,7 @@ sub cmd_features {
         ociVersionMin => '1.0.0',
         ociVersionMax => '1.2.0',
         hooks => [qw(prestart createRuntime createContainer startContainer poststart poststop)],
-        mountOptions => [sort keys %MOUNT_FLAGS],
+        mountOptions => [sort (keys %MOUNT_FLAGS, 'idmap', 'ridmap')],
         linux => {
             namespaces => [sort keys %NS_MAP],
             capabilities => [@CAP_NAMES],
@@ -4962,7 +5533,7 @@ sub cmd_features {
             seccomp => {
                 enabled => JSON::PP::true,
                 actions => [qw(SCMP_ACT_KILL SCMP_ACT_KILL_PROCESS SCMP_ACT_TRAP
-                              SCMP_ACT_ERRNO SCMP_ACT_LOG SCMP_ACT_ALLOW)],
+                              SCMP_ACT_ERRNO SCMP_ACT_NOTIFY SCMP_ACT_LOG SCMP_ACT_ALLOW)],
                 operators => [qw(SCMP_CMP_NE SCMP_CMP_LT SCMP_CMP_LE
                                 SCMP_CMP_EQ SCMP_CMP_GE SCMP_CMP_GT
                                 SCMP_CMP_MASKED_EQ)],
