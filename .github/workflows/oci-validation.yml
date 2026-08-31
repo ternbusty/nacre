@@ -44,44 +44,6 @@ jobs:
             print "sys_getpid=$sys_getpid result=$pid real=$$\n";
             print "match=" . ($pid == $$ ? "YES" : "NO") . "\n";
           '
-          echo "=== unshare test (system command) ==="
-          sudo unshare --mount echo "unshare-cmd: OK" 2>&1 || echo "unshare-cmd: FAILED rc=$?"
-          echo "=== unshare test (each namespace flag individually, as root) ==="
-          sudo perl -e '
-            my %flags = (
-              CLONE_NEWNS  => 0x00020000,
-              CLONE_NEWUTS => 0x04000000,
-              CLONE_NEWIPC => 0x08000000,
-              CLONE_NEWNET => 0x40000000,
-            );
-            for my $name (sort keys %flags) {
-              my $pid = fork();
-              if ($pid == 0) {
-                my $ret = syscall(272, $flags{$name});
-                if ($ret == 0) {
-                  print "child unshare($name): OK\n";
-                } else {
-                  print "child unshare($name): FAILED errno=" . int($!) . " ($!)\n";
-                }
-                exit(0);
-              }
-              waitpid($pid, 0);
-            }
-          '
-          echo "=== unshare test (combined 0x4c020000, as root, after fork) ==="
-          sudo perl -e '
-            my $pid = fork();
-            if ($pid == 0) {
-                my $ret = syscall(272, 0x4c020000);
-                if ($ret == 0) {
-                    print "child unshare(0x4c020000): OK\n";
-                } else {
-                    print "child unshare(0x4c020000): FAILED errno=" . int($!) . " ($!)\n";
-                }
-                exit(0);
-            }
-            waitpid($pid, 0);
-          '
 
       - name: Install Go and dependencies
         run: |
@@ -114,30 +76,40 @@ jobs:
       - name: Run validation suite
         id: run-validation
         run: |
-          # Write the test loop to a temporary script so we can run it via
-          # setsid with ALL fds detached from the Actions log pipe.  This
-          # prevents lingering children from blocking subsequent steps.
+          # ---------------------------------------------------------------
+          # CRITICAL: Close ALL fds > 2 in THIS step shell immediately.
+          #
+          # The Actions runner leaks its log-pipe on high fds.  If any child
+          # process inherits one of those fds, the runner never sees EOF and
+          # this step (plus every subsequent one) hangs until the job times
+          # out.  Closing them here means sudo / setsid / bash / test-procs
+          # can never inherit the pipe on fd 3+.
+          # ---------------------------------------------------------------
+          for _fd in /proc/self/fd/*; do
+            _n=$(basename "$_fd")
+            if [ "$_n" -gt 2 ] 2>/dev/null; then
+              eval "exec ${_n}>&-" 2>/dev/null || true
+            fi
+          done
+
           OUTDIR=$HOME/validation-out
           mkdir -p "$OUTDIR"
 
           cat > /tmp/run-validation.sh << 'VALIDATION_SCRIPT'
           #!/usr/bin/env bash
           set +e
-          # Close ALL fds > 2 so no child process can inherit the Actions log
-          # pipe fd (which the runner leaks on fd 3+).  stdout/stderr are
-          # already redirected to /tmp/validation-main.log by the caller.
-          for _fd in /proc/self/fd/*; do
-            _n=$(basename "$_fd")
-            [ "$_n" -gt 2 ] 2>/dev/null && eval "exec ${_n}>&-" 2>/dev/null || true
-          done
-          cd $HOME/runtime-tools
+
+          cd "$HOME/runtime-tools"
           RUNTIME=/opt/nacre/bin
           OUTDIR=$HOME/validation-out
+
           PASS=0; FAIL=0; ERROR=0; TIMEOUT=0; SKIP_V1=0; SKIP_BROKEN=0
           SKIP_V1_PATTERN='^(linux_cgroups_(network|blkio|hugetlb|devices|pids|relative_(blkio|network|hugetlb|devices|pids))|linux_cgroups_relative_cpus|linux_cgroups_relative_memory|linux_cgroups_cpus|linux_cgroups_memory|delete_(only_create_)?resources)$'
           SKIP_BROKEN_PATTERN='^(pidfile|process_rlimits)$'
+
           for t in validation/*/*.t; do
             name=$(basename "$t" .t)
+
             if echo "$name" | grep -qE "$SKIP_V1_PATTERN"; then
               SKIP_V1=$((SKIP_V1+1))
               echo "SKIP(v1) $name"
@@ -148,21 +120,27 @@ jobs:
               echo "SKIP(broken-upstream) $name"
               continue
             fi
+
             out=$OUTDIR/$name.log
             timeout --signal=KILL 60 env RUNTIME=$RUNTIME "$t" > "$out" 2>&1
             rc=$?
+
+            # Aggressively clean up between tests
             $RUNTIME delete --force "$name" > /dev/null 2>&1 || true
-            killall -9 perl nacre runtimetest > /dev/null 2>&1 || true
+            killall -9 perl nacre runtimetest 2>/dev/null || true
             sleep 0.2
             find /run/nacre -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+
             if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
               TIMEOUT=$((TIMEOUT+1))
               echo "TIMEOUT  $name"
               continue
             fi
-            n_ok=$(grep -c "^ok " "$out" 2>/dev/null)
-            n_notok=$(grep -c "^not ok " "$out" 2>/dev/null)
+
+            n_ok=$(grep -c "^ok " "$out" 2>/dev/null || true)
+            n_notok=$(grep -c "^not ok " "$out" 2>/dev/null || true)
             n_ok=${n_ok:-0}; n_notok=${n_notok:-0}
+
             if [ "$n_notok" -gt 0 ]; then
               FAIL=$((FAIL+1))
               echo "FAIL     $name  ok=$n_ok notok=$n_notok"
@@ -176,31 +154,68 @@ jobs:
               echo "SKIP     $name"
             fi
           done
+
           echo "=== SUMMARY ==="
           echo "PASS=$PASS  FAIL=$FAIL  TIMEOUT=$TIMEOUT  ERROR=$ERROR  SKIP_V1=$SKIP_V1  SKIP_BROKEN=$SKIP_BROKEN"
+
           # Write outputs for the GitHub step
-          echo "$PASS" > /tmp/validation_pass
-          echo "$FAIL" > /tmp/validation_fail
+          echo "$PASS"    > /tmp/validation_pass
+          echo "$FAIL"    > /tmp/validation_fail
           echo "$TIMEOUT" > /tmp/validation_timeout
-          echo "$ERROR" > /tmp/validation_error
+          echo "$ERROR"   > /tmp/validation_error
           VALIDATION_SCRIPT
           chmod +x /tmp/run-validation.sh
 
-          # Run as root, in a new session, with ALL stdio detached.
-          # stdout/stderr go to a log file; the test loop has zero access
-          # to the Actions log pipe, so no lingering child can block steps.
-          sudo -E setsid bash /tmp/run-validation.sh > /tmp/validation-main.log 2>&1 </dev/null
+          # Run as root, in a new session, ALL stdio to a log file.
+          # The test loop has zero access to Actions fds.
+          sudo -E setsid bash /tmp/run-validation.sh \
+            > /tmp/validation-main.log 2>&1 </dev/null
 
-          # Display results back into the Actions log
+          # Kill ALL lingering processes from the validation run
+          sudo pkill -9 -f 'nacre|runtimetest|validation\.t' 2>/dev/null || true
+          sleep 1
+
+          # Display results (set +e so grep failures don't kill the step)
+          set +eo pipefail
+          echo "::group::Validation output"
           cat /tmp/validation-main.log
+          echo "::endgroup::"
+
+          # Show failing test logs
+          echo "::group::Failing test details"
+          for f in "$OUTDIR"/*.log; do
+            [ -f "$f" ] || continue
+            n_notok=$(grep -c "^not ok " "$f" 2>/dev/null || true)
+            if [ "${n_notok:-0}" -gt 0 ]; then
+              echo "=== $(basename "$f") ==="
+              head -100 "$f"
+              lines=$(wc -l < "$f")
+              [ "$lines" -gt 100 ] && echo "... ($lines lines total, truncated)"
+              echo ""
+            fi
+          done
+          echo "::endgroup::"
+
+          # Show errored/timed-out test logs
+          echo "::group::Error and timeout details"
+          grep -E "^(ERROR|TIMEOUT)" /tmp/validation-main.log | while IFS= read -r line; do
+            tname=$(echo "$line" | awk '{print $2}')
+            f="$OUTDIR/$tname.log"
+            if [ -f "$f" ]; then
+              echo "=== $tname ==="
+              head -50 "$f"
+              echo ""
+            fi
+          done
+          echo "::endgroup::"
 
           # Read outputs
           PASS=$(cat /tmp/validation_pass 2>/dev/null || echo 0)
           FAIL=$(cat /tmp/validation_fail 2>/dev/null || echo 0)
           TIMEOUT=$(cat /tmp/validation_timeout 2>/dev/null || echo 0)
           ERROR=$(cat /tmp/validation_error 2>/dev/null || echo 0)
-          SKIP_V1=$(grep -c "^SKIP(v1)" /tmp/validation-main.log || echo 0)
-          SKIP_BROKEN=$(grep -c "^SKIP(broken-upstream)" /tmp/validation-main.log || echo 0)
+          SKIP_V1=$(grep -c "^SKIP(v1)" /tmp/validation-main.log 2>/dev/null || echo 0)
+          SKIP_BROKEN=$(grep -c "^SKIP(broken-upstream)" /tmp/validation-main.log 2>/dev/null || echo 0)
 
           # Step summary
           {
@@ -217,61 +232,25 @@ jobs:
             echo
             if [ "$FAIL" -gt 0 ]; then
               echo "### Failing tests"
-              grep "^FAIL " /tmp/validation-main.log | while read -r line; do
+              grep "^FAIL " /tmp/validation-main.log | while IFS= read -r line; do
                 echo "- $line"
               done
             fi
             if [ "$TIMEOUT" -gt 0 ]; then
               echo "### Timeouts"
-              grep "^TIMEOUT " /tmp/validation-main.log | while read -r line; do
+              grep "^TIMEOUT " /tmp/validation-main.log | while IFS= read -r line; do
                 echo "- $line"
               done
             fi
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "validation_pass=$PASS" >> "$GITHUB_OUTPUT"
-          echo "validation_fail=$FAIL" >> "$GITHUB_OUTPUT"
+
+          echo "validation_pass=$PASS"       >> "$GITHUB_OUTPUT"
+          echo "validation_fail=$FAIL"       >> "$GITHUB_OUTPUT"
           echo "validation_timeout=$TIMEOUT" >> "$GITHUB_OUTPUT"
-          echo "validation_error=$ERROR" >> "$GITHUB_OUTPUT"
+          echo "validation_error=$ERROR"     >> "$GITHUB_OUTPUT"
 
-      - name: Debug lingering processes
-        if: always()
-        timeout-minutes: 1
-        run: |
-          echo "=== Nacre-related processes ==="
-          ps auxf | grep -E 'nacre|perl|runtimetest|validation' | grep -v grep || echo "(none)"
-          echo "=== Pipe fds in this shell ==="
-          for fd in /proc/self/fd/*; do
-            n=$(basename "$fd")
-            if [ "$n" -gt 2 ] 2>/dev/null; then
-              readlink "$fd" 2>/dev/null | grep -q pipe && echo "fd $n -> $(readlink "$fd")"
-            fi
-          done || true
-          echo "=== Kill stragglers ==="
-          sudo pkill -9 -f nacre 2>/dev/null || true
-          sudo pkill -9 -f runtimetest 2>/dev/null || true
-          echo "=== Done ==="
-
-      - name: Show test logs
-        if: always()
-        timeout-minutes: 1
-        run: |
-          # Close leaked pipe fds before doing anything
-          for _fd in /proc/self/fd/*; do
-            _n=$(basename "$_fd")
-            [ "$_n" -gt 2 ] 2>/dev/null && [ -p "$_fd" ] && eval "exec ${_n}>&-" 2>/dev/null || true
-          done
-          for f in ~/validation-out/*.log; do
-            [ -f "$f" ] || continue
-            n_ok=$(grep -c "^ok " "$f" 2>/dev/null || echo 0)
-            n_notok=$(grep -c "^not ok " "$f" 2>/dev/null || echo 0)
-            if [ "$n_notok" -gt 0 ] || { [ "$n_ok" -eq 0 ] && [ -s "$f" ]; }; then
-              echo "=== $(basename "$f") ==="
-              head -100 "$f"
-              lines=$(wc -l < "$f")
-              [ "$lines" -gt 100 ] && echo "... ($lines lines total, truncated)"
-              echo ""
-            fi
-          done
+          # Final cleanup — kill anything still alive
+          sudo pkill -9 -f 'nacre|runtimetest' 2>/dev/null || true
 
       - name: Fail on validation failures
         if: steps.run-validation.outputs.validation_fail != '0' || steps.run-validation.outputs.validation_error != '0'
