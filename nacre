@@ -10,7 +10,8 @@ use JSON::PP;
 use File::Basename qw(basename dirname);
 use File::Path qw(make_path remove_tree);
 use Fcntl qw(:flock :mode :seek O_RDONLY O_WRONLY O_RDWR O_CREAT
-             O_TRUNC O_EXCL O_NONBLOCK O_DIRECTORY O_NOFOLLOW O_NOCTTY);
+             O_TRUNC O_EXCL O_NONBLOCK O_DIRECTORY O_NOFOLLOW O_NOCTTY
+             F_GETFD F_SETFD FD_CLOEXEC);
 use constant O_CLOEXEC => 0o2000000;
 use Getopt::Long qw(:config pass_through no_auto_abbrev);
 use Cwd qw(abs_path getcwd);
@@ -2129,11 +2130,11 @@ sub apply_scheduler {
     my $deadline  = $sched->{deadline} // 0;
     my $period    = $sched->{period}   // 0;
 
-    # struct sched_attr (56 bytes):
+    # struct sched_attr (48 bytes):
     #   u32 size, u32 sched_policy, u64 sched_flags, s32 sched_nice,
     #   u32 sched_priority, u64 sched_runtime, u64 sched_deadline, u64 sched_period
-    my $attr = pack('LLQLlQQQ',
-        56,        # size
+    my $attr = pack('LLQlLQQQ',
+        48,        # size
         $policy,
         $flags,
         $nice,
