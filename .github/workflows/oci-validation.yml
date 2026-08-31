@@ -114,43 +114,42 @@ jobs:
       - name: Run validation suite
         id: run-validation
         run: |
+          # Write the test loop to a temporary script so we can run it via
+          # setsid with ALL fds detached from the Actions log pipe.  This
+          # prevents lingering children from blocking subsequent steps.
+          OUTDIR=$HOME/validation-out
+          mkdir -p "$OUTDIR"
+
+          cat > /tmp/run-validation.sh << 'VALIDATION_SCRIPT'
+          #!/usr/bin/env bash
           set +e
           cd $HOME/runtime-tools
           RUNTIME=/opt/nacre/bin
-          mkdir -p $HOME/validation-out
+          OUTDIR=$HOME/validation-out
           PASS=0; FAIL=0; ERROR=0; TIMEOUT=0; SKIP_V1=0; SKIP_BROKEN=0
-          declare -a FAIL_NAMES TIMEOUT_NAMES SKIP_V1_NAMES SKIP_BROKEN_NAMES
-          # Cgroup v1 tests skipped on cgroup-v2 only hosts
           SKIP_V1_PATTERN='^(linux_cgroups_(network|blkio|hugetlb|devices|pids|relative_(blkio|network|hugetlb|devices|pids))|linux_cgroups_relative_cpus|linux_cgroups_relative_memory|linux_cgroups_cpus|linux_cgroups_memory|delete_(only_create_)?resources)$'
-          # Known-broken upstream tests
           SKIP_BROKEN_PATTERN='^(pidfile|process_rlimits)$'
           for t in validation/*/*.t; do
             name=$(basename "$t" .t)
             if echo "$name" | grep -qE "$SKIP_V1_PATTERN"; then
               SKIP_V1=$((SKIP_V1+1))
-              SKIP_V1_NAMES+=("$name")
               echo "SKIP(v1) $name"
               continue
             fi
             if echo "$name" | grep -qE "$SKIP_BROKEN_PATTERN"; then
               SKIP_BROKEN=$((SKIP_BROKEN+1))
-              SKIP_BROKEN_NAMES+=("$name")
               echo "SKIP(broken-upstream) $name"
               continue
             fi
-            out=$HOME/validation-out/$name.log
-            # Run in its own session (setsid) so lingering children don't
-            # inherit the GitHub Actions log pipe and block subsequent steps.
-            sudo timeout --signal=KILL 60 setsid env RUNTIME=$RUNTIME "$t" > "$out" 2>&1 </dev/null
+            out=$OUTDIR/$name.log
+            timeout --signal=KILL 60 env RUNTIME=$RUNTIME "$t" > "$out" 2>&1
             rc=$?
-            # Redirect ALL cleanup to /dev/null so no child inherits the Actions pipe fd.
-            sudo $RUNTIME delete --force "$name" > /dev/null 2>&1 || true
-            sudo killall -9 perl nacre runtimetest > /dev/null 2>&1 || true
+            $RUNTIME delete --force "$name" > /dev/null 2>&1 || true
+            killall -9 perl nacre runtimetest > /dev/null 2>&1 || true
             sleep 0.2
-            sudo find /run/nacre -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
-            if [ "$rc" -eq 124 ]; then
+            find /run/nacre -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+            if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
               TIMEOUT=$((TIMEOUT+1))
-              TIMEOUT_NAMES+=("$name")
               echo "TIMEOUT  $name"
               continue
             fi
@@ -159,7 +158,6 @@ jobs:
             n_ok=${n_ok:-0}; n_notok=${n_notok:-0}
             if [ "$n_notok" -gt 0 ]; then
               FAIL=$((FAIL+1))
-              FAIL_NAMES+=("$name (ok=$n_ok notok=$n_notok)")
               echo "FAIL     $name  ok=$n_ok notok=$n_notok"
             elif [ "$n_ok" -gt 0 ]; then
               PASS=$((PASS+1))
@@ -173,6 +171,31 @@ jobs:
           done
           echo "=== SUMMARY ==="
           echo "PASS=$PASS  FAIL=$FAIL  TIMEOUT=$TIMEOUT  ERROR=$ERROR  SKIP_V1=$SKIP_V1  SKIP_BROKEN=$SKIP_BROKEN"
+          # Write outputs for the GitHub step
+          echo "$PASS" > /tmp/validation_pass
+          echo "$FAIL" > /tmp/validation_fail
+          echo "$TIMEOUT" > /tmp/validation_timeout
+          echo "$ERROR" > /tmp/validation_error
+          VALIDATION_SCRIPT
+          chmod +x /tmp/run-validation.sh
+
+          # Run as root, in a new session, with ALL stdio detached.
+          # stdout/stderr go to a log file; the test loop has zero access
+          # to the Actions log pipe, so no lingering child can block steps.
+          sudo setsid bash /tmp/run-validation.sh > /tmp/validation-main.log 2>&1 </dev/null
+
+          # Display results back into the Actions log
+          cat /tmp/validation-main.log
+
+          # Read outputs
+          PASS=$(cat /tmp/validation_pass 2>/dev/null || echo 0)
+          FAIL=$(cat /tmp/validation_fail 2>/dev/null || echo 0)
+          TIMEOUT=$(cat /tmp/validation_timeout 2>/dev/null || echo 0)
+          ERROR=$(cat /tmp/validation_error 2>/dev/null || echo 0)
+          SKIP_V1=$(grep -c "^SKIP(v1)" /tmp/validation-main.log || echo 0)
+          SKIP_BROKEN=$(grep -c "^SKIP(broken-upstream)" /tmp/validation-main.log || echo 0)
+
+          # Step summary
           {
             echo "## OCI runtime-tools validation"
             echo
@@ -185,16 +208,16 @@ jobs:
             echo "| skip (cgroup v1) | $SKIP_V1 |"
             echo "| skip (broken upstream) | $SKIP_BROKEN |"
             echo
-            if [ ${#FAIL_NAMES[@]} -gt 0 ]; then
+            if [ "$FAIL" -gt 0 ]; then
               echo "### Failing tests"
-              for n in "${FAIL_NAMES[@]}"; do
-                echo "- $n"
+              grep "^FAIL " /tmp/validation-main.log | while read -r line; do
+                echo "- $line"
               done
             fi
-            if [ ${#TIMEOUT_NAMES[@]} -gt 0 ]; then
+            if [ "$TIMEOUT" -gt 0 ]; then
               echo "### Timeouts"
-              for n in "${TIMEOUT_NAMES[@]}"; do
-                echo "- $n"
+              grep "^TIMEOUT " /tmp/validation-main.log | while read -r line; do
+                echo "- $line"
               done
             fi
           } >> "$GITHUB_STEP_SUMMARY"
@@ -202,15 +225,6 @@ jobs:
           echo "validation_fail=$FAIL" >> "$GITHUB_OUTPUT"
           echo "validation_timeout=$TIMEOUT" >> "$GITHUB_OUTPUT"
           echo "validation_error=$ERROR" >> "$GITHUB_OUTPUT"
-
-      - name: Kill lingering processes
-        if: always()
-        timeout-minutes: 1
-        run: |
-          # Only kill runtime-related processes; avoid sh/sleep which can hit
-          # the runner itself.  Redirect to /dev/null so nothing inherits the
-          # Actions log pipe.
-          sudo killall -9 perl nacre runtimetest > /dev/null 2>&1 || true
 
       - name: Show test logs
         if: always()
