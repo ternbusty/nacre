@@ -2718,7 +2718,7 @@ sub cmd_run {
     # reparented to us when the intermediate child exits).
     my $pr_nr  = SYS_prctl + 0;
     my $pr_opt = PR_SET_CHILD_SUBREAPER + 0;
-    do_syscall($pr_nr, $pr_opt, 1, 0, 0, 0);
+    my $sr_ret = syscall($pr_nr, $pr_opt, 1, 0, 0, 0);
 
     # Create (foreground: keep stdio so user sees container output)
     my $state = cmd_create(%p, foreground => 1);
@@ -2763,14 +2763,23 @@ sub cmd_run {
             # +24 si_status (int)
             my $si_code   = unpack('i', substr($siginfo, 8, 4));
             my $si_status = unpack('i', substr($siginfo, 24, 4));
+            warn "nacre-dbg: waitid ok code=$si_code status=$si_status hex=" .
+                 unpack('H*', substr($siginfo, 0, 32)) . "\n"
+                if $ENV{NACRE_RUN_DEBUG};
             if ($si_code == 1) {    # CLD_EXITED
                 $exit_code = $si_status;
             } else {
                 $exit_code = 128 + $si_status;
             }
             $got_init = 1;
+        } else {
+            warn "nacre-dbg: waitid failed wr=$wr errno=$!\n"
+                if $ENV{NACRE_RUN_DEBUG};
         }
         POSIX::close($pidfd);
+    } else {
+        warn "nacre-dbg: pidfd_open failed pidfd=$pidfd errno=$!\n"
+            if $ENV{NACRE_RUN_DEBUG};
     }
 
     # Fallback: waitpid with subreaper
