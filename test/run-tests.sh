@@ -327,7 +327,7 @@ make_bundle "$BUNDLE_EC" '"sh", "-c", "exit 42"'
 
 run_test "exit code 42 propagated" bash -c '
     set +e
-    perl '"$NACRE"' --root '"$ROOT"' run --bundle '"$BUNDLE_EC"' test-ec42 2>&1
+    NACRE_RUN_DEBUG=1 perl '"$NACRE"' --root '"$ROOT"' run --bundle '"$BUNDLE_EC"' test-ec42 2>&1
     rc=$?
     set -e
     if [ "$rc" -ne 42 ]; then
