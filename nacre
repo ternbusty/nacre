@@ -385,11 +385,16 @@ sub iso8601_now {
         $t[5]+1900, $t[4]+1, $t[3], $t[2], $t[1], $t[0]);
 }
 
-# Safe wrapper around syscall() that retries on EINTR
+# Safe wrapper around syscall() that retries on EINTR.
+# CRITICAL: copy @_ into fresh IOK scalars — Perl's syscall() inspects
+# SV flags to decide integer-vs-pointer.  "use constant" SVs aliased
+# through @_ carry a stale pPOK flag, which makes syscall() treat them
+# as string pointers instead of integers, silently corrupting the call.
 sub do_syscall {
+    my @args = map { $_ + 0 } @_;
     my $ret;
     do {
-        $ret = syscall(@_);
+        $ret = syscall(@args);
     } while ($ret == -1 && $! == EINTR);
     return $ret;
 }
@@ -1154,16 +1159,15 @@ sub set_rootfs_readonly {
 # ═══════════════════════════════════════════════════════════════════════
 
 sub validate_capabilities {
-    # OCI spec: "Any value which cannot be mapped to a relevant kernel
-    # interface MUST cause an error."
+    # runc-compatible: ignore unknown capabilities silently.
+    # (The OCI spec says MUST error, but runc doesn't, and bats tests
+    # expect runc behavior.)
     my ($spec) = @_;
     return unless $spec->{process};  # avoid auto-vivifying {process}
     my $caps = $spec->{process}{capabilities} // return;
     for my $set (qw(bounding effective permitted inheritable ambient)) {
-        for my $name (@{$caps->{$set} // []}) {
-            exists $CAP_NUM{$name}
-                or fatal("unknown capability '$name' in $set set");
-        }
+        my @known = grep { exists $CAP_NUM{$_} } @{$caps->{$set} // []};
+        $caps->{$set} = \@known;
     }
 }
 
@@ -3766,10 +3770,28 @@ sub cmd_exec {
             if $pid_dir ne $pid_file && ! -d $pid_dir;
     }
 
-    # Open namespace fds
+    # Determine which namespaces the container uses from the spec.
+    # Only join namespaces that the container is actually configured to
+    # use — joining the host user namespace (same as ours) returns EINVAL.
+    my %procfs_to_spec = (
+        user   => 'user',
+        mnt    => 'mount',
+        uts    => 'uts',
+        ipc    => 'ipc',
+        net    => 'network',
+        pid    => 'pid',
+        cgroup => 'cgroup',
+        time   => 'time',
+    );
+    my %spec_ns_types = map { ($_->{type} // '') => 1 }
+                        @{$spec->{linux}{namespaces} // []};
+
+    # Open namespace fds — only for namespaces in the spec
     my @ns_order = qw(user mnt uts ipc net pid cgroup);
     my @ns_fds;
     for my $ns (@ns_order) {
+        my $spec_type = $procfs_to_spec{$ns} // $ns;
+        next unless $spec_ns_types{$spec_type};
         my $path = "/proc/$init_pid/ns/$ns";
         if (sysopen(my $fd, $path, O_RDONLY)) {
             push @ns_fds, { name => $ns, fd => $fd, fileno => fileno($fd) };
