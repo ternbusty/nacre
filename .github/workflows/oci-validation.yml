@@ -44,6 +44,41 @@ jobs:
             print "sys_getpid=$sys_getpid result=$pid real=$$\n";
             print "match=" . ($pid == $$ ? "YES" : "NO") . "\n";
           '
+          echo "=== unshare test (system command) ==="
+          sudo unshare --mount echo "unshare-cmd: OK" 2>&1 || echo "unshare-cmd: FAILED rc=$?"
+          echo "=== unshare test (Perl syscall, as root) ==="
+          sudo perl -e '
+            my $CLONE_NEWNS = 0x00020000;
+            my $CLONE_NEWUTS = 0x04000000;
+            my $CLONE_NEWNET = 0x40000000;
+            # Direct unshare test
+            my $ret = syscall(272, $CLONE_NEWNS);
+            if ($ret == 0) {
+                print "unshare(CLONE_NEWNS): OK\n";
+            } else {
+                print "unshare(CLONE_NEWNS): FAILED errno=" . int($!) . " ($!)\n";
+            }
+            $ret = syscall(272, $CLONE_NEWUTS);
+            if ($ret == 0) {
+                print "unshare(CLONE_NEWUTS): OK\n";
+            } else {
+                print "unshare(CLONE_NEWUTS): FAILED errno=" . int($!) . " ($!)\n";
+            }
+          '
+          echo "=== unshare test (Perl after fork, as root) ==="
+          sudo perl -e '
+            my $pid = fork();
+            if ($pid == 0) {
+                my $ret = syscall(272, 0x00020000);
+                if ($ret == 0) {
+                    print "child unshare(CLONE_NEWNS): OK\n";
+                } else {
+                    print "child unshare(CLONE_NEWNS): FAILED errno=" . int($!) . " ($!)\n";
+                }
+                exit(0);
+            }
+            waitpid($pid, 0);
+          '
 
       - name: Install Go and dependencies
         run: |
