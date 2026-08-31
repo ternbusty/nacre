@@ -2835,7 +2835,7 @@ sub run_hooks {
 # ═══════════════════════════════════════════════════════════════════════
 
 sub run_init_process {
-    my ($spec, $rootfs, $notify_fd, $main_chan_w, $main_chan_r, $cgpath, $id, $bundle, $console_socket_path, $debug_fd, $no_pivot, $foreground) = @_;
+    my ($spec, $rootfs, $notify_fd, $main_chan_w, $main_chan_r, $cgpath, $id, $bundle, $console_socket_path, $debug_fd, $no_pivot, $foreground, $pty_sock_fd) = @_;
 
     my $dbg = sub {
         return unless defined $debug_fd && $debug_fd >= 0;
@@ -2856,7 +2856,8 @@ sub run_init_process {
     # Using $rootfs/dev/pts/ptmx ensures readlink shows /dev/pts/N inside
     # the container (not a host devpts path).
     my $pts_fd;
-    if (defined $console_socket_path) {
+    my $need_pty = defined $console_socket_path || defined $pty_sock_fd;
+    if ($need_pty) {
         sysopen(my $ptm, "$rootfs/dev/pts/ptmx", O_RDWR | O_NOCTTY | O_CLOEXEC)
             or fatal("open PTY master ($rootfs/dev/pts/ptmx): $!");
         my $ptn_buf = pack('i', 0);
@@ -2877,9 +2878,16 @@ sub run_init_process {
             ioctl($ptm, TIOCSWINSZ, $ws);
         }
 
-        # Send master to console socket (path still reachable before pivot_root)
-        send_fd_via_socket($console_socket_path, fileno($ptm));
-        close($ptm);
+        if (defined $console_socket_path) {
+            # Detached mode: send master to console socket
+            send_fd_via_socket($console_socket_path, fileno($ptm));
+            close($ptm);
+        } elsif (defined $pty_sock_fd) {
+            # Foreground mode: send master to parent via socketpair
+            send_fd_over_fd($pty_sock_fd + 0, fileno($ptm));
+            close($ptm);
+            POSIX::close($pty_sock_fd);
+        }
 
         # Dup the slave fd so it survives filehandle scope
         $pts_fd = POSIX::dup(fileno($pts));
@@ -3233,6 +3241,14 @@ sub cmd_create {
     my ($main_r_fd, $main_w_fd, $main_r_fh, $main_w_fh) = create_channel();
     my ($init_r_fd, $init_w_fd, $init_r_fh, $init_w_fh) = create_channel();
 
+    # For foreground mode with terminal but no console-socket: create a
+    # socketpair so the init process can send the PTY master fd to the parent.
+    my ($pty_parent_sock, $pty_child_sock);
+    if ($p{foreground} && $spec->{process}{terminal} && !$p{console_socket}) {
+        socketpair($pty_parent_sock, $pty_child_sock, AF_UNIX, SOCK_STREAM, 0)
+            or fatal("socketpair for PTY: $!");
+    }
+
     # Create notify socket directory
     my $notify_dir = state_dir($root, $id);
     ensure_dir($notify_dir);
@@ -3246,6 +3262,7 @@ sub cmd_create {
         # === Child process (will become container init) ===
         close $main_r_fh;  # Close parent's read end
         close $init_w_fh;  # Close parent's write end
+        close $pty_parent_sock if defined $pty_parent_sock;  # Close parent's PTY sock
 
         # Set death signal
         do_syscall(SYS_prctl, PR_SET_PDEATHSIG, 9, 0, 0, 0);
@@ -3332,6 +3349,10 @@ sub cmd_create {
         my $console_socket_path = ($spec->{process}{terminal} && $p{console_socket})
             ? $p{console_socket} : undef;
 
+        # For foreground terminal: pass the PTY socketpair fd so init can
+        # send the master fd back to the parent for I/O relay.
+        my $pty_sock_fd = (defined $pty_child_sock) ? fileno($pty_child_sock) : undef;
+
         # Open a debug log in the state directory (host filesystem, before
         # pivot_root).  The fd survives pivot_root and close_range(CLOEXEC),
         # so we can write to it right up until exec.
@@ -3366,7 +3387,7 @@ sub cmd_create {
         # Run the init process (eval captures die from fatal so we can
         # report the actual error to the parent through the channel).
         eval {
-            run_init_process($spec, $rootfs, $notify_srv, $main_w_fd, $init_r_fd, $cgpath, $id, $bundle, $console_socket_path, $init_debug_fd, $no_pivot, $p{foreground});
+            run_init_process($spec, $rootfs, $notify_srv, $main_w_fd, $init_r_fd, $cgpath, $id, $bundle, $console_socket_path, $init_debug_fd, $no_pivot, $p{foreground}, $pty_sock_fd);
         };
         if ($@) {
             my $err = "$@";
@@ -3386,6 +3407,7 @@ sub cmd_create {
     # === Parent process ===
     close $main_w_fh;  # Close child's write end
     close $init_r_fh;  # Close child's read end
+    close $pty_child_sock if defined $pty_child_sock;  # Close child's PTY sock end
 
     # Handle messages from child
     my $init_pid;
@@ -3451,6 +3473,17 @@ sub cmd_create {
     # If no user namespace, write mappings now (for non-userns case they're not needed)
     # (uid/gid mappings are only for user namespaces)
 
+    # Receive PTY master fd from init process (foreground terminal mode)
+    my $pty_master_fd;
+    if (defined $pty_parent_sock) {
+        $pty_master_fd = recv_fd_over_fd(fileno($pty_parent_sock));
+        close $pty_parent_sock;
+        if ($pty_master_fd < 0) {
+            warn "nacre: failed to receive PTY master fd\n";
+            $pty_master_fd = undef;
+        }
+    }
+
     # Save state
     my $start_time = get_pid_starttime($init_pid);
     my $state = {
@@ -3477,6 +3510,9 @@ sub cmd_create {
         run_hooks($hooks->{createContainer}, $state, must_succeed => 1, type => 'createContainer');
         run_hooks($hooks->{prestart}, $state, must_succeed => 1, type => 'prestart');
     }
+
+    # Return PTY master fd for foreground relay
+    $state->{_pty_master_fd} = $pty_master_fd if defined $pty_master_fd;
 
     return $state;
 }
@@ -3670,79 +3706,128 @@ sub cmd_run {
 
     # Forward signals to init
     my $init_pid = $state->{pid};
+    my $pty_master_fd = $state->{_pty_master_fd};
     for my $sig (qw(TERM INT HUP QUIT USR1 USR2)) {
         $SIG{$sig} = sub { kill $SIG_NUM{$sig}, $init_pid; };
     }
 
-    # Wait for init process to exit.
-    # Primary: pidfd_open + waitid(P_PIDFD) — stable handle, no PID
-    # recycling race, works even if the init exits immediately.
-    # Fallback: waitpid with subreaper (if pidfd_open unavailable).
-    # Last resort: poll with kill(0, pid).
-    my $exit_code = 0;
-    my $got_init = 0;
+    my $exit_code;
 
-    # Try pidfd_open first (kernel 5.3+)
-    my $pidfd_nr = SYS_pidfd_open + 0;
-    my $pidfd = syscall($pidfd_nr, $init_pid + 0, 0);
-
-    if ($pidfd >= 0) {
-        # waitid(P_PIDFD, pidfd, ...) — kernel 5.4+
-        my $waitid_nr = SYS_waitid + 0;
-        my $siginfo = "\0" x 128;       # siginfo_t
-        my $P_PIDFD = 3;               # <linux/wait.h>
-        my $WEXITED = 4;               # <sys/wait.h>
-        my $wr = syscall($waitid_nr, $P_PIDFD + 0, $pidfd + 0,
-                         $siginfo, $WEXITED + 0, 0);
-        if ($wr == 0) {
-            # siginfo_t layout (x86_64/aarch64 LP64):
-            # +0  si_signo  (int)
-            # +4  si_errno  (int)
-            # +8  si_code   (int)
-            # +12 padding   (4 bytes — union alignment)
-            # +16 si_pid    (pid_t)
-            # +20 si_uid    (uid_t)
-            # +24 si_status (int)
-            my $si_code   = unpack('i', substr($siginfo, 8, 4));
-            my $si_status = unpack('i', substr($siginfo, 24, 4));
-            if ($si_code == 1) {    # CLD_EXITED
-                $exit_code = $si_status;
-            } else {
-                $exit_code = 128 + $si_status;
+    if (defined $pty_master_fd) {
+        # Foreground with PTY: relay I/O between master and stdin/stdout
+        # Forward SIGWINCH to the container's terminal
+        $SIG{WINCH} = sub {
+            if (-t STDIN) {
+                my $ws = "\0" x 8;
+                ioctl(STDIN, TIOCGWINSZ, $ws);
+                # Forward winsize to the PTY master via sysopen+ioctl on the fd
+                if (open my $mfh, '+<&=', $pty_master_fd) {
+                    ioctl($mfh, TIOCSWINSZ, $ws);
+                    # Don't close — it's a dup alias for the raw fd
+                }
             }
-            $got_init = 1;
-        } else {
-            warn "nacre-dbg: waitid failed wr=$wr errno=$!\n"
-                if $ENV{NACRE_RUN_DEBUG};
-        }
-        POSIX::close($pidfd);
-    } else {
-        warn "nacre-dbg: pidfd_open failed pidfd=$pidfd errno=$!\n"
-            if $ENV{NACRE_RUN_DEBUG};
-    }
+        };
 
-    # Fallback: waitpid with subreaper
-    unless ($got_init) {
+        # Put master in non-blocking mode
+        my $fl = fcntl_getfl($pty_master_fd);
+        fcntl_setfl($pty_master_fd, $fl | O_NONBLOCK) if defined $fl;
+
+        # Put stdin in non-blocking mode
+        my $stdin_fd = fileno(STDIN);
+        my $stdin_fl = fcntl_getfl($stdin_fd);
+        fcntl_setfl($stdin_fd, $stdin_fl | O_NONBLOCK) if defined $stdin_fl;
+
+        my $done = 0;
+        $exit_code = 0;
+        local $SIG{CHLD} = sub {
+            while ((my $w = waitpid(-1, WNOHANG)) > 0) {
+                if ($w == $init_pid) {
+                    if (WIFEXITED($?)) {
+                        $exit_code = WEXITSTATUS($?);
+                    } elsif (WIFSIGNALED($?)) {
+                        $exit_code = 128 + WTERMSIG($?);
+                    }
+                    $done = 1;
+                }
+            }
+        };
+
+        while (!$done) {
+            my $rin = '';
+            vec($rin, $pty_master_fd, 1) = 1;
+            vec($rin, $stdin_fd, 1) = 1;
+
+            my $nfound = select($rin, undef, undef, 0.5);
+            next if !$nfound || $nfound < 0;
+
+            # Read from PTY master → write to stdout
+            if (vec($rin, $pty_master_fd, 1)) {
+                my $buf;
+                my $n = POSIX::read($pty_master_fd, $buf, 8192);
+                if (defined $n && $n > 0) {
+                    syswrite(STDOUT, $buf, $n);
+                } elsif (!defined $n && $! != EAGAIN && $! != EWOULDBLOCK && $! != EINTR) {
+                    $done = 1;
+                } elsif (defined $n && $n == 0) {
+                    $done = 1;
+                }
+            }
+
+            # Read from stdin → write to PTY master
+            if (vec($rin, $stdin_fd, 1)) {
+                my $buf;
+                my $n = sysread(STDIN, $buf, 8192);
+                if (defined $n && $n > 0) {
+                    POSIX::write($pty_master_fd, $buf, $n);
+                }
+            }
+        }
+
+        # Drain remaining output
         while (1) {
-            my $w = waitpid(-1, 0);
-            if ($w == $init_pid) {
-                if (WIFEXITED($?)) {
-                    $exit_code = WEXITSTATUS($?);
-                } elsif (WIFSIGNALED($?)) {
-                    $exit_code = 128 + WTERMSIG($?);
+            my $buf;
+            my $n = POSIX::read($pty_master_fd, $buf, 8192);
+            last unless defined $n && $n > 0;
+            syswrite(STDOUT, $buf, $n);
+        }
+
+        POSIX::close($pty_master_fd);
+
+        # Restore stdin
+        fcntl_setfl($stdin_fd, $stdin_fl) if defined $stdin_fl;
+    } else {
+        # No PTY: just wait for the init process
+        $exit_code = 0;
+        my $got_init = 0;
+
+        # Try pidfd_open first (kernel 5.3+)
+        my $pidfd_nr = SYS_pidfd_open + 0;
+        my $pidfd = syscall($pidfd_nr, $init_pid + 0, 0);
+
+        if ($pidfd >= 0) {
+            my $waitid_nr = SYS_waitid + 0;
+            my $siginfo = "\0" x 128;
+            my $P_PIDFD = 3;
+            my $WEXITED = 4;
+            my $wr = syscall($waitid_nr, $P_PIDFD + 0, $pidfd + 0,
+                             $siginfo, $WEXITED + 0, 0);
+            if ($wr == 0) {
+                my $si_code   = unpack('i', substr($siginfo, 8, 4));
+                my $si_status = unpack('i', substr($siginfo, 24, 4));
+                if ($si_code == 1) {
+                    $exit_code = $si_status;
+                } else {
+                    $exit_code = 128 + $si_status;
                 }
                 $got_init = 1;
-                last;
             }
-            last if $w < 0 && $! != EINTR;
+            POSIX::close($pidfd);
         }
-    }
 
-    # Last resort: poll with kill(0, pid)
-    unless ($got_init) {
-        while (kill(0, $init_pid)) {
-            while ((my $z = waitpid(-1, WNOHANG)) > 0) {
-                if ($z == $init_pid) {
+        unless ($got_init) {
+            while (1) {
+                my $w = waitpid(-1, 0);
+                if ($w == $init_pid) {
                     if (WIFEXITED($?)) {
                         $exit_code = WEXITSTATUS($?);
                     } elsif (WIFSIGNALED($?)) {
@@ -3751,9 +3836,26 @@ sub cmd_run {
                     $got_init = 1;
                     last;
                 }
+                last if $w < 0 && $! != EINTR;
             }
-            last if $got_init;
-            select(undef, undef, undef, 0.1);
+        }
+
+        unless ($got_init) {
+            while (kill(0, $init_pid)) {
+                while ((my $z = waitpid(-1, WNOHANG)) > 0) {
+                    if ($z == $init_pid) {
+                        if (WIFEXITED($?)) {
+                            $exit_code = WEXITSTATUS($?);
+                        } elsif (WIFSIGNALED($?)) {
+                            $exit_code = 128 + WTERMSIG($?);
+                        }
+                        $got_init = 1;
+                        last;
+                    }
+                }
+                last if $got_init;
+                select(undef, undef, undef, 0.1);
+            }
         }
     }
 
@@ -4701,11 +4803,20 @@ sub main {
 
     log_debug("nacre starting, command=$command root=$root");
 
-    # Handle `<command> -h` / `<command> --help` for any subcommand (runc compat)
+    # Handle `<command> -h` / `<command> --help` for known subcommands (runc compat)
+    my %_known_cmds = map { $_ => 1 } qw(
+        create run start delete kill state list ps events pause resume
+        update exec spec version checkpoint restore features
+    );
     if ($command !~ /^-/ && $command ne 'help'
         && grep { $_ eq '-h' || $_ eq '--help' } @ARGV) {
-        print "NAME:\n   runc $command\n\nUSAGE:\n   runc $command [options]\n";
-        exit(0);
+        if ($_known_cmds{$command}) {
+            print "NAME:\n   runc $command\n\nUSAGE:\n   runc $command [options]\n";
+            exit(0);
+        } else {
+            print STDERR "No help topic for '$command'\n";
+            exit(1);
+        }
     }
 
     if ($command eq 'create') {
