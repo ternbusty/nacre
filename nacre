@@ -225,6 +225,8 @@ use constant {
     TIOCGPTN   => 0x80045430,   # Get PTY slave number
     TIOCSPTLCK => 0x40045431,   # Unlock PTY slave
     TIOCSCTTY  => 0x5480,       # Set controlling terminal
+    TIOCSWINSZ => 0x5414,       # Set window size
+    TIOCGWINSZ => 0x5413,       # Get window size
 };
 
 # -- Signals (name -> number) --
@@ -1914,6 +1916,56 @@ sub send_fd_via_socket {
     close($sock);
 }
 
+# Send a file descriptor over an already-connected socket fd (not a path).
+sub send_fd_over_fd {
+    my ($sock_fd, $fd) = @_;
+    $sock_fd = $sock_fd + 0;
+    my $data = "\x00";
+    my $iov  = pack('P L!', $data, 1);
+    my $cmsg_data = pack('i', $fd);
+    my $cmsg_len  = 8 + 4 + 4 + length($cmsg_data);
+    my $cmsg = pack('L! i i', $cmsg_len, SOL_SOCKET, SCM_RIGHTS)
+             . $cmsg_data;
+    my $pad = (8 - (length($cmsg) % 8)) % 8;
+    $cmsg .= "\0" x $pad;
+    my $msghdr = pack('Q',    0)
+               . pack('I x4', 0)
+               . pack('P',    $iov)
+               . pack('Q',    1)
+               . pack('P',    $cmsg)
+               . pack('Q',    length($cmsg))
+               . pack('I x4', 0);
+    my $nr  = SYS_sendmsg + 0;
+    my $ret = syscall($nr, $sock_fd, $msghdr, 0);
+    return $ret >= 0;
+}
+
+# Receive a file descriptor over a socket fd.
+sub recv_fd_over_fd {
+    my ($sock_fd) = @_;
+    $sock_fd = $sock_fd + 0;
+    my $data = "\0";
+    my $iov  = pack('P L!', $data, 1);
+    # Space for one fd in cmsg
+    my $cmsg_space = 8 + 4 + 4 + 4;  # cmsghdr + one int
+    my $pad = (8 - ($cmsg_space % 8)) % 8;
+    $cmsg_space += $pad;
+    my $cmsg_buf = "\0" x $cmsg_space;
+    my $msghdr = pack('Q',    0)
+               . pack('I x4', 0)
+               . pack('P',    $iov)
+               . pack('Q',    1)
+               . pack('P',    $cmsg_buf)
+               . pack('Q',    $cmsg_space)
+               . pack('I x4', 0);
+    my $nr  = SYS_recvmsg + 0;
+    my $ret = syscall($nr, $sock_fd, $msghdr, 0);
+    return -1 if $ret < 0;
+    # Extract fd from cmsg (offset: L! + i + i = 8+4+4 = 16 on LP64)
+    my $fd = unpack('i', substr($cmsg_buf, 16, 4));
+    return $fd;
+}
+
 # Create a PTY pair, send the master to the console socket, return the
 # slave file descriptor (as an integer fd number).  Must be called before
 # pivot_root so that both /dev/ptmx and the console-socket path are
@@ -3515,6 +3567,124 @@ sub cmd_resume {
 }
 
 # ═══════════════════════════════════════════════════════════════════════
+# Exec TTY I/O relay
+# ═══════════════════════════════════════════════════════════════════════
+
+sub exec_tty_relay {
+    my ($child_pid, $master_fd, $err_r_fd) = @_;
+
+    # Relay I/O between PTY master and our stdin/stdout.
+    # This runs until the child process exits.
+
+    # Put PTY master in non-blocking mode
+    my $fl = fcntl_getfl($master_fd);
+    fcntl_setfl($master_fd, $fl | O_NONBLOCK) if defined $fl;
+
+    # Also set stdin non-blocking for select
+    my $stdin_fd = fileno(STDIN);
+    my $stdin_fl = fcntl_getfl($stdin_fd);
+    fcntl_setfl($stdin_fd, $stdin_fl | O_NONBLOCK) if defined $stdin_fl;
+
+    my $done = 0;
+    my $exit_status = 0;
+    local $SIG{CHLD} = sub {
+        my $ret = waitpid($child_pid, WNOHANG);
+        if ($ret > 0) {
+            if (WIFEXITED($?)) {
+                $exit_status = WEXITSTATUS($?);
+            } elsif (WIFSIGNALED($?)) {
+                $exit_status = 128 + WTERMSIG($?);
+            }
+            $done = 1;
+        }
+    };
+
+    while (!$done) {
+        my $rin = '';
+        vec($rin, $master_fd, 1) = 1;
+        vec($rin, $stdin_fd,  1) = 1;
+
+        my $nfound = select($rin, undef, undef, 0.5);
+        next if !$nfound || $nfound < 0;
+
+        # Read from PTY master → write to stdout
+        if (vec($rin, $master_fd, 1)) {
+            my $buf;
+            my $n = POSIX::read($master_fd, $buf, 8192);
+            if (defined $n && $n > 0) {
+                syswrite(STDOUT, $buf, $n);
+            } elsif (!defined $n && $! != EAGAIN && $! != EWOULDBLOCK && $! != EINTR) {
+                $done = 1;
+            } elsif (defined $n && $n == 0) {
+                $done = 1;
+            }
+        }
+
+        # Read from stdin → write to PTY master
+        if (vec($rin, $stdin_fd, 1)) {
+            my $buf;
+            my $n = sysread(STDIN, $buf, 8192);
+            if (defined $n && $n > 0) {
+                POSIX::write($master_fd, $buf, $n);
+            }
+        }
+    }
+
+    # Drain remaining output
+    while (1) {
+        my $buf;
+        my $n = POSIX::read($master_fd, $buf, 8192);
+        last unless defined $n && $n > 0;
+        syswrite(STDOUT, $buf, $n);
+    }
+
+    # Check for exec errors
+    my $err_msg = '';
+    while (sysread(*STDIN, my $buf, 4096, 0) // 0) { last; }  # dummy
+    if (defined $err_r_fd) {
+        # Open err_r_fd for reading
+        if (open my $efh, '<&=', $err_r_fd) {
+            while (sysread($efh, my $buf, 4096)) { $err_msg .= $buf; }
+            close $efh;
+        }
+    }
+    warn "nacre: $err_msg\n" if $err_msg ne '';
+
+    # Restore stdin
+    fcntl_setfl($stdin_fd, $stdin_fl) if defined $stdin_fl;
+
+    POSIX::close($master_fd);
+
+    # Reap if not yet done
+    unless ($done) {
+        waitpid($child_pid, 0);
+        if (WIFEXITED($?)) {
+            $exit_status = WEXITSTATUS($?);
+        } elsif (WIFSIGNALED($?)) {
+            $exit_status = 128 + WTERMSIG($?);
+        }
+    }
+
+    exit($exit_status);
+}
+
+# Helper: fcntl F_GETFL / F_SETFL
+sub fcntl_getfl {
+    my ($fd) = @_;
+    return undef unless defined $fd;
+    open my $fh, '+<&=', $fd or return undef;
+    my $fl = fcntl($fh, Fcntl::F_GETFL(), 0);
+    return defined $fl ? ($fl + 0) : undef;
+}
+
+sub fcntl_setfl {
+    my ($fd, $fl) = @_;
+    return undef unless defined $fd;
+    open my $fh, '+<&=', $fd or return undef;
+    return fcntl($fh, Fcntl::F_SETFL(), $fl);
+}
+
+# ═══════════════════════════════════════════════════════════════════════
 # Container: exec
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -3606,6 +3776,13 @@ sub cmd_exec {
         }
     }
 
+    # PTY socketpair: used to pass master fd from child to parent when -t
+    my ($pty_parent_fh, $pty_child_fh);
+    if ($tty) {
+        socketpair($pty_parent_fh, $pty_child_fh, AF_UNIX, SOCK_STREAM, 0)
+            or fatal("socketpair for pty: $!");
+    }
+
     # Error pipe: child writes exec errors back to parent
     pipe(my $err_r, my $err_w) or fatal("pipe: $!");
     # Set CLOEXEC on the write end so it auto-closes on successful exec
@@ -3617,6 +3794,7 @@ sub cmd_exec {
 
     if ($child == 0) {
         close $err_r;
+        close $pty_parent_fh if $pty_parent_fh;
 
         log_debug("nsexec container setup");
         log_debug("child process in init()");
@@ -3640,6 +3818,47 @@ sub cmd_exec {
         # chdir into container root after joining mount ns
         chdir('/');
         chdir($exec_cwd // $spec->{process}{cwd} // '/');
+
+        # Set up PTY for exec -t (must happen after joining mount namespace
+        # so we allocate from the container's devpts)
+        if ($tty) {
+            setsid();
+
+            # Allocate PTY inside container
+            sysopen(my $ptm, '/dev/ptmx', O_RDWR | O_NOCTTY | O_CLOEXEC)
+                or do { syswrite($err_w, "open /dev/ptmx: $!"); _exit(255); };
+            my $ptn_buf = pack('i', 0);
+            ioctl($ptm, TIOCGPTN, $ptn_buf)
+                or do { syswrite($err_w, "TIOCGPTN: $!"); _exit(255); };
+            my $ptn = unpack('i', $ptn_buf);
+            my $unlock = pack('i', 0);
+            ioctl($ptm, TIOCSPTLCK, $unlock);
+
+            my $pts_path = "/dev/pts/$ptn";
+
+            # Set console size from process.json if given
+            if ($exec_proc && $exec_proc->{consoleSize}) {
+                my $h = $exec_proc->{consoleSize}{height} // 0;
+                my $w = $exec_proc->{consoleSize}{width}  // 0;
+                my $ws = pack('S4', $h + 0, $w + 0, 0, 0);
+                ioctl($ptm, TIOCSWINSZ, $ws);
+            }
+
+            # Send master fd to parent for I/O relay
+            send_fd_over_fd(fileno($pty_child_fh), fileno($ptm));
+            close $ptm;
+            close $pty_child_fh;
+
+            # Open slave and dup2 to stdio
+            sysopen(my $pts, $pts_path, O_RDWR)
+                or do { syswrite($err_w, "open PTY slave $pts_path: $!"); _exit(255); };
+            my $pts_fd = fileno($pts);
+            POSIX::dup2($pts_fd, 0);
+            POSIX::dup2($pts_fd, 1);
+            POSIX::dup2($pts_fd, 2);
+            ioctl(STDIN, TIOCSCTTY, 0);
+            close $pts if $pts_fd > 2;
+        }
 
         # Set environment
         if ($exec_env && @$exec_env) {
@@ -3741,6 +3960,25 @@ sub cmd_exec {
 
     # Parent
     close $err_w;
+    close $pty_child_fh if $pty_child_fh;
+
+    # Receive PTY master fd from child
+    my $pty_master_fd;
+    if ($tty && $pty_parent_fh) {
+        $pty_master_fd = recv_fd_over_fd(fileno($pty_parent_fh));
+        close $pty_parent_fh;
+        if ($pty_master_fd < 0) {
+            warn "nacre: failed to receive PTY master fd\n";
+            $pty_master_fd = undef;
+        }
+    }
+
+    # For detached exec with tty and console socket: send master to console socket
+    if ($detach && $tty && $console_socket && defined $pty_master_fd) {
+        send_fd_via_socket($console_socket, $pty_master_fd);
+        POSIX::close($pty_master_fd);
+        $pty_master_fd = undef;
+    }
 
     # Write pid file
     if ($pid_file) {
@@ -3770,10 +4008,17 @@ sub cmd_exec {
             warn "nacre: $err_msg\n";
             exit(255);
         }
+        POSIX::close($pty_master_fd) if defined $pty_master_fd;
         exit(0);
     }
 
-    # Wait for exec'd process
+    # For foreground exec with tty: relay I/O between PTY master and stdio
+    if ($tty && defined $pty_master_fd) {
+        exec_tty_relay($child, $pty_master_fd, fileno($err_r));
+        # exec_tty_relay does not return; it calls exit()
+    }
+
+    # Wait for exec'd process (non-tty path)
     waitpid($child, 0);
 
     # Check for exec errors from the child

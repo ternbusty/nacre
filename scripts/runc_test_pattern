@@ -17,7 +17,7 @@
 #   nacre:idmap   idmap mounts not implemented
 #   nacre:netdev  network device move not implemented
 #   nacre:notify  seccomp SCMP_ACT_NOTIFY listener not implemented
-#   nacre:exec    exec feature gap (missing tty/userns)
+#   nacre:exec    exec feature gap (missing userns join)
 #   nacre:cgroup  cgroup feature gap
 #   nacre:cgroup  cgroup feature gap
 
@@ -279,7 +279,7 @@ runc exec --pid-file
 runc exec --pid-file with new CWD
 runc exec [exit codes]
 runc exec [execve error]
-[skip]runc exec [stdin not a tty] # nacre:exec
+runc exec [stdin not a tty]
 runc exec check default home
 runc exec should refuse a paused container
 runc exec with RLIMIT_NOFILE(Bigger than system's hard value)
@@ -296,10 +296,10 @@ runc exec (session keyring security label + userns)
 [skip]runc exec [seccomp] (SCMP_ACT_NOTIFY noNewPrivileges false) # nacre:notify
 [skip]runc exec [seccomp] (SCMP_ACT_NOTIFY noNewPrivileges true) # nacre:notify
 runc exec [simple timens]
-[skip]runc exec [tty consolesize] # nacre:exec
-[skip]runc exec [tty owner] # nacre:exec
-[skip]runc exec [tty owner] ({u,g}id != 0) # nacre:exec
-[skip]runc exec [tty ptsname] # nacre:exec
+runc exec [tty consolesize]
+runc exec [tty owner]
+runc exec [tty owner] ({u,g}id != 0)
+runc exec [tty ptsname]
 [skip]runc exec [init changes cgroup] # nacre:cgroup
 runc exec [CPU affinity, initial and final set from config.json]
 runc exec [CPU affinity, initial and final set from process.json]
