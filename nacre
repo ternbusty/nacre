@@ -1457,7 +1457,7 @@ use constant {
 # The full libseccomp integration requires FFI::Platypus
 sub apply_seccomp_raw {
     my ($spec) = @_;
-    my $seccomp = $spec->{linux}{seccomp} // return;
+    my $seccomp = $spec->{linux}{seccomp} // return undef;
 
     # If FFI::Platypus is available, use it
     if (eval { require FFI::Platypus; 1 }) {
@@ -1465,7 +1465,7 @@ sub apply_seccomp_raw {
     }
 
     # Fallback: build and load BPF program directly via seccomp(2)
-    apply_seccomp_minimal($seccomp);
+    return apply_seccomp_minimal($seccomp);
 }
 
 sub apply_seccomp_ffi {
@@ -1648,6 +1648,7 @@ my %_SECCOMP_RET = (
     SCMP_ACT_KILL         => 0x00000000,
     SCMP_ACT_KILL_PROCESS => 0x80000000,
     SCMP_ACT_TRAP         => 0x00030000,
+    SCMP_ACT_NOTIFY       => 0x7fc00000,   # SECCOMP_RET_USER_NOTIF
     SCMP_ACT_LOG          => 0x7ffc0000,
     SCMP_ACT_ALLOW        => 0x7fff0000,
 );
@@ -1752,6 +1753,14 @@ sub apply_seccomp_minimal {
     # sock_fprog as a string.  'P' in pack produces a raw pointer to the scalar.
     my $fprog = pack('S x![Q] P', $ninsns, $filter);
 
+    # Check if any rule uses SCMP_ACT_NOTIFY
+    my $has_notify = 0;
+    for my $r (@rules) {
+        $has_notify = 1 if $r->[1] == 0x7fc00000;  # SECCOMP_RET_USER_NOTIF
+    }
+    # Also check default action
+    $has_notify = 1 if $default_ret == 0x7fc00000;
+
     # Map OCI seccomp.flags to kernel SECCOMP_FILTER_FLAG_* values
     my %flag_map = (
         SECCOMP_FILTER_FLAG_TSYNC     => SECCOMP_FILTER_FLAG_TSYNC,
@@ -1770,12 +1779,27 @@ sub apply_seccomp_minimal {
         }
     }
 
+    # If NOTIFY actions are present, add NEW_LISTENER flag
+    if ($has_notify) {
+        $fl |= SECCOMP_FILTER_FLAG_NEW_LISTENER;
+    }
+
     my $nr = SYS_seccomp + 0;
     my $op = SECCOMP_SET_MODE_FILTER + 0;
     $fl += 0;
     my $ret = syscall($nr, $op, $fl, $fprog);
-    if ($ret != 0) {
-        fatal("seccomp: BPF load failed (errno=$!), filter has $ninsns insns");
+
+    if ($has_notify || ($fl & SECCOMP_FILTER_FLAG_NEW_LISTENER)) {
+        # With NEW_LISTENER, ret is the notify fd on success (>= 0)
+        if ($ret < 0) {
+            fatal("seccomp: BPF load failed (errno=$!), filter has $ninsns insns");
+        }
+        return $ret;   # notify fd
+    } else {
+        if ($ret != 0) {
+            fatal("seccomp: BPF load failed (errno=$!), filter has $ninsns insns");
+        }
+        return undef;  # no notify fd
     }
 }
 
@@ -2085,8 +2109,10 @@ sub notify_container_start {
 # ═══════════════════════════════════════════════════════════════════════
 
 # Send a file descriptor over a Unix domain socket using SCM_RIGHTS.
+# Optional $payload is sent as the data (instead of a single NUL byte);
+# this is used for seccomp notify listener metadata.
 sub send_fd_via_socket {
-    my ($socket_path, $fd) = @_;
+    my ($socket_path, $fd, $payload) = @_;
 
     socket(my $sock, AF_UNIX, SOCK_STREAM, 0) or fatal("socket: $!");
     connect($sock, pack_sockaddr_un($socket_path))
@@ -2094,9 +2120,9 @@ sub send_fd_via_socket {
 
     my $sock_fd = fileno($sock) + 0;
 
-    # iovec: one byte of data (required for SCM_RIGHTS)
-    my $data = "\x00";
-    my $iov = pack('P L!', $data, 1);
+    # iovec: data payload (required for SCM_RIGHTS; at least one byte)
+    my $data = (defined $payload && length($payload)) ? $payload : "\x00";
+    my $iov = pack('P L!', $data, length($data));
 
     # cmsg: SOL_SOCKET / SCM_RIGHTS / fd
     my $cmsg_data = pack('i', $fd);
@@ -2237,7 +2263,7 @@ sub apply_process_security {
     }
 
     # 4. Seccomp (must be applied before dropping caps)
-    apply_seccomp_raw($spec);
+    my $seccomp_notify_fd = apply_seccomp_raw($spec);
 
     # 5. Capabilities phase 1: drop bounding set + set KEEPCAPS.
     #    KEEPCAPS must be on BEFORE setuid so the kernel preserves the
@@ -2267,6 +2293,8 @@ sub apply_process_security {
     #    sets.  The kernel cleared effective on setuid but kept permitted
     #    (KEEPCAPS was on); capset re-establishes the spec's desired sets.
     apply_capabilities_final($spec);
+
+    return $seccomp_notify_fd;
 }
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2987,7 +3015,22 @@ sub run_init_process {
     # Apply process security (NNP, seccomp, caps, setuid/setgid)
     # Must happen BEFORE startContainer hooks so hooks run with seccomp applied
     $dbg->("apply_process_security");
-    apply_process_security($spec);
+    my $seccomp_notify_fd = apply_process_security($spec);
+
+    # If seccomp NOTIFY is active, send the notify fd to the parent.
+    # The parent will forward it to the listener socket (listenerPath).
+    if (defined $seccomp_notify_fd && $seccomp_notify_fd >= 0) {
+        $dbg->("seccomp: sending notify fd=$seccomp_notify_fd to parent");
+        # Send JSON message first, then the fd in a separate message
+        channel_send($main_chan_w, { type => 'seccomp_notify_fd' });
+        send_fd_over_fd($main_chan_w, $seccomp_notify_fd);
+        POSIX::close($seccomp_notify_fd);
+        # Wait for parent to confirm listener connection
+        my $resp = channel_recv($main_chan_r);
+        if (!$resp || $resp->{type} ne 'notify_fd_done') {
+            fatal("seccomp notify: parent failed to connect listener");
+        }
+    }
 
     # Run startContainer hooks (run inside the container namespace, with seccomp active)
     if (my $hooks = $spec->{hooks}) {
@@ -3190,6 +3233,20 @@ sub cmd_create {
     validate_capabilities($spec);
     validate_rlimits($spec);
     validate_memory_policy($spec);
+
+    # Validate: seccomp SCMP_ACT_NOTIFY requires a non-empty listenerPath
+    if (my $seccomp = $spec->{linux}{seccomp}) {
+        my $has_notify = 0;
+        for my $rule (@{$seccomp->{syscalls} // []}) {
+            $has_notify = 1 if ($rule->{action} // '') eq 'SCMP_ACT_NOTIFY';
+        }
+        $has_notify = 1 if ($seccomp->{defaultAction} // '') eq 'SCMP_ACT_NOTIFY';
+        if ($has_notify) {
+            my $lp = $seccomp->{listenerPath} // '';
+            fatal("seccomp SCMP_ACT_NOTIFY requires a non-empty listenerPath")
+                if $lp eq '';
+        }
+    }
 
     # Validate: timeOffsets require a time namespace
     if (my $to = $spec->{linux}{timeOffsets}) {
@@ -3435,6 +3492,26 @@ sub cmd_create {
                 channel_send($init_w_fd, { type => 'cgroup_done' });
             }
         }
+        elsif ($msg->{type} eq 'seccomp_notify_fd') {
+            # Receive the seccomp notify fd from init
+            my $notify_fd = recv_fd_over_fd($main_r_fd);
+            if ($notify_fd >= 0) {
+                # Forward the notify fd to the seccomp listener
+                my $listener_path = $spec->{linux}{seccomp}{listenerPath} // '';
+                my $listener_meta = $spec->{linux}{seccomp}{listenerMetadata} // '';
+                if ($listener_path ne '') {
+                    eval {
+                        send_fd_via_socket($listener_path, $notify_fd, $listener_meta);
+                    };
+                    if ($@) {
+                        warn "nacre: seccomp notify: failed to send fd to listener: $@\n";
+                    }
+                }
+                POSIX::close($notify_fd);
+            }
+            # Signal init that listener is connected
+            channel_send($init_w_fd, { type => 'notify_fd_done' });
+        }
         elsif ($msg->{type} eq 'init_ready') {
             $init_ready = 1;
             last;
@@ -3502,6 +3579,16 @@ sub cmd_create {
     # Write pid file
     if ($p{pid_file}) {
         write_file($p{pid_file}, "$init_pid\n");
+    }
+
+    # Send pidfd via socket if requested
+    if ($p{pidfd_socket}) {
+        my $pidfd_nr = SYS_pidfd_open + 0;
+        my $pid_arg  = $init_pid + 0;
+        my $pidfd    = syscall($pidfd_nr, $pid_arg, 0);
+        fatal("pidfd_open($init_pid): $!") if $pidfd < 0;
+        send_fd_via_socket($p{pidfd_socket}, $pidfd);
+        POSIX::close($pidfd);
     }
 
     # Run createRuntime hooks (OCI spec: MUST error if these fail)
@@ -4094,6 +4181,8 @@ sub cmd_exec {
     my $detach         = $p{detach};
     my $console_socket = $p{console_socket};
     my $cap_add        = $p{cap};
+    my $pidfd_socket   = $p{pidfd_socket};
+    my $exec_cgroup    = $p{exec_cgroup};
     log_debug("exec in container id=$id");
 
     # Load process from -p file if given
@@ -4466,6 +4555,71 @@ sub cmd_exec {
         }
     }
 
+    # Move exec process into the container's cgroup
+    my $container_cgpath = $state->{cgroupPath};
+    if ($exec_cgroup) {
+        # --cgroup: move to a specific sub-cgroup
+        fatal("container has no cgroup path") unless $container_cgpath;
+
+        # Resolve the sub-cgroup path
+        my $sub_path;
+        if ($exec_cgroup eq '/' || $exec_cgroup eq '') {
+            $sub_path = $container_cgpath;
+        } else {
+            # Validate: no ".." components (path traversal)
+            my $cleaned = $exec_cgroup;
+            $cleaned =~ s{^/+}{};
+            $cleaned =~ s{/+$}{};
+            if ($cleaned =~ m{(?:^|/)\.\.(?:/|$)}) {
+                fatal("bad sub cgroup path: '$exec_cgroup'");
+            }
+            # Also reject paths that escape the container's cgroup
+            # (e.g. "../sibling" even after cleaning)
+            $sub_path = "$container_cgpath/$cleaned";
+            # Canonicalize and check it's still under the container cgroup
+            my $real = Cwd::abs_path($sub_path);
+            if (!$real || index($real, $container_cgpath) != 0) {
+                fatal("bad sub cgroup path: '$exec_cgroup'");
+            }
+            $sub_path = $real;
+        }
+        # Check the cgroup exists
+        fatal("exec cgroup '$sub_path': no such file or directory")
+            unless -d $sub_path;
+        # Write exec process PID to the sub-cgroup
+        write_file("$sub_path/cgroup.procs", "$child\n");
+    } elsif ($container_cgpath && -d $container_cgpath) {
+        # Default: join the container's cgroup.
+        # Try the state's cgroup first; if that fails (e.g. init moved
+        # to a sub-cgroup and domain controllers are active), fall back
+        # to wherever the init process actually lives.
+        my $joined = eval { write_file("$container_cgpath/cgroup.procs", "$child\n"); 1 };
+        if (!$joined) {
+            # Fall back to init's actual cgroup
+            my $init_cg = read_file("/proc/$init_pid/cgroup");
+            if (defined $init_cg && $init_cg =~ m{^0::(.+)$}m) {
+                my $rel = $1;
+                # The init's cgroup path is relative to the cgroupfs root.
+                # Compute the host path by finding the cgroup mount root.
+                # For cgroup v2: /sys/fs/cgroup + init_relative_path
+                my $init_cghost = "/sys/fs/cgroup$rel";
+                if (-d $init_cghost) {
+                    eval { write_file("$init_cghost/cgroup.procs", "$child\n") };
+                }
+            }
+        }
+    }
+
+    # Send pidfd via socket if requested
+    if ($pidfd_socket) {
+        my $pidfd_nr = SYS_pidfd_open + 0;
+        my $pid_arg  = $child + 0;
+        my $pidfd    = syscall($pidfd_nr, $pid_arg, 0);
+        fatal("pidfd_open($child): $!") if $pidfd < 0;
+        send_fd_via_socket($pidfd_socket, $pidfd);
+        POSIX::close($pidfd);
+    }
+
     # Close namespace fds in parent
     for my $ns (@ns_fds) { close $ns->{fd}; }
 
@@ -4834,17 +4988,18 @@ sub main {
     }
 
     if ($command eq 'create') {
-        my ($bundle, $pid_file, $console_socket, $no_pivot);
+        my ($bundle, $pid_file, $console_socket, $no_pivot, $pidfd_socket);
         GetOptions(
             'bundle|b=s'         => \$bundle,
             'pid-file=s'         => \$pid_file,
             'console-socket=s'   => \$console_socket,
+            'pidfd-socket=s'     => \$pidfd_socket,
             'no-pivot'           => \$no_pivot,
         );
         my $id = shift @ARGV // fatal("container id required");
         cmd_create(id => $id, bundle => $bundle, root => $root,
                    pid_file => $pid_file, console_socket => $console_socket,
-                   no_pivot => $no_pivot);
+                   pidfd_socket => $pidfd_socket, no_pivot => $no_pivot);
     }
     elsif ($command eq 'start') {
         my $id = shift @ARGV // fatal("container id required");
@@ -4868,17 +5023,19 @@ sub main {
         cmd_delete(id => $id, root => $root, force => $force);
     }
     elsif ($command eq 'run') {
-        my ($bundle, $pid_file, $console_socket, $no_pivot, $detach);
+        my ($bundle, $pid_file, $console_socket, $pidfd_socket, $no_pivot, $detach);
         GetOptions(
             'bundle|b=s'         => \$bundle,
             'pid-file=s'         => \$pid_file,
             'console-socket=s'   => \$console_socket,
+            'pidfd-socket=s'     => \$pidfd_socket,
             'no-pivot'           => \$no_pivot,
             'detach|d'           => \$detach,
         );
         my $id = shift @ARGV // fatal("container id required");
         cmd_run(id => $id, bundle => $bundle, root => $root,
                 pid_file => $pid_file, console_socket => $console_socket,
+                pidfd_socket => $pidfd_socket,
                 detach => $detach, no_pivot => $no_pivot);
     }
     elsif ($command eq 'list') {
@@ -4900,8 +5057,8 @@ sub main {
     }
     elsif ($command eq 'exec') {
         my ($exec_cwd, @exec_env, $exec_user, $detach, $pid_file,
-            $console_socket, $tty, $process_file, $ignore_paused,
-            $preserve_fds, @additional_gids, @cap_add);
+            $console_socket, $pidfd_socket, $tty, $process_file, $ignore_paused,
+            $preserve_fds, @additional_gids, @cap_add, $exec_cgroup);
         # Separate exec args: everything after "--" or after container id
         my @before;
         my @exec_cmd;
@@ -4929,12 +5086,14 @@ sub main {
             'detach|d'          => \$detach,
             'pid-file=s'        => \$pid_file,
             'console-socket=s'  => \$console_socket,
+            'pidfd-socket=s'    => \$pidfd_socket,
             'tty|t'             => \$tty,
             'process|p=s'       => \$process_file,
             'ignore-paused'     => \$ignore_paused,
             'preserve-fds=i'    => \$preserve_fds,
             'additional-gids=i' => \@additional_gids,
             'cap=s'             => \@cap_add,
+            'cgroup=s'          => \$exec_cgroup,
         );
         Getopt::Long::Configure('permute');
         my $id = shift @ARGV // fatal("container id required");
@@ -4948,6 +5107,8 @@ sub main {
                  process_file => $process_file,
                  tty => $tty, detach => $detach,
                  console_socket => $console_socket,
+                 pidfd_socket => $pidfd_socket,
+                 exec_cgroup => $exec_cgroup,
                  cap => (@cap_add ? \@cap_add : undef));
     }
     elsif ($command eq 'update') {
