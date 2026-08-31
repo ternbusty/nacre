@@ -13,10 +13,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Check Perl version
-        run: perl -v | head -5
-
       - name: Syntax check
         run: perl -c nacre
 
@@ -24,12 +20,8 @@ jobs:
     name: Integration tests
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-
     steps:
       - uses: actions/checkout@v4
-
-      - name: Check Perl version
-        run: perl -v | head -5
 
       - name: Install dependencies
         run: |
@@ -39,64 +31,10 @@ jobs:
       - name: Syntax check
         run: perl -c nacre
 
-      - name: Quick smoke test
-        run: |
-          set -x
-          # Test basic commands first
-          perl nacre --version
-          perl nacre features | python3 -m json.tool > /dev/null
-          echo "=== Smoke test: spec ==="
-          tmpdir=$(mktemp -d)
-          perl nacre spec --bundle "$tmpdir" --force
-          cat "$tmpdir/config.json" | python3 -m json.tool > /dev/null
-          rm -rf "$tmpdir"
-          echo "=== Smoke test: create ==="
-          # Build a minimal bundle
-          BUNDLE=$(mktemp -d)
-          mkdir -p "$BUNDLE/rootfs"/{bin,dev,proc,sys,tmp,etc}
-          cp "$(which busybox)" "$BUNDLE/rootfs/bin/"
-          (cd "$BUNDLE/rootfs/bin" && for c in sh ls echo id cat hostname sleep; do ln -sf busybox "$c"; done)
-          cat > "$BUNDLE/config.json" <<'SPEC'
-          {
-            "ociVersion": "1.2.0",
-            "root": { "path": "rootfs", "readonly": false },
-            "process": {
-              "terminal": false,
-              "user": { "uid": 0, "gid": 0 },
-              "args": ["sh", "-c", "echo Hello-from-nacre && hostname"],
-              "env": ["PATH=/bin:/usr/bin", "TERM=xterm"],
-              "cwd": "/",
-              "noNewPrivileges": true
-            },
-            "hostname": "nacre-test",
-            "mounts": [
-              { "destination": "/proc", "type": "proc", "source": "proc", "options": ["nosuid","noexec","nodev"] },
-              { "destination": "/dev", "type": "tmpfs", "source": "tmpfs", "options": ["nosuid","strictatime","mode=755","size=65536k"] },
-              { "destination": "/sys", "type": "sysfs", "source": "sysfs", "options": ["nosuid","noexec","nodev","readonly"] }
-            ],
-            "linux": {
-              "namespaces": [
-                { "type": "pid" },
-                { "type": "mount" },
-                { "type": "uts" },
-                { "type": "ipc" }
-              ]
-            }
-          }
-          SPEC
-          sudo perl nacre run --bundle "$BUNDLE" smoke-test 2>&1 || echo "EXIT CODE: $?"
-          rm -rf "$BUNDLE"
-
       - name: Run integration tests
-        if: success()
         run: |
           chmod +x test/run-tests.sh
           sudo test/run-tests.sh 2>&1 | tee /tmp/test-output.log
-        continue-on-error: true
-
-      - name: Show test results
-        if: always()
-        run: cat /tmp/test-output.log 2>/dev/null || echo "No test output captured"
 
       - name: Upload test logs
         if: always()
@@ -105,3 +43,11 @@ jobs:
           name: test-logs
           path: /tmp/test-output.log
           retention-days: 5
+
+  oci-validation:
+    needs: integration
+    uses: ./.github/workflows/oci-validation.yml
+
+  runc-bats:
+    needs: integration
+    uses: ./.github/workflows/runc-compat.yml

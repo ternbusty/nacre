@@ -1,0 +1,6 @@
+#!/bin/bash
+# Wrapper to make nacre behave like a standalone binary for runc bats tests.
+# runc bats tests expect the runtime at $RUNC or ./runc; this script
+# finds the Perl source relative to itself and invokes it.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec perl "$SCRIPT_DIR/nacre" "$@"

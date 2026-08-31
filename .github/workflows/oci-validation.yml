@@ -1,0 +1,147 @@
+name: OCI runtime-tools validation
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    name: runtime-tools validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nacre
+        run: |
+          sudo mkdir -p /opt/nacre
+          sudo cp nacre /opt/nacre/nacre
+          sudo chmod +x /opt/nacre/nacre
+          # Create a wrapper that invokes perl
+          sudo tee /opt/nacre/bin > /dev/null <<'WRAPPER'
+          #!/bin/bash
+          exec perl /opt/nacre/nacre "$@"
+          WRAPPER
+          sudo chmod +x /opt/nacre/bin
+
+      - name: Install Go and dependencies
+        run: |
+          sudo apt-get update || true
+          sudo apt-get install -y golang-go make busybox-static
+
+      - name: Clone and build runtime-tools validation suite
+        run: |
+          cd $HOME
+          git clone --depth 1 https://github.com/opencontainers/runtime-tools
+          cd runtime-tools
+          make runtimetest validation-executables
+
+      - name: Build busybox rootfs tarball
+        run: |
+          set -eux
+          BUSYBOX=$(which busybox)
+          STAGE=$(mktemp -d)
+          mkdir -p $STAGE/{bin,etc,proc,sys,dev,tmp}
+          cp "$BUSYBOX" $STAGE/bin/
+          ( cd $STAGE/bin && for c in sh ls cat echo grep awk sleep true false test mkdir rm chmod chown touch stat date wc head tail sort uniq id ps mount umount; do ln -sf busybox $c; done )
+          ARCH=$(uname -m)
+          case "$ARCH" in
+            aarch64|arm64) GOARCH=arm64 ;;
+            x86_64|amd64)  GOARCH=amd64 ;;
+            *)             GOARCH=$ARCH ;;
+          esac
+          tar -czf $HOME/runtime-tools/rootfs-$GOARCH.tar.gz -C $STAGE .
+
+      - name: Run validation suite
+        id: run-validation
+        run: |
+          set +e
+          cd $HOME/runtime-tools
+          RUNTIME=/opt/nacre/bin
+          mkdir -p $HOME/validation-out
+          PASS=0; FAIL=0; ERROR=0; TIMEOUT=0; SKIP_V1=0; SKIP_BROKEN=0
+          declare -a FAIL_NAMES TIMEOUT_NAMES SKIP_V1_NAMES SKIP_BROKEN_NAMES
+          # Cgroup v1 tests skipped on cgroup-v2 only hosts
+          SKIP_V1_PATTERN='^(linux_cgroups_(network|blkio|hugetlb|devices|pids|relative_(blkio|network|hugetlb|devices|pids))|linux_cgroups_relative_cpus|linux_cgroups_relative_memory|linux_cgroups_cpus|linux_cgroups_memory|delete_(only_create_)?resources)$'
+          # Known-broken upstream tests
+          SKIP_BROKEN_PATTERN='^(pidfile|process_rlimits)$'
+          for t in validation/*/*.t; do
+            name=$(basename "$t" .t)
+            if echo "$name" | grep -qE "$SKIP_V1_PATTERN"; then
+              SKIP_V1=$((SKIP_V1+1))
+              SKIP_V1_NAMES+=("$name")
+              echo "SKIP(v1) $name"
+              continue
+            fi
+            if echo "$name" | grep -qE "$SKIP_BROKEN_PATTERN"; then
+              SKIP_BROKEN=$((SKIP_BROKEN+1))
+              SKIP_BROKEN_NAMES+=("$name")
+              echo "SKIP(broken-upstream) $name"
+              continue
+            fi
+            out=$HOME/validation-out/$name.log
+            sudo timeout 60 env RUNTIME=$RUNTIME "$t" > "$out" 2>&1
+            rc=$?
+            sudo $RUNTIME delete --force "$name" 2>/dev/null || true
+            # Safe cleanup: only remove nacre state files
+            sudo find /run/nacre -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+            if [ "$rc" -eq 124 ]; then
+              TIMEOUT=$((TIMEOUT+1))
+              TIMEOUT_NAMES+=("$name")
+              echo "TIMEOUT  $name"
+              continue
+            fi
+            n_ok=$(grep -c "^ok " "$out" 2>/dev/null)
+            n_notok=$(grep -c "^not ok " "$out" 2>/dev/null)
+            n_ok=${n_ok:-0}; n_notok=${n_notok:-0}
+            if [ "$n_notok" -gt 0 ]; then
+              FAIL=$((FAIL+1))
+              FAIL_NAMES+=("$name (ok=$n_ok notok=$n_notok)")
+              echo "FAIL     $name  ok=$n_ok notok=$n_notok"
+            elif [ "$n_ok" -gt 0 ]; then
+              PASS=$((PASS+1))
+              echo "PASS     $name  ok=$n_ok"
+            elif [ "$rc" -ne 0 ]; then
+              ERROR=$((ERROR+1))
+              echo "ERROR    $name  rc=$rc"
+            else
+              echo "SKIP     $name"
+            fi
+          done
+          echo "=== SUMMARY ==="
+          echo "PASS=$PASS  FAIL=$FAIL  TIMEOUT=$TIMEOUT  ERROR=$ERROR  SKIP_V1=$SKIP_V1  SKIP_BROKEN=$SKIP_BROKEN"
+          {
+            echo "## OCI runtime-tools validation"
+            echo
+            echo "| metric | count |"
+            echo "|---|---|"
+            echo "| pass | $PASS |"
+            echo "| fail | $FAIL |"
+            echo "| timeout | $TIMEOUT |"
+            echo "| error | $ERROR |"
+            echo "| skip (cgroup v1) | $SKIP_V1 |"
+            echo "| skip (broken upstream) | $SKIP_BROKEN |"
+            echo
+            if [ ${#FAIL_NAMES[@]} -gt 0 ]; then
+              echo "### Failing tests"
+              for n in "${FAIL_NAMES[@]}"; do
+                echo "- $n"
+              done
+            fi
+            if [ ${#TIMEOUT_NAMES[@]} -gt 0 ]; then
+              echo "### Timeouts"
+              for n in "${TIMEOUT_NAMES[@]}"; do
+                echo "- $n"
+              done
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Don't fail CI yet — report results only
+          echo "validation_pass=$PASS" >> "$GITHUB_OUTPUT"
+          echo "validation_fail=$FAIL" >> "$GITHUB_OUTPUT"
+
+      - name: Upload per-test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-logs
+          path: ~/validation-out/

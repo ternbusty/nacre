@@ -1,0 +1,48 @@
+# runc bats integration test pattern for nacre
+#
+# Each line is either a test name to run, or prefixed with [skip] to skip.
+# Blank lines and lines starting with # are ignored.
+
+# --- spec ---
+spec generation cwd
+spec generation --bundle
+
+# --- version / help ---
+runc version
+runc -h
+runc command -h
+
+# --- create ---
+runc create
+runc create --pid-file
+runc create [terminal=false]
+
+# --- start ---
+runc start
+
+# --- state ---
+runc state
+
+# --- kill ---
+runc kill
+runc kill --all
+
+# --- delete ---
+runc delete
+
+# --- list ---
+runc list
+runc list -q
+runc list --format json
+
+# --- run ---
+runc run
+runc run [terminal=false]
+runc run detached
+runc run detached --pid-file
+
+# --- pause / resume ---
+runc pause and resume
+
+# --- events ---
+runc events --stats
