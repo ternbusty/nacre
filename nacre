@@ -2685,6 +2685,7 @@ sub run_init_process {
     chdir($cwd) or fatal("chdir to cwd '$cwd': $!");
 
     # Signal main process: init ready
+    log_debug("init: closing the pipe to signal completion");
     channel_send($main_chan_w, { type => 'init_ready' });
 
     # Wait for start signal
@@ -3323,7 +3324,15 @@ sub cmd_delete {
     my $force = $p{force} // 0;
     log_debug("delete container id=$id force=$force");
 
-    my $state = load_state($root, $id);
+    # runc compat: `delete --force` on a nonexistent container succeeds silently
+    my $state_path = state_dir($root, $id) . '/state.json';
+    my $state_raw  = read_file($state_path);
+    if (!defined $state_raw) {
+        return if $force;
+        fatal("container '$id' does not exist");
+    }
+    my $state = $JSON->decode($state_raw);
+    refresh_state($state);
 
     if ($state->{status} eq 'running' || $state->{status} eq 'created'
         || $state->{status} eq 'paused') {
@@ -3530,13 +3539,14 @@ sub cmd_list {
         return;
     }
 
-    # Table format
-    printf "%-20s %-10s %-10s %-10s %s\n", 'ID', 'PID', 'STATUS', 'CREATED', 'BUNDLE';
+    # Table format (runc column order: ID PID STATUS BUNDLE CREATED OWNER)
+    printf "%-20s %-10s %-10s %-40s %-30s %s\n", 'ID', 'PID', 'STATUS', 'BUNDLE', 'CREATED', 'OWNER';
     for my $c (sort { $a->{id} cmp $b->{id} } @containers) {
-        printf "%-20s %-10s %-10s %-10s %s\n",
+        printf "%-20s %-10s %-10s %-40s %-30s %s\n",
             $c->{id}, $c->{pid}, $c->{status},
-            substr($c->{created} // '', 0, 10),
-            $c->{bundle} // '';
+            $c->{bundle} // '',
+            $c->{created} // '',
+            '';
     }
 }
 
@@ -4543,10 +4553,10 @@ sub main {
         print "go: n/a (perl $Config{archname})\n";
     }
     else {
-        # Handle `<command> -h` for any command (runc compat)
+        # runc compat: unknown command with -h prints "No help topic"
         if (@ARGV && ($ARGV[0] eq '-h' || $ARGV[0] eq '--help')) {
-            print "NAME:\n   runc $command\n\nUSAGE:\n   runc $command [options]\n";
-            exit(0);
+            print STDERR "No help topic for '$command'\n";
+            exit(1);
         }
         fatal("unknown command: $command");
     }
