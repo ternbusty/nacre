@@ -621,6 +621,23 @@ sub cgroup_path {
 
 sub cgroup_setup {
     my ($cgpath, $spec) = @_;
+
+    # Check if cgroup already exists and has processes (non-empty cgroup)
+    if (-d $cgpath) {
+        my $procs = read_file("$cgpath/cgroup.procs");
+        if (defined $procs && $procs =~ /\d/) {
+            fatal("container's cgroup is not empty: $cgpath");
+        }
+        # Check if cgroup is frozen
+        my $freeze = read_file("$cgpath/cgroup.freeze");
+        if (defined $freeze) {
+            chomp $freeze;
+            if ($freeze eq '1') {
+                fatal("container's cgroup is frozen: $cgpath");
+            }
+        }
+    }
+
     ensure_dir($cgpath);
 
     # Enable controllers up the tree
@@ -679,7 +696,12 @@ sub cgroup_apply_resources {
     if (my $pids = $res->{pids}) {
         unless ($opts{defer_pids}) {
             my $max = $pids->{limit} // 'max';
-            $max = 'max' if $max <= 0;
+            if ($max eq 'max' || $max < 0) {
+                $max = 'max';
+            } elsif ($max == 0) {
+                # pids.limit=0 means 1 (minimum useful value)
+                $max = 1;
+            }
             cg_write($cgpath, 'pids.max', $max);
         }
     }
@@ -3092,6 +3114,7 @@ sub cmd_update {
     my $id       = $p{id}        // fatal("container id required");
     my $root     = $p{root}      // $DEFAULT_ROOT;
     my $res_file = $p{resources};
+    log_debug("update container id=$id");
 
     my $state = load_state($root, $id);
     fatal("container '$id' is not running or created or paused")
@@ -3100,19 +3123,47 @@ sub cmd_update {
     my $cgpath = $state->{cgroupPath}
         // fatal("no cgroup path for container");
 
-    # Load resources from file or stdin
-    my $res_json;
-    if ($res_file && $res_file ne '-') {
-        $res_json = read_file_or_die($res_file);
+    my $resources;
+    if ($res_file) {
+        # Load resources from file or stdin
+        my $res_json;
+        if ($res_file ne '-') {
+            $res_json = read_file_or_die($res_file);
+        } else {
+            local $/;
+            $res_json = <STDIN>;
+        }
+        $resources = $JSON->decode($res_json);
     } else {
-        local $/;
-        $res_json = <STDIN>;
+        # Build resources from CLI flags
+        $resources = {};
+        if (defined $p{pids_limit}) {
+            $resources->{pids} = { limit => $p{pids_limit} };
+        }
+        my %cpu;
+        $cpu{shares} = $p{cpu_share}   if defined $p{cpu_share};
+        $cpu{quota}  = $p{cpu_quota}   if defined $p{cpu_quota};
+        $cpu{period} = $p{cpu_period}  if defined $p{cpu_period};
+        $cpu{burst}  = $p{cpu_burst}   if defined $p{cpu_burst};
+        $cpu{idle}   = $p{cpu_idle}    if defined $p{cpu_idle};
+        $cpu{cpus}   = $p{cpuset_cpus} if defined $p{cpuset_cpus};
+        $cpu{mems}   = $p{cpuset_mems} if defined $p{cpuset_mems};
+        $resources->{cpu} = \%cpu if %cpu;
+        my %mem;
+        $mem{limit}       = $p{memory}             if defined $p{memory};
+        $mem{swap}        = $p{memory_swap}        if defined $p{memory_swap};
+        $mem{reservation} = $p{memory_reservation} if defined $p{memory_reservation};
+        $resources->{memory} = \%mem if %mem;
     }
-    my $resources = $JSON->decode($res_json);
 
     # Build a fake spec with just the resources
     my $fake_spec = { linux => { resources => $resources } };
     cgroup_apply_resources($cgpath, $fake_spec);
+
+    # Update device cgroup rules if present
+    if ($resources->{devices}) {
+        apply_device_cgroup($cgpath, $fake_spec);
+    }
 }
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -3441,10 +3492,32 @@ sub main {
                  cwd => $exec_cwd, env => \@exec_env, user => $exec_user);
     }
     elsif ($command eq 'update') {
-        my $resources;
-        GetOptions('resources|r=s' => \$resources);
+        my ($resources, $pids_limit, $cpu_period, $cpu_quota, $cpu_share,
+            $cpu_burst, $memory, $memory_swap, $memory_reservation,
+            $cpuset_cpus, $cpuset_mems, $cpu_idle);
+        GetOptions(
+            'resources|r=s'       => \$resources,
+            'pids-limit=i'        => \$pids_limit,
+            'cpu-period=i'        => \$cpu_period,
+            'cpu-quota=i'         => \$cpu_quota,
+            'cpu-share=i'         => \$cpu_share,
+            'cpu-burst=i'         => \$cpu_burst,
+            'memory=i'            => \$memory,
+            'memory-swap=i'       => \$memory_swap,
+            'memory-reservation=i' => \$memory_reservation,
+            'cpuset-cpus=s'       => \$cpuset_cpus,
+            'cpuset-mems=s'       => \$cpuset_mems,
+            'cpu-idle=i'          => \$cpu_idle,
+        );
         my $id = shift @ARGV // fatal("container id required");
-        cmd_update(id => $id, root => $root, resources => $resources);
+        cmd_update(id => $id, root => $root, resources => $resources,
+                   pids_limit => $pids_limit, cpu_period => $cpu_period,
+                   cpu_quota => $cpu_quota, cpu_share => $cpu_share,
+                   cpu_burst => $cpu_burst, memory => $memory,
+                   memory_swap => $memory_swap,
+                   memory_reservation => $memory_reservation,
+                   cpuset_cpus => $cpuset_cpus, cpuset_mems => $cpuset_mems,
+                   cpu_idle => $cpu_idle);
     }
     elsif ($command eq 'events') {
         my ($interval, $stats);
