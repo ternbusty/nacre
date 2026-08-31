@@ -155,7 +155,12 @@ jobs:
           # Run in a PID namespace: when the namespace init process
           # exits, the kernel kills ALL remaining processes in the
           # namespace.  This guarantees zero orphaned processes.
-          sudo -E unshare --pid --fork bash /tmp/run-validation.sh \
+          # --mount-proc remounts /proc so that PID numbers from the
+          # new namespace match /proc entries; without it nacre reads
+          # /proc/<pid>/stat for a HOST pid, not the namespace pid,
+          # causing all containers to appear "stopped" immediately.
+          sudo -E unshare --pid --fork --mount-proc \
+            bash /tmp/run-validation.sh \
             > /tmp/validation-main.log 2>&1 </dev/null
 
           # Display results (set +e so grep failures don't kill the step)
