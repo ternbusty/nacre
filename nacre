@@ -1842,6 +1842,19 @@ sub cmd_create {
 
         # Unshare remaining namespaces (not PID, not cgroup)
         if ($unshare_flags) {
+            # Diagnostic: verify syscall() works in this process state
+            warn sprintf("nacre: diag: pre-unshare: SYS_unshare=%d flags=0x%x pid=%d uid=%d euid=%d\n",
+                SYS_unshare, $unshare_flags, $$, $<, $>);
+            my $gpid = syscall(39);  # SYS_getpid on x86_64 (172 on aarch64)
+            warn "nacre: diag: getpid sanity: syscall(39)=$gpid real=$$\n";
+            # Try with literal values to rule out constant/variable issues
+            my $tret = syscall(272, 0x00020000);  # literal SYS_unshare, CLONE_NEWNS
+            my $terr = int($!);
+            warn "nacre: diag: literal syscall(272, 0x20000)=$tret errno=$terr ($!)\n";
+            if ($tret == 0) {
+                warn "nacre: diag: literal unshare SUCCEEDED — problem is with constants/vars\n";
+            }
+
             # Try all at once first
             my $ret = do_syscall(SYS_unshare, $unshare_flags);
             if ($ret != 0) {
