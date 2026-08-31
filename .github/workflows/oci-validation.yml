@@ -139,11 +139,13 @@ jobs:
               continue
             fi
             out=$HOME/validation-out/$name.log
-            sudo timeout 60 env RUNTIME=$RUNTIME "$t" > "$out" 2>&1
+            # Run in its own session (setsid) so lingering children don't
+            # inherit the GitHub Actions log pipe and block subsequent steps.
+            sudo timeout --signal=KILL 60 setsid env RUNTIME=$RUNTIME "$t" > "$out" 2>&1
             rc=$?
             sudo $RUNTIME delete --force "$name" 2>/dev/null || true
             # Kill any lingering nacre/perl processes from this test
-            sudo pkill -9 -f "nacre" 2>/dev/null || true
+            sudo killall -9 perl nacre runtimetest 2>/dev/null || true
             sleep 0.2
             # Safe cleanup: only remove nacre state files
             sudo find /run/nacre -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
@@ -204,37 +206,25 @@ jobs:
 
       - name: Kill lingering processes
         if: always()
+        timeout-minutes: 1
         run: |
-          sudo pkill -9 -f "nacre" 2>/dev/null || true
-          sudo pkill -9 -f "perl.*nacre" 2>/dev/null || true
-          sudo pkill -9 -f "runtimetest" 2>/dev/null || true
-          sleep 1
+          # Kill ALL children of this runner to avoid inherited-fd hangs
+          sudo killall -9 perl nacre runtimetest sleep sh 2>/dev/null || true
+          sleep 0.5
 
-      - name: Show failing test logs
+      - name: Show test logs
         if: always()
-        timeout-minutes: 2
+        timeout-minutes: 1
         run: |
           for f in ~/validation-out/*.log; do
             [ -f "$f" ] || continue
-            if grep -q "^not ok" "$f" 2>/dev/null; then
+            n_ok=$(grep -c "^ok " "$f" 2>/dev/null || echo 0)
+            n_notok=$(grep -c "^not ok " "$f" 2>/dev/null || echo 0)
+            if [ "$n_notok" -gt 0 ] || { [ "$n_ok" -eq 0 ] && [ -s "$f" ]; }; then
               echo "=== $(basename "$f") ==="
-              head -200 "$f"
+              head -100 "$f"
               lines=$(wc -l < "$f")
-              [ "$lines" -gt 200 ] && echo "... ($lines lines total, truncated)"
-              echo ""
-            fi
-          done
-
-      - name: Show error test logs (no TAP output)
-        if: always()
-        run: |
-          for f in ~/validation-out/*.log; do
-            [ -f "$f" ] || continue
-            n_ok=$(grep -c "^ok " "$f" 2>/dev/null || true)
-            n_notok=$(grep -c "^not ok " "$f" 2>/dev/null || true)
-            if [ "${n_ok:-0}" -eq 0 ] && [ "${n_notok:-0}" -eq 0 ] && [ -s "$f" ]; then
-              echo "=== $(basename "$f") ==="
-              head -50 "$f"
+              [ "$lines" -gt 100 ] && echo "... ($lines lines total, truncated)"
               echo ""
             fi
           done
