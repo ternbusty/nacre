@@ -2157,7 +2157,7 @@ sub run_hooks {
 # ═══════════════════════════════════════════════════════════════════════
 
 sub run_init_process {
-    my ($spec, $rootfs, $notify_fd, $main_chan_w, $main_chan_r, $cgpath, $id, $bundle, $pts_fd, $debug_fd) = @_;
+    my ($spec, $rootfs, $notify_fd, $main_chan_w, $main_chan_r, $cgpath, $id, $bundle, $pts_fd, $debug_fd, $no_pivot) = @_;
 
     my $dbg = sub {
         return unless defined $debug_fd && $debug_fd >= 0;
@@ -2170,8 +2170,14 @@ sub run_init_process {
     # Setup rootfs (mounts, devices, symlinks)
     prepare_rootfs($spec, $rootfs);
 
-    # pivot_root
-    apply_pivot_root($rootfs);
+    # pivot_root or chroot
+    if ($no_pivot) {
+        $dbg->("no-pivot: using chroot instead of pivot_root");
+        chroot($rootfs) or fatal("chroot($rootfs): $!");
+        chdir('/') or fatal("chdir /: $!");
+    } else {
+        apply_pivot_root($rootfs);
+    }
 
     # Apply the spec's rootfs propagation now that we're inside the new root
     apply_rootfs_propagation($spec);
@@ -2239,6 +2245,26 @@ sub run_init_process {
     for my $e (@{$spec->{process}{env} // []}) {
         my ($k, $v) = split /=/, $e, 2;
         $ENV{$k} = $v if defined $k;
+    }
+
+    # Default HOME from /etc/passwd if not set or empty (OCI / runc compat).
+    # runc overrides HOME="" with the passwd entry (de facto behavior).
+    # At this point we are already inside the container rootfs (post pivot_root).
+    if (!defined $ENV{HOME} || $ENV{HOME} eq '') {
+        my $uid = $spec->{process}{user}{uid} // 0;
+        my $home = '/';
+        if (open my $pw, '<', '/etc/passwd') {
+            while (my $line = <$pw>) {
+                chomp $line;
+                my @f = split /:/, $line;
+                if (@f >= 6 && $f[2] == $uid) {
+                    $home = $f[5] if $f[5] ne '';
+                    last;
+                }
+            }
+            close $pw;
+        }
+        $ENV{HOME} = $home;
     }
 
     # Set up container stdio from PTY slave BEFORE close_range fallback
@@ -2380,9 +2406,10 @@ sub write_id_mappings {
 
 sub cmd_create {
     my (%p) = @_;
-    my $id     = $p{id}     // fatal("container id required");
-    my $bundle = $p{bundle} // getcwd();
-    my $root   = $p{root}   // $DEFAULT_ROOT;
+    my $id       = $p{id}       // fatal("container id required");
+    my $bundle   = $p{bundle}   // getcwd();
+    my $root     = $p{root}     // $DEFAULT_ROOT;
+    my $no_pivot = $p{no_pivot};
 
     $bundle = abs_path($bundle);
     log_debug("create container id=$id bundle=$bundle root=$root");
@@ -2580,7 +2607,7 @@ sub cmd_create {
         # Run the init process (eval captures die from fatal so we can
         # report the actual error to the parent through the channel).
         eval {
-            run_init_process($spec, $rootfs, $notify_srv, $main_w_fd, $init_r_fd, $cgpath, $id, $bundle, $pts_fd, $init_debug_fd);
+            run_init_process($spec, $rootfs, $notify_srv, $main_w_fd, $init_r_fd, $cgpath, $id, $bundle, $pts_fd, $init_debug_fd, $no_pivot);
         };
         if ($@) {
             my $err = "$@";
@@ -3047,20 +3074,80 @@ sub cmd_resume {
 
 sub cmd_exec {
     my (%p) = @_;
-    my $id         = $p{id}         // fatal("container id required");
-    my $root       = $p{root}       // $DEFAULT_ROOT;
-    my @cmd        = @{$p{command}  // fatal("command required")};
-    my $exec_cwd   = $p{cwd};
-    my $exec_env   = $p{env};
-    my $exec_user  = $p{user};
+    my $id             = $p{id}             // fatal("container id required");
+    my $root           = $p{root}           // $DEFAULT_ROOT;
+    my @cmd            = @{$p{command}      // []};
+    my $exec_cwd       = $p{cwd};
+    my $exec_env       = $p{env};
+    my $exec_user      = $p{user};
+    my $pid_file       = $p{pid_file};
+    my $preserve_fds   = $p{preserve_fds}   // 0;
+    my $additional_gids = $p{additional_gids};
+    my $ignore_paused  = $p{ignore_paused};
+    my $process_file   = $p{process_file};
+    my $tty            = $p{tty};
+    my $detach         = $p{detach};
+    my $console_socket = $p{console_socket};
+    my $cap_add        = $p{cap};
     log_debug("exec in container id=$id");
 
+    # Load process from -p file if given
+    if ($process_file) {
+        my $pdata = read_file($process_file);
+        fatal("cannot read process file '$process_file'") unless defined $pdata;
+        my $proc = eval { $JSON->decode($pdata) };
+        fatal("invalid process JSON: $@") if $@;
+        @cmd = @{$proc->{args} // []} unless @cmd;
+        $exec_cwd  //= $proc->{cwd};
+        $exec_env  = $proc->{env} if $proc->{env} && !($exec_env && @$exec_env);
+        $exec_user //= join(':', $proc->{user}{uid} // 0, $proc->{user}{gid} // 0)
+            if $proc->{user};
+        $additional_gids //= $proc->{user}{additionalGids}
+            if $proc->{user} && $proc->{user}{additionalGids};
+        $tty //= $proc->{terminal};
+    }
+    fatal("command required for exec") unless @cmd;
+
     my $state = load_state($root, $id);
-    fatal("container '$id' is not running")
-        unless $state->{status} eq 'running';
+
+    # Refuse paused container (unless --ignore-paused)
+    if ($state->{status} eq 'paused') {
+        if ($ignore_paused) {
+            # Wait for unpause — poll cgroup.freeze until 0
+            log_debug("exec: container paused, waiting for resume (--ignore-paused)");
+            my $cgpath = $state->{cgroupPath};
+            while (1) {
+                my $freeze = read_file("$cgpath/cgroup.freeze") if $cgpath;
+                if (defined $freeze) {
+                    chomp $freeze;
+                    last if $freeze eq '0';
+                }
+                # Also re-check status in case container was killed
+                my $s2 = eval { load_state($root, $id) };
+                last unless $s2;
+                if ($s2->{status} ne 'paused' && $s2->{status} ne 'running') {
+                    fatal("container '$id' is not running");
+                }
+                last if $s2->{status} eq 'running';
+                select(undef, undef, undef, 0.1);
+            }
+        } else {
+            fatal("cannot exec in a paused container, use --ignore-paused to wait");
+        }
+    } elsif ($state->{status} ne 'running') {
+        fatal("container '$id' is not running");
+    }
 
     my $init_pid = $state->{pid};
     my $spec = load_cached_spec($root, $id, $state->{bundle});
+
+    # Validate --pid-file directory exists
+    if ($pid_file) {
+        my $pid_dir = $pid_file;
+        $pid_dir =~ s{/[^/]*$}{};
+        fatal("open pidfile: open $pid_file: no such file or directory")
+            if $pid_dir ne $pid_file && ! -d $pid_dir;
+    }
 
     # Open namespace fds
     my @ns_order = qw(user mnt uts ipc net pid cgroup);
@@ -3072,10 +3159,21 @@ sub cmd_exec {
         }
     }
 
+    # Error pipe: child writes exec errors back to parent
+    pipe(my $err_r, my $err_w) or fatal("pipe: $!");
+    # Set CLOEXEC on the write end so it auto-closes on successful exec
+    my $flags = fcntl($err_w, F_GETFD, 0);
+    fcntl($err_w, F_SETFD, $flags | FD_CLOEXEC);
+
     my $child = fork();
     fatal("fork for exec: $!") unless defined $child;
 
     if ($child == 0) {
+        close $err_r;
+
+        log_debug("nsexec container setup");
+        log_debug("child process in init()");
+
         # Join namespaces
         for my $ns (@ns_fds) {
             my $nr  = SYS_setns + 0;
@@ -3083,30 +3181,102 @@ sub cmd_exec {
             my $flg = 0;
             my $r;
             do { $r = syscall($nr, $fd, $flg) } while ($r == -1 && $! == EINTR);
-            $r == 0 or warn "nacre: setns $ns->{name}: $!\n";
+            if ($r != 0) {
+                my $msg = "setns $ns->{name}: $!";
+                syswrite($err_w, $msg);
+                _exit(255);
+            }
         }
+        # Close namespace fds
+        for my $ns (@ns_fds) { close $ns->{fd}; }
 
-        # chdir
+        # chdir into container root after joining mount ns
+        chdir('/');
         chdir($exec_cwd // $spec->{process}{cwd} // '/');
 
         # Set environment
-        if ($exec_env) {
+        if ($exec_env && @$exec_env) {
             for my $e (@$exec_env) {
                 my ($k, $v) = split /=/, $e, 2;
                 $ENV{$k} = $v;
             }
         }
 
-        # Set user
+        # Set HOME from /etc/passwd if --user is given and HOME not already
+        # in the environment (runc compat: defaults to "/" if uid not found)
         if ($exec_user) {
-            if ($exec_user =~ /^(\d+)(?::(\d+))?$/) {
-                POSIX::setgid($2) if defined $2;
-                POSIX::setuid($1);
+            my $target_uid;
+            if ($exec_user =~ /^(\d+)/) { $target_uid = $1; }
+            if (defined $target_uid && (!defined $ENV{HOME} || $ENV{HOME} eq '')) {
+                my $home = '/';
+                if (open my $pw, '<', '/etc/passwd') {
+                    while (my $line = <$pw>) {
+                        chomp $line;
+                        my @f = split /:/, $line;
+                        if (@f >= 6 && $f[2] == $target_uid) {
+                            $home = $f[5] if $f[5] ne '';
+                            last;
+                        }
+                    }
+                    close $pw;
+                }
+                $ENV{HOME} = $home;
             }
         }
 
+        # Set supplementary groups
+        if ($additional_gids && @$additional_gids) {
+            my $packed = pack("i*", map { $_ + 0 } @$additional_gids);
+            my $nr = SYS_setgroups + 0;
+            my $n  = scalar(@$additional_gids) + 0;
+            syscall($nr, $n, $packed);
+        }
+
+        # Set user (gid then uid)
+        if ($exec_user) {
+            if ($exec_user =~ /^(\d+)(?::(\d+))?$/) {
+                POSIX::setgid($2 + 0) if defined $2;
+                POSIX::setuid($1 + 0);
+            }
+        }
+
+        log_debug("setns_init: about to exec");
+
+        # Close fds above preserve range
+        # Keep: 0,1,2 + preserve_fds extra (i.e., fds 3..2+preserve_fds)
+        # Close everything else except err_w
+        my $max_keep = 2 + $preserve_fds;
+        my $err_w_fd = fileno($err_w);
+        my $log_fd = defined $LOG_FH ? eval { fileno($LOG_FH) } : undef;
+        if (opendir(my $dh, '/proc/self/fd')) {
+            for my $ent (readdir $dh) {
+                next unless $ent =~ /^\d+$/;
+                my $fd = $ent + 0;
+                next if $fd <= $max_keep;
+                next if $fd == $err_w_fd;
+                next if $fd == fileno($dh);
+                next if defined $log_fd && $fd == $log_fd;
+                POSIX::close($fd);
+            }
+            closedir $dh;
+        }
         { exec { $cmd[0] } @cmd };
-        _exit(1);
+        my $msg = "exec: $cmd[0]: $!";
+        syswrite($err_w, $msg);
+        _exit(255);
+    }
+
+    # Parent
+    close $err_w;
+
+    # Write pid file
+    if ($pid_file) {
+        if (open my $pf, '>', $pid_file) {
+            print $pf "$child\n";
+            close $pf;
+        } else {
+            warn "nacre: cannot write pid-file '$pid_file': $!\n";
+        }
     }
 
     # Close namespace fds in parent
@@ -3114,6 +3284,16 @@ sub cmd_exec {
 
     # Wait for exec'd process
     waitpid($child, 0);
+
+    # Check for exec errors from the child
+    my $err_msg = '';
+    while (sysread($err_r, my $buf, 4096)) { $err_msg .= $buf; }
+    close $err_r;
+
+    if ($err_msg ne '') {
+        warn "nacre: $err_msg\n";
+    }
+
     if (WIFEXITED($?)) {
         exit(WEXITSTATUS($?));
     } elsif (WIFSIGNALED($?)) {
@@ -3494,7 +3674,8 @@ sub main {
     }
     elsif ($command eq 'exec') {
         my ($exec_cwd, @exec_env, $exec_user, $detach, $pid_file,
-            $console_socket, $tty, $process_file);
+            $console_socket, $tty, $process_file, $ignore_paused,
+            $preserve_fds, @additional_gids, @cap_add);
         # Separate exec args: everything after "--" or after container id
         my @before;
         my @exec_cmd;
@@ -3520,12 +3701,23 @@ sub main {
             'console-socket=s'  => \$console_socket,
             'tty|t'             => \$tty,
             'process|p=s'       => \$process_file,
+            'ignore-paused'     => \$ignore_paused,
+            'preserve-fds=i'    => \$preserve_fds,
+            'additional-gids=i' => \@additional_gids,
+            'cap=s'             => \@cap_add,
         );
         my $id = shift @ARGV // fatal("container id required");
         @exec_cmd = @ARGV unless @exec_cmd;
-        fatal("command required for exec") unless @exec_cmd;
         cmd_exec(id => $id, root => $root, command => \@exec_cmd,
-                 cwd => $exec_cwd, env => \@exec_env, user => $exec_user);
+                 cwd => $exec_cwd, env => (@exec_env ? \@exec_env : undef),
+                 user => $exec_user, pid_file => $pid_file,
+                 preserve_fds => ($preserve_fds // 0),
+                 additional_gids => (@additional_gids ? \@additional_gids : undef),
+                 ignore_paused => $ignore_paused,
+                 process_file => $process_file,
+                 tty => $tty, detach => $detach,
+                 console_socket => $console_socket,
+                 cap => (@cap_add ? \@cap_add : undef));
     }
     elsif ($command eq 'update') {
         my ($resources, $pids_limit, $cpu_period, $cpu_quota, $cpu_share,

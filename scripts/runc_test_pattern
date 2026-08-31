@@ -22,7 +22,7 @@
 #   nacre:keyring session keyring not implemented
 #   nacre:notify  seccomp SCMP_ACT_NOTIFY listener not implemented
 #   nacre:timens  time namespace offsets not implemented
-#   nacre:exec    exec feature gap (missing --cap/--additional-gids/etc)
+#   nacre:exec    exec feature gap (missing --cap/tty/userns)
 #   nacre:cgroup  cgroup feature gap
 
 # --- spec ---
@@ -118,7 +118,7 @@ runc run [mount order, container bind-mount source] (userns)
 runc run [/proc is a symlink]
 runc run [rootfsPropagation shared]
 runc run [rootfsPropagation slave]
-[skip]runc run --no-pivot must not expose bare /proc # nacre:nopivot
+runc run --no-pivot must not expose bare /proc
 runc run [ro /sys/fs/cgroup mounts]
 runc run [ro /sys/fs/cgroup mounts + cgroupns]
 runc run [setgid / + mkdirall]
@@ -273,19 +273,19 @@ runc exec ls -la with --cwd
 runc exec --env
 runc exec --user
 [skip]runc exec --user vs /dev/null ownership # nacre:exec
-[skip]runc exec --user with no access to cwd # nacre:exec
-[skip]runc exec --additional-gids # nacre:exec
+runc exec --user with no access to cwd
+runc exec --additional-gids
 [skip]runc exec --cap # nacre:exec
 [skip]runc exec --cap [ambient is set from spec] # nacre:exec
-[skip]runc exec --preserve-fds # nacre:exec
-[skip]runc exec --ignore-paused # nacre:exec
-[skip]runc exec --pid-file # nacre:exec
-[skip]runc exec --pid-file with new CWD # nacre:exec
+runc exec --preserve-fds
+runc exec --ignore-paused
+runc exec --pid-file
+runc exec --pid-file with new CWD
 runc exec [exit codes]
 runc exec [execve error]
 [skip]runc exec [stdin not a tty] # nacre:exec
 runc exec check default home
-[skip]runc exec should refuse a paused container # nacre:exec
+runc exec should refuse a paused container
 [skip]runc exec with RLIMIT_NOFILE(Bigger than system's hard value) # nacre:exec
 [skip]runc exec with RLIMIT_NOFILE(Smaller than system's hard value) # nacre:exec
 [skip]runc exec with RLIMIT_NOFILE(The same as system's hard value) # nacre:exec
@@ -315,10 +315,10 @@ runc exec check default home
 [skip]runc exec [ --pidfd-socket ] [cgroups_v1]  # cgroups_v1
 [skip]runc exec [ --pidfd-socket ] [cgroups_v2] # nacre:pidfd
 [skip]runc exec vs systemctl daemon-reload # systemd
-[skip]runc --debug exec # nacre:exec
-[skip]runc --debug --log exec # nacre:exec
-[skip]env [runc exec -p] # nacre:exec
-[skip]env HOME is set for runc exec -p with no process.env # nacre:exec
+runc --debug exec
+runc --debug --log exec
+env [runc exec -p]
+env HOME is set for runc exec -p with no process.env
 
 # --- pause / resume ---
 runc pause and resume
