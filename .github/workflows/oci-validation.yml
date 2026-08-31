@@ -201,12 +201,15 @@ jobs:
 
       - name: Show failing test logs
         if: always()
+        timeout-minutes: 2
         run: |
           for f in ~/validation-out/*.log; do
             [ -f "$f" ] || continue
             if grep -q "^not ok" "$f" 2>/dev/null; then
               echo "=== $(basename "$f") ==="
-              cat "$f"
+              head -200 "$f"
+              lines=$(wc -l < "$f")
+              [ "$lines" -gt 200 ] && echo "... ($lines lines total, truncated)"
               echo ""
             fi
           done

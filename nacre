@@ -2406,8 +2406,9 @@ sub cmd_run {
     }
 
     # Foreground mode: create + start + wait
-    # Set as subreaper so we can wait for the init process
-    do_syscall(SYS_prctl, PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
+    # Set as subreaper so we can wait for the init process (grandchild
+    # reparented to us when the intermediate child exits).
+    my $sr_ret = do_syscall(SYS_prctl, PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
 
     # Create (foreground: keep stdio so user sees container output)
     my $state = cmd_create(%p, foreground => 1);
@@ -2422,9 +2423,11 @@ sub cmd_run {
     }
 
     # Wait for init process to exit.
-    # Use waitpid(-1) to reap ANY child (including orphaned grandchildren
-    # adopted via subreaper), and check whether we got $init_pid each time.
+    # Primary: waitpid(-1) to reap any child adopted via subreaper.
+    # Fallback: if the init process was not reparented to us (ECHILD),
+    # poll with kill(0, pid) until the process disappears.
     my $exit_code = 0;
+    my $got_init = 0;
     while (1) {
         my $w = waitpid(-1, 0);
         if ($w == $init_pid) {
@@ -2433,10 +2436,33 @@ sub cmd_run {
             } elsif (WIFSIGNALED($?)) {
                 $exit_code = 128 + WTERMSIG($?);
             }
+            $got_init = 1;
             last;
         }
         last if $w < 0 && $! != EINTR;
         # Otherwise it was some other child (zombie, intermediate process) — keep waiting.
+    }
+
+    # Fallback: init was never reparented to us (subreaper didn't take
+    # effect, or the kernel reparented to pid-1 instead).  Poll its
+    # existence so we keep the container state alive until it exits.
+    unless ($got_init) {
+        while (kill(0, $init_pid)) {
+            # Reap any stray zombies while we're at it
+            while ((my $z = waitpid(-1, WNOHANG)) > 0) {
+                if ($z == $init_pid) {
+                    if (WIFEXITED($?)) {
+                        $exit_code = WEXITSTATUS($?);
+                    } elsif (WIFSIGNALED($?)) {
+                        $exit_code = 128 + WTERMSIG($?);
+                    }
+                    $got_init = 1;
+                    last;
+                }
+            }
+            last if $got_init;
+            select(undef, undef, undef, 0.2);
+        }
     }
 
     # Delete
