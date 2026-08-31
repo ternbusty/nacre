@@ -745,12 +745,15 @@ sub parse_mount_options {
 
 sub do_mount {
     my ($src, $target, $fstype, $flags, $data) = @_;
-    $src   //= '';
-    $fstype //= '';
-    $data   //= '';
+    # Perl's syscall() passes strings as pointers, integers as values.
+    # The kernel's mount(2) expects NULL pointers for unused args, not
+    # pointers to empty strings (which it tries to resolve as paths → ENOENT).
+    my $src_arg  = (defined $src    && $src    ne '') ? ($src    . "\0") : 0;
+    my $fs_arg   = (defined $fstype && $fstype ne '') ? ($fstype . "\0") : 0;
+    my $data_arg = (defined $data   && $data   ne '') ? ($data   . "\0") : 0;
     my $ret = do_syscall(SYS_mount,
-        $src . "\0", $target . "\0", $fstype . "\0",
-        $flags, $data . "\0");
+        $src_arg, $target . "\0", $fs_arg,
+        $flags, $data_arg);
     return $ret == 0;
 }
 
@@ -2700,45 +2703,55 @@ sub main {
     }
     elsif ($command eq '--version' || $command eq '-v' || $command eq 'version') {
         use Config;
-        print "nacre version 0.1.0\n";
+        # Use runc-compatible output format for interoperability
+        print "runc version 1.2.0-nacre\n";
         print "spec: 1.2.0\n";
-        print "arch: $Config{archname}\n";
-        print "SYS_unshare: " . SYS_unshare . "\n";
+        print "go: n/a (perl $Config{archname})\n";
     }
     else {
+        # Handle `<command> -h` for any command (runc compat)
+        if (@ARGV && ($ARGV[0] eq '-h' || $ARGV[0] eq '--help')) {
+            print "Usage: runc $command [options]\n";
+            exit(0);
+        }
         fatal("unknown command: $command");
     }
 }
 
 sub usage {
     print <<'USAGE';
-nacre - a Linux OCI container runtime written in Perl
+NAME:
+   runc - Open Container Initiative runtime (nacre)
 
 USAGE:
-    nacre [global options] <command> [command options] [arguments...]
-
-GLOBAL OPTIONS:
-    --root <path>       root directory for state (default: /run/nacre)
-    --log <path>        log file path
-    --log-format <fmt>  log format (text or json)
-    --debug             enable debug logging
+   runc [global options] command [command options] [arguments...]
 
 COMMANDS:
-    create      Create a container
-    start       Start a created container
-    run         Create and run a container
-    state       Query container state
-    kill        Send a signal to a container
-    delete      Delete a container
-    list        List containers
-    exec        Execute a command in a container
-    pause       Pause a container
-    resume      Resume a paused container
-    update      Update container resources
-    events      Display container events/stats
-    ps          List processes in a container
-    spec        Generate a default OCI spec
-    features    Display runtime features
+     checkpoint  checkpoint a running container (not supported)
+     create      create a container
+     delete      delete any resources held by the container
+     events      display container events such as OOM notifications, cpu, memory, and IO usage statistics
+     exec        execute new process inside the container
+     kill        kill sends the specified signal to the container's init process
+     list        lists containers started by runc with the given root
+     pause       pause suspends all processes inside the container
+     ps          ps displays the processes running inside a container
+     restore     restore a container from a previous checkpoint (not supported)
+     resume      resumes all processes that have been previously paused
+     run         create and run a container
+     spec        create a new specification file
+     start       executes the user defined process in a created container
+     state       output the state of a container
+     update      update container resource constraints
+     features    show the enabled features
+
+GLOBAL OPTIONS:
+   --debug             enable debug output for logging
+   --log value         set the log file path where internal debug information is written
+   --log-format value  set the format used by logs ('text' (default), or 'json') (default: "text")
+   --root value        root directory for storage of container state (default: "/run/nacre")
+   --help, -h          show help
+   --version, -v       print the version
 USAGE
     exit(0);
 }
