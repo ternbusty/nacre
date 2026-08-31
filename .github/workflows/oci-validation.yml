@@ -152,15 +152,11 @@ jobs:
           VALIDATION_SCRIPT
           chmod +x /tmp/run-validation.sh
 
-          # Run as root. stdout/stderr go to a log file so they don't
-          # flood the Actions log. No setsid — keep all processes in
-          # this step's process group so the runner can kill them.
-          sudo -E bash /tmp/run-validation.sh \
+          # Run in a PID namespace: when the namespace init process
+          # exits, the kernel kills ALL remaining processes in the
+          # namespace.  This guarantees zero orphaned processes.
+          sudo -E unshare --pid --fork bash /tmp/run-validation.sh \
             > /tmp/validation-main.log 2>&1 </dev/null
-
-          # Kill ALL lingering processes from the validation run
-          sudo pkill -9 -f 'nacre|runtimetest' 2>/dev/null || true
-          sleep 0.5
 
           # Display results (set +e so grep failures don't kill the step)
           set +eo pipefail
