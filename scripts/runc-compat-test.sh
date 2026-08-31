@@ -230,6 +230,14 @@ for file in $(printf '%s\n' "${!FILE_FILTER[@]}" | sort); do
     echo "  --- full bats output ($fname) ---"
     cat "$TMPOUT"
     echo "  --- end ---"
+    # Dump any nacre init debug logs
+    for initlog in /run/nacre/*/init.log; do
+      if [[ -f "$initlog" ]]; then
+        echo "  --- $initlog ---"
+        cat "$initlog"
+        echo "  --- end init.log ---"
+      fi
+    done
   fi
 
   if [[ $rc -ne 0 && $file_pass -eq 0 && $file_fail -eq 0 ]]; then

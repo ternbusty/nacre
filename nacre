@@ -1773,7 +1773,15 @@ sub run_hooks {
 # ═══════════════════════════════════════════════════════════════════════
 
 sub run_init_process {
-    my ($spec, $rootfs, $notify_fd, $main_chan_w, $main_chan_r, $cgpath, $id, $bundle, $pts_fd) = @_;
+    my ($spec, $rootfs, $notify_fd, $main_chan_w, $main_chan_r, $cgpath, $id, $bundle, $pts_fd, $debug_fd) = @_;
+
+    my $dbg = sub {
+        return unless defined $debug_fd && $debug_fd >= 0;
+        my $msg = join('', @_) . "\n";
+        POSIX::write($debug_fd, $msg, length($msg));
+    };
+
+    $dbg->("init_process: start, pts_fd=" . (defined $pts_fd ? $pts_fd : 'undef'));
 
     # Setup rootfs (mounts, devices, symlinks)
     prepare_rootfs($spec, $rootfs);
@@ -1833,6 +1841,7 @@ sub run_init_process {
     }
 
     # Apply process security (NNP, seccomp, caps, setuid/setgid)
+    $dbg->("apply_process_security");
     apply_process_security($spec);
 
     # Apply rlimits
@@ -1849,26 +1858,40 @@ sub run_init_process {
     # can destroy it (close_range with CLOEXEC only marks, but the POSIX
     # fallback actually closes fds immediately).
     if (defined $pts_fd) {
-        POSIX::dup2($pts_fd, 0) >= 0 or fatal("dup2 pts→stdin: $!");
-        POSIX::dup2($pts_fd, 1) >= 0 or fatal("dup2 pts→stdout: $!");
-        POSIX::dup2($pts_fd, 2) >= 0 or fatal("dup2 pts→stderr: $!");
-        # Set the PTY as the controlling terminal for this session
-        ioctl(STDIN, TIOCSCTTY, pack('i', 0));
+        my $r0 = POSIX::dup2($pts_fd, 0);
+        my $r1 = POSIX::dup2($pts_fd, 1);
+        my $r2 = POSIX::dup2($pts_fd, 2);
+        $dbg->("dup2 pts_fd=$pts_fd → 0=$r0 1=$r1 2=$r2");
+        $r0 >= 0 or fatal("dup2 pts→stdin: $!");
+        $r1 >= 0 or fatal("dup2 pts→stdout: $!");
+        $r2 >= 0 or fatal("dup2 pts→stderr: $!");
+        # Set the PTY as the controlling terminal for this session.
+        # Pass integer 0 (not pack('i',0) which Perl treats as a pointer).
+        my $tio = ioctl(STDIN, TIOCSCTTY, 0);
+        $dbg->("TIOCSCTTY=$tio err=$!");
         # pts_fd itself (>= 3) will be closed below
     }
 
-    # Close extra fds (marks CLOEXEC — actually closed at exec)
-    eval { do_syscall(SYS_close_range, 3, ~0, CLOSE_RANGE_CLOEXEC); };
-    # Fallback: close individually
-    if ($@ || $! == ENOSYS) {
+    # Close extra fds (marks CLOEXEC — actually closed at exec).
+    # Save the return value explicitly; $! can hold a stale errno from
+    # earlier calls and must not be tested after a *successful* syscall.
+    my $cr_ret = do_syscall(SYS_close_range, 3, ~0, CLOSE_RANGE_CLOEXEC);
+    $dbg->("close_range=$cr_ret err=$!");
+    if ($cr_ret == -1) {
+        # Fallback: close individually (needed on kernels < 5.11)
         for my $fd (3..1023) {
+            next if defined $debug_fd && $fd == $debug_fd;
             POSIX::close($fd);
         }
+        $dbg->("close_range fallback done");
     }
 
     # Exec
     my @args = @{$spec->{process}{args} // ['sh']};
+    $dbg->("exec: " . join(' ', @args) . " (PATH=$ENV{PATH})");
+    # The debug fd is marked CLOEXEC (or closed by fallback); exec closes it.
     { exec { $args[0] } @args };
+    $dbg->("exec FAILED: $!");
     fatal("exec $args[0]: $!");
 }
 
@@ -2104,6 +2127,17 @@ sub cmd_create {
             $pts_fd = setup_pty_console($p{console_socket});
         }
 
+        # Open a debug log in the state directory (host filesystem, before
+        # pivot_root).  The fd survives pivot_root and close_range(CLOEXEC),
+        # so we can write to it right up until exec.
+        my $init_debug_fd;
+        eval {
+            sysopen(my $dfh, "$notify_dir/init.log",
+                    O_WRONLY | O_CREAT | O_TRUNC, 0644) or die "open: $!";
+            $init_debug_fd = POSIX::dup(fileno($dfh));
+            close $dfh;
+        };
+
         # For detached containers (create, not run), close stdout/stderr so
         # that shell callers like output=$(...) don't hang waiting for us.
         # When a PTY is set up the slave will replace stdio before exec;
@@ -2131,7 +2165,7 @@ sub cmd_create {
         my $notify_srv = create_notify_listener($notify_path);
 
         # Run the init process
-        run_init_process($spec, $rootfs, $notify_srv, $main_w_fd, $init_r_fd, $cgpath, $id, $bundle, $pts_fd);
+        run_init_process($spec, $rootfs, $notify_srv, $main_w_fd, $init_r_fd, $cgpath, $id, $bundle, $pts_fd, $init_debug_fd);
         _exit(1);  # Should not reach here
     }
 
@@ -2611,13 +2645,16 @@ sub cmd_events {
     my $print_stats = sub {
         my %s;
         $s{pids}{current} = scalar(cgroup_pids($cgpath));
-        $s{pids}{limit}   = read_file("$cgpath/pids.max") // 'max';
-        chomp $s{pids}{limit} if $s{pids}{limit};
+        my $pids_max = read_file("$cgpath/pids.max") // 'max';
+        chomp $pids_max;
+        $s{pids}{limit} = ($pids_max =~ /^\d+$/) ? int($pids_max) : 0;
 
-        my $mem_current = read_file("$cgpath/memory.current");
-        $s{memory}{usage} = int($mem_current // 0);
-        my $mem_max = read_file("$cgpath/memory.max");
-        $s{memory}{limit} = $mem_max ? int($mem_max) : 0;
+        my $mem_current = read_file("$cgpath/memory.current") // '0';
+        chomp $mem_current;
+        $s{memory}{usage} = ($mem_current =~ /^\d+$/) ? int($mem_current) : 0;
+        my $mem_max = read_file("$cgpath/memory.max") // 'max';
+        chomp $mem_max;
+        $s{memory}{limit} = ($mem_max =~ /^\d+$/) ? int($mem_max) : 0;
 
         my $cpu_stat = read_file("$cgpath/cpu.stat") // '';
         for my $line (split /\n/, $cpu_stat) {
@@ -2903,9 +2940,9 @@ sub main {
     }
     elsif ($command eq '--version' || $command eq '-v' || $command eq 'version') {
         use Config;
-        # nacre-specific line + runc-compatible format for interoperability
+        # runc-compatible format for interoperability
         print "runc version 1.2.0-nacre\n";
-        print "nacre version 0.5.1\n";
+        print "commit: nacre-0.5.1\n";
         print "spec: 1.2.0\n";
         print "go: n/a (perl $Config{archname})\n";
     }
