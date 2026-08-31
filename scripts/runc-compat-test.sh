@@ -51,9 +51,13 @@ if [[ ! -d "$INTEGRATION_DIR" ]]; then
   exit 1
 fi
 
-# Copy nacre wrapper as "runc" into the runc tree
+# Copy nacre wrapper as "runc" into the runc tree, along with the nacre Perl
+# script (the wrapper resolves the script relative to its own location via
+# BASH_SOURCE, so both files must be co-located).
+NACRE_SCRIPT_DIR="$(cd "$(dirname "$NACRE_BIN")" && pwd)"
 cp "$NACRE_BIN" "$RUNC_REPO_DIR/runc"
-chmod +x "$RUNC_REPO_DIR/runc"
+cp "$NACRE_SCRIPT_DIR/nacre" "$RUNC_REPO_DIR/nacre"
+chmod +x "$RUNC_REPO_DIR/runc" "$RUNC_REPO_DIR/nacre"
 
 # Fetch rootfs images
 echo ">>> Fetching rootfs images ..."

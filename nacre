@@ -1778,8 +1778,35 @@ sub cmd_create {
 
         # Unshare remaining namespaces (not PID, not cgroup)
         if ($unshare_flags) {
-            do_syscall(SYS_unshare, $unshare_flags)
-                == 0 or fatal("unshare: $!");
+            # Try all at once first
+            my $ret = do_syscall(SYS_unshare, $unshare_flags);
+            if ($ret != 0) {
+                my $errno = int($!);
+                my $errstr = "$!";
+                warn "nacre: debug: unshare(flags=0x"
+                    . sprintf('%x', $unshare_flags)
+                    . ") failed: errno=$errno ($errstr), trying one-by-one\n";
+                # Identify which flag fails
+                my %flag_names = (
+                    CLONE_NEWNS,  'CLONE_NEWNS',  CLONE_NEWUTS,  'CLONE_NEWUTS',
+                    CLONE_NEWIPC, 'CLONE_NEWIPC', CLONE_NEWNET,  'CLONE_NEWNET',
+                    CLONE_NEWUSER,'CLONE_NEWUSER', CLONE_NEWTIME,'CLONE_NEWTIME',
+                );
+                for my $flag (sort { $a <=> $b } keys %flag_names) {
+                    next unless $unshare_flags & $flag;
+                    my $r = do_syscall(SYS_unshare, $flag);
+                    if ($r != 0) {
+                        warn "nacre: debug:   $flag_names{$flag} (0x"
+                            . sprintf('%x', $flag) . "): FAILED errno="
+                            . int($!) . " ($!)\n";
+                    } else {
+                        warn "nacre: debug:   $flag_names{$flag} (0x"
+                            . sprintf('%x', $flag) . "): OK\n";
+                    }
+                }
+                fatal("unshare(flags=0x" . sprintf('%x', $unshare_flags)
+                      . "): errno=$errno ($errstr)");
+            }
         }
 
         # Fork again for PID namespace (child becomes PID 1 in new PID ns)
