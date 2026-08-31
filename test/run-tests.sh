@@ -1,7 +1,7 @@
 #!/bin/bash
 # nacre integration test suite
 # Requires: root privileges, busybox, perl 5.20+
-set -euo pipefail
+set -uo pipefail
 
 NACRE="$(cd "$(dirname "$0")/.." && pwd)/nacre"
 ROOT="/run/nacre-test-$$"

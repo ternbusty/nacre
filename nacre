@@ -163,10 +163,11 @@ use constant {
 };
 
 # -- Signals (name -> number) --
+use Config;
 my %SIG_NUM;
 {
-    my @names = split ' ', $Config::Config{sig_name} // '';
-    my @nums  = split ' ', $Config::Config{sig_num}  // '';
+    my @names = split ' ', $Config{sig_name} // '';
+    my @nums  = split ' ', $Config{sig_num}  // '';
     if (!@names) {
         # Fallback: standard x86_64 signals
         %SIG_NUM = (
@@ -183,7 +184,6 @@ my %SIG_NUM;
         }
     }
 }
-require Config;  # for sig_name/sig_num
 
 # -- OCI namespace type -> clone flag & proc name --
 my %NS_MAP = (
