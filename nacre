@@ -2061,6 +2061,97 @@ sub apply_rlimits {
 }
 
 # ═══════════════════════════════════════════════════════════════════════
+# IO Priority
+# ═══════════════════════════════════════════════════════════════════════
+
+my %IOPRIO_CLASS_MAP = (
+    IOPRIO_CLASS_RT   => 1,
+    IOPRIO_CLASS_BE   => 2,
+    IOPRIO_CLASS_IDLE => 3,
+);
+
+sub apply_iopriority {
+    my ($spec) = @_;
+    my $iop = $spec->{process}{ioPriority} // return;
+    my $class = $IOPRIO_CLASS_MAP{$iop->{class} // ''} // return;
+    my $prio  = $iop->{priority} // 0;
+    # ioprio_set(IOPRIO_WHO_PROCESS=1, pid=0, ioprio)
+    # ioprio = (class << 13) | prio
+    my $ioprio = ($class << 13) | ($prio & 0x1fff);
+    my $nr = SYS_ioprio_set + 0;
+    my $who  = 1 + 0;  # IOPRIO_WHO_PROCESS
+    my $pid  = 0 + 0;  # self
+    my $val  = $ioprio + 0;
+    syscall($nr, $who, $pid, $val);
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Scheduler
+# ═══════════════════════════════════════════════════════════════════════
+
+my %SCHED_POLICY_MAP = (
+    SCHED_OTHER    => 0,
+    SCHED_FIFO     => 1,
+    SCHED_RR       => 2,
+    SCHED_BATCH    => 3,
+    SCHED_IDLE     => 5,
+    SCHED_DEADLINE => 6,
+);
+
+my %SCHED_FLAG_MAP = (
+    SCHED_FLAG_RESET_ON_FORK  => 0x01,
+    SCHED_FLAG_RECLAIM        => 0x02,
+    SCHED_FLAG_DL_OVERRUN     => 0x04,
+    SCHED_FLAG_KEEP_POLICY    => 0x08,
+    SCHED_FLAG_KEEP_PARAMS    => 0x10,
+    SCHED_FLAG_UTIL_CLAMP_MIN => 0x20,
+    SCHED_FLAG_UTIL_CLAMP_MAX => 0x40,
+);
+
+sub apply_scheduler {
+    my ($spec) = @_;
+    my $sched = $spec->{process}{scheduler} // return;
+
+    # If CPU affinity is set AND scheduler is DEADLINE, conflict
+    my $cpus = $spec->{linux}{resources}{cpu}{cpus} // '';
+    if ($cpus ne '' && ($sched->{policy} // '') eq 'SCHED_DEADLINE') {
+        fatal("process scheduler can't be used together with AllowedCPUs");
+    }
+
+    my $policy = $SCHED_POLICY_MAP{$sched->{policy} // 'SCHED_OTHER'} // 0;
+    my $flags = 0;
+    for my $f (@{$sched->{flags} // []}) {
+        $flags |= ($SCHED_FLAG_MAP{$f} // 0);
+    }
+    my $nice      = $sched->{nice}     // 0;
+    my $priority  = $sched->{priority} // 0;
+    my $runtime   = $sched->{runtime}  // 0;
+    my $deadline  = $sched->{deadline} // 0;
+    my $period    = $sched->{period}   // 0;
+
+    # struct sched_attr (56 bytes):
+    #   u32 size, u32 sched_policy, u64 sched_flags, s32 sched_nice,
+    #   u32 sched_priority, u64 sched_runtime, u64 sched_deadline, u64 sched_period
+    my $attr = pack('LLQLlQQQ',
+        56,        # size
+        $policy,
+        $flags,
+        $nice,
+        $priority,
+        $runtime,
+        $deadline,
+        $period,
+    );
+    my $nr = SYS_sched_setattr + 0;
+    my $pid_val = 0 + 0;  # self
+    my $fl = 0 + 0;
+    my $r = syscall($nr, $pid_val, $attr, $fl);
+    if ($r == -1) {
+        fatal("sched_setattr: $!");
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
 # Sysctls
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -2239,6 +2330,12 @@ sub run_init_process {
 
     # Apply rlimits
     apply_rlimits($spec);
+
+    # Apply IO priority
+    apply_iopriority($spec);
+
+    # Apply scheduler
+    apply_scheduler($spec);
 
     # Set environment
     %ENV = ();
@@ -3092,19 +3189,20 @@ sub cmd_exec {
     log_debug("exec in container id=$id");
 
     # Load process from -p file if given
+    my $exec_proc;  # process.json data for ioprio/scheduler
     if ($process_file) {
         my $pdata = read_file($process_file);
         fatal("cannot read process file '$process_file'") unless defined $pdata;
-        my $proc = eval { $JSON->decode($pdata) };
+        $exec_proc = eval { $JSON->decode($pdata) };
         fatal("invalid process JSON: $@") if $@;
-        @cmd = @{$proc->{args} // []} unless @cmd;
-        $exec_cwd  //= $proc->{cwd};
-        $exec_env  = $proc->{env} if $proc->{env} && !($exec_env && @$exec_env);
-        $exec_user //= join(':', $proc->{user}{uid} // 0, $proc->{user}{gid} // 0)
-            if $proc->{user};
-        $additional_gids //= $proc->{user}{additionalGids}
-            if $proc->{user} && $proc->{user}{additionalGids};
-        $tty //= $proc->{terminal};
+        @cmd = @{$exec_proc->{args} // []} unless @cmd;
+        $exec_cwd  //= $exec_proc->{cwd};
+        $exec_env  = $exec_proc->{env} if $exec_proc->{env} && !($exec_env && @$exec_env);
+        $exec_user //= join(':', $exec_proc->{user}{uid} // 0, $exec_proc->{user}{gid} // 0)
+            if $exec_proc->{user};
+        $additional_gids //= $exec_proc->{user}{additionalGids}
+            if $exec_proc->{user} && $exec_proc->{user}{additionalGids};
+        $tty //= $exec_proc->{terminal};
     }
     fatal("command required for exec") unless @cmd;
 
@@ -3238,6 +3336,14 @@ sub cmd_exec {
                 POSIX::setgid($2 + 0) if defined $2;
                 POSIX::setuid($1 + 0);
             }
+        }
+
+        # Apply iopriority/scheduler from process.json if given,
+        # otherwise inherit from init (which already set them from config.json)
+        if ($exec_proc) {
+            my $fake_spec = { process => $exec_proc };
+            apply_iopriority($fake_spec);
+            apply_scheduler($fake_spec);
         }
 
         log_debug("setns_init: about to exec");

@@ -286,9 +286,9 @@ runc exec [execve error]
 [skip]runc exec [stdin not a tty] # nacre:exec
 runc exec check default home
 runc exec should refuse a paused container
-[skip]runc exec with RLIMIT_NOFILE(Bigger than system's hard value) # nacre:exec
-[skip]runc exec with RLIMIT_NOFILE(Smaller than system's hard value) # nacre:exec
-[skip]runc exec with RLIMIT_NOFILE(The same as system's hard value) # nacre:exec
+runc exec with RLIMIT_NOFILE(Bigger than system's hard value)
+runc exec with RLIMIT_NOFILE(Smaller than system's hard value)
+runc exec with RLIMIT_NOFILE(The same as system's hard value)
 [skip]runc exec (cgroup v1+hybrid joins correct cgroup) # cgroups_v1
 [skip]runc exec (cgroup v2 + init process in non-root cgroup) succeeds # nacre:cgroup
 [skip]runc exec (cgroup v2, ro cgroupfs, new cgroupns) does not chown cgroup # nacre:cgroup
@@ -444,9 +444,9 @@ runc run [joining existing container namespaces]
 runc run [hostname domainname]
 
 # --- ioprio / scheduler ---
-[skip]ioprio_set is applied to process group # nacre:ioprio
-[skip]scheduler is applied # nacre:ioprio
-[skip]scheduler vs cpus # nacre:ioprio
+ioprio_set is applied to process group
+scheduler is applied
+scheduler vs cpus
 
 # --- spec validator ---
 spec validator
