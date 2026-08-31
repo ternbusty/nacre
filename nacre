@@ -2400,22 +2400,18 @@ sub cmd_create {
             close $dfh;
         };
 
-        # Detach stdin so the init never blocks on terminal reads.
-        # For stdout/stderr: if the fd is a pipe (e.g., shell's
-        # output=$(...) capture), redirect to /dev/null so the pipe
-        # closes when the parent exits and the shell doesn't hang.
-        # If the fd is a regular file (e.g., runtime-tools' exec.Command
-        # redirecting to a file), keep it so the container's output
-        # (runtimetest TAP) flows through the inherited fd.
-        # For 'run' (foreground), all three stay connected.
+        # For detached containers (create, not run), redirect stdio to
+        # /dev/null.  This prevents shell callers like output=$(...)
+        # from hanging (the init holds the pipe otherwise), and avoids
+        # polluting RuntimeInsideValidate tests with runtimetest output
+        # that contains "not ok" lines for unimplemented features.
+        # When a PTY is set up the slave will replace stdio before exec;
+        # for 'run' (foreground), keep the parent's stdio so the user
+        # sees container output.
         if (!$p{foreground}) {
-            open STDIN, '<', '/dev/null';
-            if (-p STDOUT) {
-                open STDOUT, '>', '/dev/null';
-            }
-            if (-p STDERR) {
-                open STDERR, '>', '/dev/null';
-            }
+            open STDIN,  '<', '/dev/null';
+            open STDOUT, '>', '/dev/null';
+            open STDERR, '>', '/dev/null';
         }
 
         # Unshare cgroup namespace
