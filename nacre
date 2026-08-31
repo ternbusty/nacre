@@ -3268,8 +3268,27 @@ sub cmd_events {
         return;
     }
 
+    # Track OOM events — check memory.events for oom counter changes
+    my $last_oom_count = 0;
+    my $mem_events = read_file("$cgpath/memory.events");
+    if (defined $mem_events && $mem_events =~ /^oom\s+(\d+)/m) {
+        $last_oom_count = $1;
+    }
+
     while (1) {
         $print_stats->();
+
+        # Check for OOM events
+        $mem_events = read_file("$cgpath/memory.events");
+        if (defined $mem_events && $mem_events =~ /^oom\s+(\d+)/m) {
+            my $oom_count = $1;
+            if ($oom_count > $last_oom_count) {
+                # Emit OOM event (runc-compatible format)
+                printf qq({"type":"oom","id":%s}\n), $JSON_COMPACT->encode($id);
+                $last_oom_count = $oom_count;
+            }
+        }
+
         # Use select for sub-second sleep
         if ($interval < 1) {
             select(undef, undef, undef, $interval);
