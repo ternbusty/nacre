@@ -2716,20 +2716,9 @@ sub cmd_run {
     # Foreground mode: create + start + wait
     # Set as subreaper so we can wait for the init process (grandchild
     # reparented to us when the intermediate child exits).
-    # Coerce constants to fresh IOK scalars — Perl's syscall() inspects
-    # SV type flags; constants can carry stale POK flags that cause the
-    # kernel arg to be misinterpreted as a pointer.
     my $pr_nr  = SYS_prctl + 0;
     my $pr_opt = PR_SET_CHILD_SUBREAPER + 0;
-    my $one    = 1 + 0;
-    my $zero   = 0 + 0;
-    $! = 0;
-    my $sr_ret = syscall($pr_nr, $pr_opt, $one, $zero, $zero, $zero);
-    my $sr_errno = $! + 0;
-    if ($sr_ret == -1) {
-        warn "nacre: PR_SET_CHILD_SUBREAPER failed: errno=$sr_errno ($!)\n"
-            if $ENV{NACRE_RUN_DEBUG};
-    }
+    do_syscall($pr_nr, $pr_opt, 1, 0, 0, 0);
 
     # Create (foreground: keep stdio so user sees container output)
     my $state = cmd_create(%p, foreground => 1);
@@ -2744,48 +2733,39 @@ sub cmd_run {
     }
 
     # Wait for init process to exit.
-    # Use pidfd_open to get a stable handle on the init process, then
-    # waitid(P_PIDFD) to get its exit status.  This avoids relying on
-    # subreaper reparenting and the race where the init exits before
-    # we can observe it via kill(0, pid).
+    # Primary: pidfd_open + waitid(P_PIDFD) — stable handle, no PID
+    # recycling race, works even if the init exits immediately.
+    # Fallback: waitpid with subreaper (if pidfd_open unavailable).
+    # Last resort: poll with kill(0, pid).
     my $exit_code = 0;
     my $got_init = 0;
 
-    my $run_dbg = $ENV{NACRE_RUN_DEBUG} ? sub { warn "nacre-run[$$]: @_\n" } : sub {};
-    $run_dbg->("subreaper_ret=$sr_ret init_pid=$init_pid");
-
-    # Try pidfd_open first (kernel 5.3+) to get a stable handle before
-    # the init process might exit.
+    # Try pidfd_open first (kernel 5.3+)
     my $pidfd_nr = SYS_pidfd_open + 0;
     my $pidfd = syscall($pidfd_nr, $init_pid + 0, 0);
-    $run_dbg->("pidfd_open($init_pid)=$pidfd errno=$!");
 
     if ($pidfd >= 0) {
-        # Use waitid(P_PIDFD, pidfd, ...) — kernel 5.4+
+        # waitid(P_PIDFD, pidfd, ...) — kernel 5.4+
         my $waitid_nr = SYS_waitid + 0;
-        # siginfo_t is 128 bytes on x86_64/aarch64
-        my $siginfo = "\0" x 128;
-        my $P_PIDFD = 3;  # <linux/wait.h>
-        my $WEXITED = 4;  # <sys/wait.h>
+        my $siginfo = "\0" x 128;       # siginfo_t
+        my $P_PIDFD = 3;               # <linux/wait.h>
+        my $WEXITED = 4;               # <sys/wait.h>
         my $wr = syscall($waitid_nr, $P_PIDFD + 0, $pidfd + 0,
                          $siginfo, $WEXITED + 0, 0);
-        $run_dbg->("waitid(P_PIDFD,$pidfd)=$wr errno=$!");
         if ($wr == 0) {
-            # Parse siginfo_t: si_signo at offset 0 (int), si_errno at 4,
-            # si_code at 8, _si_pid at 12, _si_uid at 16, si_status at 20
-            my $si_signo  = unpack('i', substr($siginfo, 0, 4));
-            my $si_errno  = unpack('i', substr($siginfo, 4, 4));
+            # siginfo_t layout (x86_64/aarch64 LP64):
+            # +0  si_signo  (int)
+            # +4  si_errno  (int)
+            # +8  si_code   (int)
+            # +12 padding   (4 bytes — union alignment)
+            # +16 si_pid    (pid_t)
+            # +20 si_uid    (uid_t)
+            # +24 si_status (int)
             my $si_code   = unpack('i', substr($siginfo, 8, 4));
-            my $si_pid    = unpack('i', substr($siginfo, 12, 4));
-            my $si_uid    = unpack('I', substr($siginfo, 16, 4));
-            my $si_status = unpack('i', substr($siginfo, 20, 4));
-            $run_dbg->("waitid siginfo: signo=$si_signo errno=$si_errno code=$si_code pid=$si_pid uid=$si_uid status=$si_status");
-            # Also dump raw hex of first 32 bytes for verification
-            $run_dbg->("siginfo hex: " . unpack('H*', substr($siginfo, 0, 32)));
-            if ($si_code == 1) {  # CLD_EXITED
+            my $si_status = unpack('i', substr($siginfo, 24, 4));
+            if ($si_code == 1) {    # CLD_EXITED
                 $exit_code = $si_status;
             } else {
-                # Killed by signal
                 $exit_code = 128 + $si_status;
             }
             $got_init = 1;
@@ -2793,12 +2773,10 @@ sub cmd_run {
         POSIX::close($pidfd);
     }
 
-    # Fallback: try waitpid with subreaper
+    # Fallback: waitpid with subreaper
     unless ($got_init) {
-        $run_dbg->("fallback to waitpid(-1, 0)");
         while (1) {
             my $w = waitpid(-1, 0);
-            $run_dbg->("waitpid(-1,0)=$w status=$? errno=$!");
             if ($w == $init_pid) {
                 if (WIFEXITED($?)) {
                     $exit_code = WEXITSTATUS($?);
@@ -2814,7 +2792,6 @@ sub cmd_run {
 
     # Last resort: poll with kill(0, pid)
     unless ($got_init) {
-        $run_dbg->("last resort: polling kill(0, $init_pid)");
         while (kill(0, $init_pid)) {
             while ((my $z = waitpid(-1, WNOHANG)) > 0) {
                 if ($z == $init_pid) {
@@ -2830,10 +2807,7 @@ sub cmd_run {
             last if $got_init;
             select(undef, undef, undef, 0.1);
         }
-        $run_dbg->("polling done: got_init=$got_init exit_code=$exit_code");
     }
-
-    $run_dbg->("final: got_init=$got_init exit_code=$exit_code");
 
     # Delete
     eval { cmd_delete(id => $id, root => $root, force => 1); };

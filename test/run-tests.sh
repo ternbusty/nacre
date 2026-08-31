@@ -327,12 +327,9 @@ make_bundle "$BUNDLE_EC" '"sh", "-c", "exit 42"'
 
 run_test "exit code 42 propagated" bash -c '
     set +e
-    NACRE_RUN_DEBUG=1 perl '"$NACRE"' --root '"$ROOT"' run --bundle '"$BUNDLE_EC"' test-ec42 2>&1
+    perl '"$NACRE"' --root '"$ROOT"' run --bundle '"$BUNDLE_EC"' test-ec42 2>&1
     rc=$?
     set -e
-    if [ "$rc" -ne 42 ]; then
-        echo "DIAG: expected exit code 42 but got $rc" >&2
-    fi
     [ "$rc" -eq 42 ]
 '
 
