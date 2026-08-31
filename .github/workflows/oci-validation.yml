@@ -142,6 +142,9 @@ jobs:
             sudo timeout 60 env RUNTIME=$RUNTIME "$t" > "$out" 2>&1
             rc=$?
             sudo $RUNTIME delete --force "$name" 2>/dev/null || true
+            # Kill any lingering nacre/perl processes from this test
+            sudo pkill -9 -f "nacre" 2>/dev/null || true
+            sleep 0.2
             # Safe cleanup: only remove nacre state files
             sudo find /run/nacre -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
             if [ "$rc" -eq 124 ]; then
@@ -198,6 +201,14 @@ jobs:
           echo "validation_fail=$FAIL" >> "$GITHUB_OUTPUT"
           echo "validation_timeout=$TIMEOUT" >> "$GITHUB_OUTPUT"
           echo "validation_error=$ERROR" >> "$GITHUB_OUTPUT"
+
+      - name: Kill lingering processes
+        if: always()
+        run: |
+          sudo pkill -9 -f "nacre" 2>/dev/null || true
+          sudo pkill -9 -f "perl.*nacre" 2>/dev/null || true
+          sudo pkill -9 -f "runtimetest" 2>/dev/null || true
+          sleep 1
 
       - name: Show failing test logs
         if: always()
