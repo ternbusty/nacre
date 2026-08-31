@@ -258,10 +258,19 @@ jobs:
           echo "::error::OCI validation failed: ${{ steps.run-validation.outputs.validation_fail }} failures, ${{ steps.run-validation.outputs.validation_error }} errors"
           exit 1
 
-      - name: Upload per-test logs
+      - name: Kill lingering processes
         if: always()
-        timeout-minutes: 2
-        uses: actions/upload-artifact@v4
-        with:
-          name: validation-logs
-          path: ~/validation-out/
+        timeout-minutes: 1
+        continue-on-error: true
+        run: |
+          # Close leaked fds in this step shell too
+          for _fd in /proc/self/fd/*; do
+            _n=$(basename "$_fd")
+            [ "$_n" -gt 2 ] 2>/dev/null && eval "exec ${_n}>&-" 2>/dev/null || true
+          done
+          sudo pkill -9 -f 'nacre|runtimetest|validation' 2>/dev/null || true
+          sudo pkill -9 -f '/opt/nacre' 2>/dev/null || true
+          # Also kill any Go test binaries that might be lingering
+          sudo pkill -9 -f '\.t$' 2>/dev/null || true
+          sleep 1
+          echo "Cleanup complete"
