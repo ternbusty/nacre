@@ -308,21 +308,26 @@ sub iso8601_now {
         $t[5]+1900, $t[4]+1, $t[3], $t[2], $t[1], $t[0]);
 }
 
-# Safe wrapper around syscall() that retries on EINTR.
-# IMPORTANT: copies @_ instead of passing aliases directly to syscall().
-# Perl's syscall() inspects each SV's type flags to decide whether to
-# pass the value as a C long (numeric) or a string pointer (string).
-# Constant-sub return values and previously-stringified scalars can carry
-# a stale POK (string-valid) flag alongside the IOK (integer-valid) flag,
-# causing syscall() to dereference an integer as a pointer (EFAULT/EINVAL).
-# Copying into fresh lexicals and coercing the syscall number to integer
-# ensures clean type flags.
+# Safe wrapper around syscall() that retries on EINTR
 sub do_syscall {
-    my ($nr, @rest) = @_;
-    $nr += 0;   # syscall number is always integer
     my $ret;
     do {
-        $ret = syscall($nr, @rest);
+        $ret = syscall(@_);
+    } while ($ret == -1 && $! == EINTR);
+    return $ret;
+}
+
+# Variant for pure-integer syscalls (unshare, setns, prctl, etc.).
+# Copies @_ and coerces every element to a fresh IV.  Perl's syscall()
+# inspects each SV's type flags to decide whether to pass the value as a
+# C long (IOK) or a string pointer (POK).  @_ aliases from constant subs
+# can carry stale type flags, causing syscall() to misinterpret an integer
+# as a pointer.  Copying + coercion guarantees clean IOK-only SVs.
+sub do_syscall_int {
+    my @a = map { $_ + 0 } @_;
+    my $ret;
+    do {
+        $ret = syscall(@a);
     } while ($ret == -1 && $! == EINTR);
     return $ret;
 }
@@ -1829,7 +1834,7 @@ sub cmd_create {
         for my $ns (@join_ns) {
             my $ns_fd;
             sysopen($ns_fd, $ns->{path}, O_RDONLY) or fatal("open ns $ns->{path}: $!");
-            do_syscall(SYS_setns, fileno($ns_fd), 0+$ns->{info}{flag})
+            do_syscall_int(SYS_setns, fileno($ns_fd), $ns->{info}{flag})
                 == 0 or fatal("setns $ns->{type}: $!");
             close $ns_fd;
         }
@@ -1838,7 +1843,7 @@ sub cmd_create {
         my $unshare_flags = $clone_flags & ~CLONE_NEWPID & ~CLONE_NEWCGROUP;
         if ($has_userns) {
             # Unshare user namespace first
-            do_syscall(SYS_unshare, 0+CLONE_NEWUSER)
+            do_syscall_int(SYS_unshare, CLONE_NEWUSER)
                 == 0 or fatal("unshare NEWUSER: $!");
             $unshare_flags &= ~CLONE_NEWUSER;
 
@@ -1852,13 +1857,13 @@ sub cmd_create {
 
         # Unshare remaining namespaces (not PID, not cgroup)
         if ($unshare_flags) {
-            do_syscall(SYS_unshare, 0+$unshare_flags)
+            do_syscall_int(SYS_unshare, $unshare_flags)
                 == 0 or fatal("unshare(0x" . sprintf('%x', $unshare_flags) . "): $!");
         }
 
         # Fork again for PID namespace (child becomes PID 1 in new PID ns)
         if ($has_pidns) {
-            do_syscall(SYS_unshare, 0+CLONE_NEWPID)
+            do_syscall_int(SYS_unshare, CLONE_NEWPID)
                 == 0 or fatal("unshare NEWPID: $!");
         }
 
@@ -1879,7 +1884,7 @@ sub cmd_create {
             # Wait until parent has set up cgroups
             my $msg = channel_recv($init_r_fd);
             # Then unshare
-            do_syscall(SYS_unshare, 0+CLONE_NEWCGROUP);
+            do_syscall_int(SYS_unshare, CLONE_NEWCGROUP);
         }
 
         # Create notify listener
@@ -2242,7 +2247,7 @@ sub cmd_exec {
         # Join namespaces
         for my $ns (@ns_fds) {
             my $flag = 0;  # setns auto-detects from fd
-            do_syscall(SYS_setns, $ns->{fileno}, 0)
+            do_syscall_int(SYS_setns, $ns->{fileno}, 0)
                 == 0 or warn "nacre: setns $ns->{name}: $!\n";
         }
 
