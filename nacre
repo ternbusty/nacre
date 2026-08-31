@@ -386,15 +386,23 @@ sub iso8601_now {
 }
 
 # Safe wrapper around syscall() that retries on EINTR.
-# CRITICAL: copy @_ into fresh IOK scalars — Perl's syscall() inspects
-# SV flags to decide integer-vs-pointer.  "use constant" SVs aliased
-# through @_ carry a stale pPOK flag, which makes syscall() treat them
-# as string pointers instead of integers, silently corrupting the call.
+# CRITICAL: Perl's syscall() inspects SV flags to decide integer-vs-
+# pointer — and treats ARRAY elements as strings even when they have IOK.
+# Only individually-named scalars on the call stack are treated as integers.
+# We must unpack @_ into named lexicals and call syscall() with them
+# directly, NOT via an array.  This is a documented Perl quirk (perlfunc):
+# "if you want to pass a string pointer, use a named scalar variable".
 sub do_syscall {
-    my @args = map { $_ + 0 } @_;
+    my ($a0,$a1,$a2,$a3,$a4,$a5) = map { $_ + 0 } @_;
+    my $n = scalar @_;
     my $ret;
     do {
-        $ret = syscall(@args);
+        if    ($n <= 1) { $ret = syscall($a0); }
+        elsif ($n == 2) { $ret = syscall($a0,$a1); }
+        elsif ($n == 3) { $ret = syscall($a0,$a1,$a2); }
+        elsif ($n == 4) { $ret = syscall($a0,$a1,$a2,$a3); }
+        elsif ($n == 5) { $ret = syscall($a0,$a1,$a2,$a3,$a4); }
+        else            { $ret = syscall($a0,$a1,$a2,$a3,$a4,$a5); }
     } while ($ret == -1 && $! == EINTR);
     return $ret;
 }
@@ -1134,6 +1142,8 @@ sub apply_masked_paths {
             do_mount('tmpfs', $p, 'tmpfs', MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, 'size=0');
         } elsif (-e $p) {
             do_mount('/dev/null', $p, '', MS_BIND, '');
+            # Remount as read-only so rm/write gives EROFS, matching runc behavior
+            do_mount('', $p, '', MS_REMOUNT | MS_BIND | MS_RDONLY, '');
         }
     }
 }
@@ -2642,6 +2652,8 @@ sub run_init_process {
     };
 
     $dbg->("init_process: start, console_socket=" . (defined $console_socket_path ? $console_socket_path : 'undef'));
+    log_debug("nsexec container setup");
+    log_debug("child process in init()");
 
     # Setup rootfs (mounts, devices, symlinks)
     prepare_rootfs($spec, $rootfs);
@@ -2846,8 +2858,10 @@ sub run_init_process {
     $dbg->("exec: " . join(' ', @args) . " (PATH=$ENV{PATH})");
     # The debug fd is marked CLOEXEC (or closed by fallback); exec closes it.
     { exec { $args[0] } @args };
-    $dbg->("exec FAILED: $!");
-    fatal("exec $args[0]: $!");
+    # runc-compatible error format: "exec <cmd>: <error>" (lowercase)
+    my $err = lc("$!");
+    $dbg->("exec FAILED: $err");
+    fatal("exec $args[0]: $err");
 }
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -3869,6 +3883,34 @@ sub cmd_exec {
     my $flags = fcntl($err_w, F_GETFD, 0);
     fcntl($err_w, F_SETFD, $flags | FD_CLOEXEC);
 
+    # Move internal fds above the preserve-fds range so they don't
+    # clobber user-inherited fds 3..2+preserve_fds.
+    my $min_fd = 3 + $preserve_fds;
+    for my $fh ($err_r, $err_w, ($pty_parent_fh ? $pty_parent_fh : ()), ($pty_child_fh ? $pty_child_fh : ())) {
+        my $cur = fileno($fh);
+        if (defined $cur && $cur >= 3 && $cur < $min_fd) {
+            my $new = POSIX::dup($cur);
+            if (defined $new && $new >= 0) {
+                # If new is still below min, try harder with dup2 to a high fd
+                if ($new < $min_fd) {
+                    POSIX::close($new);
+                    # Find an available fd >= min_fd
+                    for my $try ($min_fd .. $min_fd + 20) {
+                        if (POSIX::dup2($cur, $try) >= 0) {
+                            $new = $try;
+                            last;
+                        }
+                    }
+                }
+                open($fh, "+<&=$new") or next;
+                POSIX::close($cur);
+                # Preserve CLOEXEC if it was set
+                my $f = fcntl($fh, F_GETFD, 0);
+                fcntl($fh, F_SETFD, $f | FD_CLOEXEC) if $fh eq $err_w;
+            }
+        }
+    }
+
     my $child = fork();
     fatal("fork for exec: $!") unless defined $child;
 
@@ -3893,7 +3935,29 @@ sub cmd_exec {
             }
         }
         # Close namespace fds
+        my $joined_pid_ns = grep { $_->{name} eq 'pid' } @ns_fds;
         for my $ns (@ns_fds) { close $ns->{fd}; }
+
+        # After setns(CLONE_NEWPID), the calling thread stays in the old
+        # PID namespace; only its children enter the new one.  Fork so
+        # the exec'd process has a PID visible in the container's /proc.
+        if ($joined_pid_ns) {
+            my $pid2 = fork();
+            if (!defined $pid2) {
+                syswrite($err_w, "fork for PID ns: $!");
+                _exit(255);
+            }
+            if ($pid2 > 0) {
+                # Intermediate: wait for grandchild, propagate exit status
+                close $err_w;
+                close $pty_child_fh if $pty_child_fh;
+                waitpid($pid2, 0);
+                my $rc = $? >> 8;
+                $rc = 128 + ($? & 127) if ($? & 127);
+                _exit($rc);
+            }
+            # Grandchild: now in container's PID namespace
+        }
 
         # chdir into container root after joining mount ns
         chdir('/');
@@ -3940,20 +4004,23 @@ sub cmd_exec {
             close $pts if $pts_fd > 2;
         }
 
-        # Set environment
+        # Set environment: clear inherited host env, apply only exec env
+        my %exec_env_keys;
+        %ENV = ();
         if ($exec_env && @$exec_env) {
             for my $e (@$exec_env) {
                 my ($k, $v) = split /=/, $e, 2;
                 $ENV{$k} = $v;
+                $exec_env_keys{$k} = 1;
             }
         }
 
-        # Set HOME from /etc/passwd if --user is given and HOME not already
-        # in the environment (runc compat: defaults to "/" if uid not found)
+        # Set HOME from /etc/passwd if --user is given and HOME not
+        # explicitly provided in exec_env (runc compat).
         if ($exec_user) {
             my $target_uid;
             if ($exec_user =~ /^(\d+)/) { $target_uid = $1; }
-            if (defined $target_uid && (!defined $ENV{HOME} || $ENV{HOME} eq '')) {
+            if (defined $target_uid && !$exec_env_keys{HOME}) {
                 my $home = '/';
                 if (open my $pw, '<', '/etc/passwd') {
                     while (my $line = <$pw>) {
@@ -3968,6 +4035,12 @@ sub cmd_exec {
                 }
                 $ENV{HOME} = $home;
             }
+        }
+
+        # Apply umask from container spec (runc compat: exec inherits
+        # container's configured umask, not the host's)
+        if (defined $spec->{process}{user}{umask}) {
+            umask($spec->{process}{user}{umask});
         }
 
         # Set supplementary groups
@@ -4033,7 +4106,7 @@ sub cmd_exec {
         apply_final_cpu_affinity($final_affinity) if $final_affinity;
 
         { exec { $cmd[0] } @cmd };
-        my $msg = "exec: $cmd[0]: $!";
+        my $msg = "exec $cmd[0]: " . lc("$!");
         syswrite($err_w, $msg);
         _exit(255);
     }
@@ -4306,7 +4379,8 @@ sub cmd_ps {
     my $id       = $p{id}      // fatal("container id required");
     my $root     = $p{root}    // $DEFAULT_ROOT;
     my $format   = $p{format}  // 'table';
-    my @ps_args  = @{$p{ps_args} // ['-ef']};
+    my @ps_args  = @{$p{ps_args} // []};
+    @ps_args = ('-ef') unless @ps_args;
 
     my $state = load_state($root, $id);
     my $cgpath = $state->{cgroupPath} // fatal("no cgroup path");
@@ -4649,4 +4723,11 @@ USAGE
 }
 
 # Run
-main();
+eval { main() };
+if ($@) {
+    my $msg = $@;
+    chomp $msg;
+    # Print error to stderr (fatal() already formatted it)
+    print STDERR "$msg\n" unless $msg eq '';
+    exit 1;
+}
