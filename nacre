@@ -1870,6 +1870,10 @@ sub apply_rootfs_propagation {
 sub apply_masked_paths {
     my ($paths) = @_;
     my %seen;
+    # runc shares a single tmpfs across all masked directories so they
+    # have the same device number (testable via stat %d).  We mount
+    # tmpfs on the first dir, then bind-mount it to subsequent dirs.
+    my $tmpfs_source;
     for my $p (@{$paths // []}) {
         # Deduplicate: don't mask the same path twice (runc compat)
         next if $seen{$p}++;
@@ -1887,15 +1891,22 @@ sub apply_masked_paths {
             next;
         }
         if (-d $p) {
-            do_mount('tmpfs', $p, 'tmpfs', MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, 'size=0');
+            if (!defined $tmpfs_source) {
+                # First masked dir: mount a real tmpfs here
+                do_mount('tmpfs', $p, 'tmpfs', MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, 'size=0');
+                $tmpfs_source = $p;
+            } else {
+                # Subsequent dirs: bind-mount from the first one (shares device number)
+                do_mount($tmpfs_source, $p, '', MS_BIND, '');
+                do_mount('', $p, '', MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, '');
+            }
         } elsif (-e $p) {
             do_mount('/dev/null', $p, '', MS_BIND, '');
             # Remount as read-only so rm/write gives EROFS, matching runc behavior.
-            # The remount must carry the mount flags from the underlying fs
-            # (devtmpfs has nosuid+noexec on many distros).  Try the most
-            # restrictive combo first, then relax.
-            do_mount('', $p, '', MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, '')
-             || do_mount('', $p, '', MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NOSUID | MS_NODEV, '')
+            # IMPORTANT: do NOT use MS_NODEV here — /dev/null is a character device,
+            # and nodev would block open() with EACCES (Permission denied).
+            do_mount('', $p, '', MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NOSUID | MS_NOEXEC, '')
+             || do_mount('', $p, '', MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NOSUID, '')
              || do_mount('', $p, '', MS_REMOUNT | MS_BIND | MS_RDONLY, '')
              || log_debug("maskedPaths: could not remount $p read-only: $!");
         }
@@ -3455,6 +3466,12 @@ sub apply_exec_caps {
         my $n = $CAP_NUM{$name} // next;
         if ($n < 32) { $inh_lo |= (1 << $n); } else { $inh_hi |= (1 << ($n - 32)); }
     }
+    # Ambient caps require the cap in BOTH permitted AND inheritable sets.
+    # Merge ambient into inheritable (same as runc's ApplyCaps).
+    for my $name (keys %amb_caps) {
+        my $n = $CAP_NUM{$name} // next;
+        if ($n < 32) { $inh_lo |= (1 << $n); } else { $inh_hi |= (1 << ($n - 32)); }
+    }
 
     my $hdr = pack('Ii', _LINUX_CAPABILITY_VERSION_3, 0);
     my $data = pack('III III',
@@ -4514,7 +4531,14 @@ sub cmd_kill {
     # running (runc compat: -a is the obsoleted "all processes" flag).
     if ($state->{status} ne 'running' && $state->{status} ne 'created') {
         return if $all;
-        fatal("container not running");
+        # In host PID namespace, the init process might be dead but children
+        # are still alive in the cgroup.  Allow SIGKILL via cgroup.kill.
+        my $signum_check;
+        if ($signal =~ /^\d+$/) { $signum_check = $signal; }
+        else { my $s = $signal; $s =~ s/^SIG//i; $signum_check = $SIG_NUM{uc($s)}; }
+        unless ($signum_check && $signum_check == 9 && $state->{cgroupPath}) {
+            fatal("container not running");
+        }
     }
 
     # Parse signal
