@@ -233,10 +233,33 @@ jobs:
           echo "validation_timeout=$TIMEOUT" >> "$GITHUB_OUTPUT"
           echo "validation_error=$ERROR" >> "$GITHUB_OUTPUT"
 
+      - name: Debug lingering processes
+        if: always()
+        timeout-minutes: 1
+        run: |
+          echo "=== Nacre-related processes ==="
+          ps auxf | grep -E 'nacre|perl|runtimetest|validation' | grep -v grep || echo "(none)"
+          echo "=== Pipe fds in this shell ==="
+          for fd in /proc/self/fd/*; do
+            n=$(basename "$fd")
+            if [ "$n" -gt 2 ] 2>/dev/null; then
+              readlink "$fd" 2>/dev/null | grep -q pipe && echo "fd $n -> $(readlink "$fd")"
+            fi
+          done || true
+          echo "=== Kill stragglers ==="
+          sudo pkill -9 -f nacre 2>/dev/null || true
+          sudo pkill -9 -f runtimetest 2>/dev/null || true
+          echo "=== Done ==="
+
       - name: Show test logs
         if: always()
         timeout-minutes: 1
         run: |
+          # Close leaked pipe fds before doing anything
+          for _fd in /proc/self/fd/*; do
+            _n=$(basename "$_fd")
+            [ "$_n" -gt 2 ] 2>/dev/null && [ -p "$_fd" ] && eval "exec ${_n}>&-" 2>/dev/null || true
+          done
           for f in ~/validation-out/*.log; do
             [ -f "$f" ] || continue
             n_ok=$(grep -c "^ok " "$f" 2>/dev/null || echo 0)
