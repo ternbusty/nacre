@@ -2629,7 +2629,7 @@ sub run_hooks {
 # ═══════════════════════════════════════════════════════════════════════
 
 sub run_init_process {
-    my ($spec, $rootfs, $notify_fd, $main_chan_w, $main_chan_r, $cgpath, $id, $bundle, $pts_fd, $debug_fd, $no_pivot) = @_;
+    my ($spec, $rootfs, $notify_fd, $main_chan_w, $main_chan_r, $cgpath, $id, $bundle, $pts_fd, $debug_fd, $no_pivot, $foreground) = @_;
 
     my $dbg = sub {
         return unless defined $debug_fd && $debug_fd >= 0;
@@ -2684,9 +2684,43 @@ sub run_init_process {
     my $cwd = $spec->{process}{cwd} // '/';
     chdir($cwd) or fatal("chdir to cwd '$cwd': $!");
 
+    # Redirect stdio AFTER pivot_root so paths resolve correctly.
+    # For detached non-terminal containers, point to the container's
+    # /dev/null.  For terminal containers, the PTY dup2 below overrides.
+    if (!$foreground && !defined $pts_fd) {
+        open STDIN,  '<', '/dev/null';
+        open STDOUT, '>', '/dev/null';
+        open STDERR, '>', '/dev/null';
+    }
+
+    # Set up container stdio from PTY slave BEFORE signaling init_ready.
+    # runc does this before the created→started transition so the fd leak
+    # test sees clean FDs (only 0,1,2 + exec.fifo).
+    if (defined $pts_fd) {
+        my $r0 = POSIX::dup2($pts_fd, 0);
+        my $r1 = POSIX::dup2($pts_fd, 1);
+        my $r2 = POSIX::dup2($pts_fd, 2);
+        $dbg->("dup2 pts_fd=$pts_fd → 0=$r0 1=$r1 2=$r2");
+        $r0 >= 0 or fatal("dup2 pts→stdin: $!");
+        $r1 >= 0 or fatal("dup2 pts→stdout: $!");
+        $r2 >= 0 or fatal("dup2 pts→stderr: $!");
+        # Set the PTY as the controlling terminal for this session.
+        my $tio = ioctl(STDIN, TIOCSCTTY, 0);
+        $dbg->("TIOCSCTTY=$tio err=$!");
+    }
+
     # Signal main process: init ready
     log_debug("init: closing the pipe to signal completion");
     channel_send($main_chan_w, { type => 'init_ready' });
+
+    # Close all fds > 2 except the notify fd (exec.fifo / start barrier).
+    # This matches runc's behavior: in "created" state the init process
+    # only has stdio + exec.fifo open.
+    my $notify_fileno = ref($notify_fd) ? fileno($notify_fd) : $notify_fd;
+    for my $fd (3..1023) {
+        next if defined $notify_fileno && $fd == $notify_fileno;
+        POSIX::close($fd);
+    }
 
     # Wait for start signal
     wait_for_start($notify_fd);
@@ -2752,36 +2786,12 @@ sub run_init_process {
         $ENV{HOME} = $home;
     }
 
-    # Set up container stdio from PTY slave BEFORE close_range fallback
-    # can destroy it (close_range with CLOEXEC only marks, but the POSIX
-    # fallback actually closes fds immediately).
-    if (defined $pts_fd) {
-        my $r0 = POSIX::dup2($pts_fd, 0);
-        my $r1 = POSIX::dup2($pts_fd, 1);
-        my $r2 = POSIX::dup2($pts_fd, 2);
-        $dbg->("dup2 pts_fd=$pts_fd → 0=$r0 1=$r1 2=$r2");
-        $r0 >= 0 or fatal("dup2 pts→stdin: $!");
-        $r1 >= 0 or fatal("dup2 pts→stdout: $!");
-        $r2 >= 0 or fatal("dup2 pts→stderr: $!");
-        # Set the PTY as the controlling terminal for this session.
-        # Pass integer 0 (not pack('i',0) which Perl treats as a pointer).
-        my $tio = ioctl(STDIN, TIOCSCTTY, 0);
-        $dbg->("TIOCSCTTY=$tio err=$!");
-        # pts_fd itself (>= 3) will be closed below
-    }
-
-    # Close extra fds (marks CLOEXEC — actually closed at exec).
-    # Save the return value explicitly; $! can hold a stale errno from
-    # earlier calls and must not be tested after a *successful* syscall.
+    # Close any fds opened during post-start setup (CLOEXEC for exec).
     my $cr_ret = do_syscall(SYS_close_range, 3, ~0, CLOSE_RANGE_CLOEXEC);
-    $dbg->("close_range=$cr_ret err=$!");
     if ($cr_ret == -1) {
-        # Fallback: close individually (needed on kernels < 5.11)
         for my $fd (3..1023) {
-            next if defined $debug_fd && $fd == $debug_fd;
             POSIX::close($fd);
         }
-        $dbg->("close_range fallback done");
     }
 
     # Exec
@@ -3078,19 +3088,10 @@ sub cmd_create {
             close $dfh;
         };
 
-        # For detached containers (create, not run), redirect stdio to
-        # /dev/null.  This prevents shell callers like output=$(...)
-        # from hanging (the init holds the pipe otherwise), and avoids
-        # polluting RuntimeInsideValidate tests with runtimetest output
-        # that contains "not ok" lines for unimplemented features.
-        # When a PTY is set up the slave will replace stdio before exec;
-        # for 'run' (foreground), keep the parent's stdio so the user
-        # sees container output.
-        if (!$p{foreground}) {
-            open STDIN,  '<', '/dev/null';
-            open STDOUT, '>', '/dev/null';
-            open STDERR, '>', '/dev/null';
-        }
+        # For detached containers, /dev/null redirect is handled inside
+        # run_init_process after pivot_root, so the fd path resolves to
+        # the container's /dev/null (not the host's, which becomes
+        # unreachable after pivot_root).
 
         # Unshare cgroup namespace
         if ($clone_flags & CLONE_NEWCGROUP) {
@@ -3110,7 +3111,7 @@ sub cmd_create {
         # Run the init process (eval captures die from fatal so we can
         # report the actual error to the parent through the channel).
         eval {
-            run_init_process($spec, $rootfs, $notify_srv, $main_w_fd, $init_r_fd, $cgpath, $id, $bundle, $pts_fd, $init_debug_fd, $no_pivot);
+            run_init_process($spec, $rootfs, $notify_srv, $main_w_fd, $init_r_fd, $cgpath, $id, $bundle, $pts_fd, $init_debug_fd, $no_pivot, $p{foreground});
         };
         if ($@) {
             my $err = "$@";
