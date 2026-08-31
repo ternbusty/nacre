@@ -272,7 +272,7 @@ runc exec ls -la
 runc exec ls -la with --cwd
 runc exec --env
 runc exec --user
-[skip]runc exec --user vs /dev/null ownership # nacre:exec
+runc exec --user vs /dev/null ownership
 runc exec --user with no access to cwd
 runc exec --additional-gids
 [skip]runc exec --cap # nacre:exec

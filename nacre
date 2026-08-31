@@ -3389,6 +3389,24 @@ sub cmd_exec {
     # Close namespace fds in parent
     for my $ns (@ns_fds) { close $ns->{fd}; }
 
+    if ($detach) {
+        # Detached exec: don't wait, just exit
+        # Read any immediate errors from the pipe
+        my $err_msg = '';
+        # Non-blocking check for exec errors
+        my $rin = '';
+        vec($rin, fileno($err_r), 1) = 1;
+        if (select($rin, undef, undef, 0.1)) {
+            sysread($err_r, $err_msg, 4096);
+        }
+        close $err_r;
+        if ($err_msg ne '') {
+            warn "nacre: $err_msg\n";
+            exit(255);
+        }
+        exit(0);
+    }
+
     # Wait for exec'd process
     waitpid($child, 0);
 
