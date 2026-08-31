@@ -1052,8 +1052,10 @@ sub netlink_list_addrs {
         $buf = '';
         recv($sock, $buf, 65536, 0) or last;
         my $offset = 0;
+        my $type;
         while ($offset + 16 <= length($buf)) {
-            my ($len, $type, $flags, $seq, $pid) = unpack('L S S L L', substr($buf, $offset, 16));
+            my ($len, $flags, $seq, $pid);
+            ($len, $type, $flags, $seq, $pid) = unpack('L S S L L', substr($buf, $offset, 16));
             last if $len < 16 || $offset + $len > length($buf);
             last if $type == NLMSG_DONE;
             if ($type == RTM_NEWADDR && $len >= 24) {
