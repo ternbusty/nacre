@@ -664,11 +664,28 @@ sub cgroup_apply_resources {
     my ($cgpath, $spec, %opts) = @_;
     my $res = $spec->{linux}{resources} // {};
 
-    # Memory
+    # Memory — order writes carefully: cgroup v2 requires memory.swap.max
+    # >= memory.max at all times.  When increasing memory.max, write it
+    # first; when decreasing, write swap first.
     if (my $mem = $res->{memory}) {
-        cg_write($cgpath, 'memory.max',      $mem->{limit})       if defined $mem->{limit};
-        cg_write($cgpath, 'memory.low',      $mem->{reservation}) if defined $mem->{reservation};
-        cg_write($cgpath, 'memory.swap.max', $mem->{swap})        if defined $mem->{swap};
+        my $new_limit = $mem->{limit};
+        my $new_swap  = $mem->{swap};
+        my $cur_limit = read_file("$cgpath/memory.max");
+        chomp($cur_limit //= 'max');
+        my $cur_val = ($cur_limit eq 'max') ? ~0 : int($cur_limit);
+        my $new_val = (defined $new_limit && $new_limit ne 'max')
+                        ? int($new_limit) : ~0;
+
+        if ($new_val > $cur_val) {
+            # Increasing memory.max — write limit first so swap stays valid
+            cg_write($cgpath, 'memory.max',      $new_limit) if defined $new_limit;
+            cg_write($cgpath, 'memory.swap.max', $new_swap)  if defined $new_swap;
+        } else {
+            # Decreasing or unchanged — write swap first, then limit
+            cg_write($cgpath, 'memory.swap.max', $new_swap)  if defined $new_swap;
+            cg_write($cgpath, 'memory.max',      $new_limit) if defined $new_limit;
+        }
+        cg_write($cgpath, 'memory.low', $mem->{reservation}) if defined $mem->{reservation};
     }
 
     # CPU
