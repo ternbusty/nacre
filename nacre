@@ -3745,7 +3745,36 @@ sub run_init_process {
         }
     }
 
-    # Run startContainer hooks (run inside the container namespace, with seccomp active)
+    # Set environment — must happen before startContainer hooks, which
+    # per OCI spec inherit the process environment.
+    %ENV = ();
+    for my $e (@{$spec->{process}{env} // []}) {
+        my ($k, $v) = split /=/, $e, 2;
+        $ENV{$k} = $v if defined $k;
+    }
+
+    # Default HOME from /etc/passwd if not set or empty (OCI / runc compat).
+    # runc overrides HOME="" with the passwd entry (de facto behavior).
+    # At this point we are already inside the container rootfs (post pivot_root).
+    if (!defined $ENV{HOME} || $ENV{HOME} eq '') {
+        my $uid = $spec->{process}{user}{uid} // 0;
+        my $home = '/';
+        if (open my $pw, '<', '/etc/passwd') {
+            while (my $line = <$pw>) {
+                chomp $line;
+                my @f = split /:/, $line;
+                if (@f >= 6 && $f[2] == $uid) {
+                    $home = $f[5] if $f[5] ne '';
+                    last;
+                }
+            }
+            close $pw;
+        }
+        $ENV{HOME} = $home;
+    }
+
+    # Run startContainer hooks (run inside the container namespace,
+    # with seccomp active and process environment set)
     if (my $hooks = $spec->{hooks}) {
         if ($hooks->{startContainer}) {
             my $hook_state = {
@@ -3774,33 +3803,6 @@ sub run_init_process {
 
     # Reset CPU affinity to available set (undoes any taskset constraint)
     apply_cpu_affinity_reset($spec);
-
-    # Set environment
-    %ENV = ();
-    for my $e (@{$spec->{process}{env} // []}) {
-        my ($k, $v) = split /=/, $e, 2;
-        $ENV{$k} = $v if defined $k;
-    }
-
-    # Default HOME from /etc/passwd if not set or empty (OCI / runc compat).
-    # runc overrides HOME="" with the passwd entry (de facto behavior).
-    # At this point we are already inside the container rootfs (post pivot_root).
-    if (!defined $ENV{HOME} || $ENV{HOME} eq '') {
-        my $uid = $spec->{process}{user}{uid} // 0;
-        my $home = '/';
-        if (open my $pw, '<', '/etc/passwd') {
-            while (my $line = <$pw>) {
-                chomp $line;
-                my @f = split /:/, $line;
-                if (@f >= 6 && $f[2] == $uid) {
-                    $home = $f[5] if $f[5] ne '';
-                    last;
-                }
-            }
-            close $pw;
-        }
-        $ENV{HOME} = $home;
-    }
 
     # Close any fds opened during post-start setup (CLOEXEC for exec).
     my $cr_ret = do_syscall(SYS_close_range, 3, ~0, CLOSE_RANGE_CLOEXEC);
