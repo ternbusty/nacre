@@ -2569,6 +2569,8 @@ sub run_hooks {
     my ($hooks, $state, %opts) = @_;
     return unless $hooks;
     my $must_succeed = $opts{must_succeed} // 0;
+    my $hook_type    = $opts{type} // '';
+    my $hook_idx     = 0;
     for my $hook (@$hooks) {
         # Prepare state JSON and pipe BEFORE forking so the child inherits
         # a real file descriptor that survives exec().
@@ -2606,21 +2608,23 @@ sub run_hooks {
             select(undef, undef, undef, 0.1);
             $elapsed += 0.1;
         }
+        my $hook_label = $hook_type ? "$hook_type hook #$hook_idx" : "hook $hook->{path}";
         if ($elapsed >= $timeout) {
             kill 9, $pid;
             waitpid($pid, 0);
             if ($must_succeed) {
-                fatal("hook $hook->{path} timed out after ${timeout}s");
+                fatal("error running $hook_label: hook timed out after ${timeout}s");
             }
-            warn "nacre: hook $hook->{path} timed out\n";
+            warn "nacre: $hook_label timed out\n";
         } elsif ($?) {
             # Hook exited non-zero
             my $exit_code = $? >> 8;
             if ($must_succeed) {
-                fatal("hook $hook->{path} failed with exit code $exit_code");
+                fatal("error running $hook_label: hook command exited with error code $exit_code");
             }
-            warn "nacre: hook $hook->{path} exited with code $exit_code\n";
+            warn "nacre: $hook_label exited with code $exit_code\n";
         }
+        $hook_idx++;
     }
 }
 
@@ -2736,7 +2740,7 @@ sub run_init_process {
                 bundle     => $bundle // '',
                 annotations => $spec->{annotations} // {},
             };
-            run_hooks($hooks->{startContainer}, $hook_state, must_succeed => 1);
+            run_hooks($hooks->{startContainer}, $hook_state, must_succeed => 1, type => 'startContainer');
         }
     }
 
@@ -2858,8 +2862,8 @@ sub run_main_process {
 
     # Run createRuntime hooks
     if (my $hooks = $spec->{hooks}) {
-        run_hooks($hooks->{createRuntime}, $state);
-        run_hooks($hooks->{prestart}, $state);      # deprecated but still supported
+        run_hooks($hooks->{createRuntime}, $state, type => 'createRuntime');
+        run_hooks($hooks->{prestart}, $state, type => 'prestart');
     }
 
     return $state;
@@ -3185,8 +3189,11 @@ sub cmd_create {
 
     # If cgroup wasn't set up yet (no CLONE_NEWCGROUP path)
     unless ($clone_flags & CLONE_NEWCGROUP) {
-        eval { cgroup_setup($cgpath, $spec); };
-        eval { cgroup_add_process($cgpath, $init_pid); };
+        # cgroup_setup must NOT be silenced — "non-empty cgroup" is a real
+        # error that the test suite checks.  Only silence apply_device_cgroup
+        # (it may fail if eBPF isn't available).
+        cgroup_setup($cgpath, $spec) if $cgpath;
+        eval { cgroup_add_process($cgpath, $init_pid); } if $cgpath;
         eval { apply_device_cgroup($cgpath, $spec); };
     }
 
@@ -3215,9 +3222,9 @@ sub cmd_create {
 
     # Run createRuntime hooks (OCI spec: MUST error if these fail)
     if (my $hooks = $spec->{hooks}) {
-        run_hooks($hooks->{createRuntime}, $state, must_succeed => 1);
-        run_hooks($hooks->{createContainer}, $state, must_succeed => 1);
-        run_hooks($hooks->{prestart}, $state, must_succeed => 1);
+        run_hooks($hooks->{createRuntime}, $state, must_succeed => 1, type => 'createRuntime');
+        run_hooks($hooks->{createContainer}, $state, must_succeed => 1, type => 'createContainer');
+        run_hooks($hooks->{prestart}, $state, must_succeed => 1, type => 'prestart');
     }
 
     return $state;
@@ -3257,7 +3264,7 @@ sub cmd_start {
 
     # Run poststart hooks ($spec already loaded above)
     if ($spec->{hooks}) {
-        run_hooks($spec->{hooks}{poststart}, $state);
+        run_hooks($spec->{hooks}{poststart}, $state, type => 'poststart');
     }
 }
 
@@ -3365,7 +3372,7 @@ sub cmd_delete {
     # Run poststop hooks (use cached spec from create time)
     my $spec = eval { load_cached_spec($root, $id, $state->{bundle}) };
     if ($spec && $spec->{hooks}) {
-        run_hooks($spec->{hooks}{poststop}, $state);
+        run_hooks($spec->{hooks}{poststop}, $state, type => 'poststop');
     }
 
     # Remove state
@@ -3766,7 +3773,7 @@ sub cmd_exec {
         } else {
             fatal("cannot exec in a paused container, use --ignore-paused to wait");
         }
-    } elsif ($state->{status} ne 'running') {
+    } elsif ($state->{status} ne 'running' && $state->{status} ne 'created') {
         fatal("container '$id' is not running");
     }
 
