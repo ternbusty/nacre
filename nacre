@@ -220,6 +220,19 @@ use constant {
     CLOSE_RANGE_CLOEXEC => (1 << 2),
 };
 
+# -- mount_setattr flags (kernel 5.12+) --
+use constant {
+    AT_RECURSIVE       => 0x8000,
+    MOUNT_ATTR_RDONLY  => 0x00000001,
+    MOUNT_ATTR_NOSUID  => 0x00000002,
+    MOUNT_ATTR_NODEV   => 0x00000004,
+    MOUNT_ATTR_NOEXEC  => 0x00000008,
+    MOUNT_ATTR_NOATIME    => 0x00000010,
+    MOUNT_ATTR_STRICTATIME => 0x00000020,
+    MOUNT_ATTR_NODIRATIME  => 0x00000080,
+    MOUNT_ATTR__ATIME      => 0x00000070,  # mask for atime settings
+};
+
 # -- PTY / terminal ioctls --
 use constant {
     TIOCGPTN   => 0x80045430,   # Get PTY slave number
@@ -362,12 +375,10 @@ sub write_file_atomic {
 sub ensure_dir {
     my ($path) = @_;
     return if -d $path;
-    # make_path uses stat() internally, which can fail with EOVERFLOW in
-    # user namespaces when the parent directory's owner UID is not mapped.
-    # Fall back to simple recursive mkdir on failure.
-    eval { make_path($path, { mode => 0o755 }) };
-    return if -d $path;
-    # Fallback: walk up to find an existing ancestor, then mkdir down
+    # Walk up to find the deepest existing ancestor, then mkdir down.
+    # This handles setgid bit inheritance: if a parent has the setgid
+    # bit set, newly created children inherit it (kernel behavior) and
+    # we apply the default mode 0755 | inherited setgid.
     my @todo;
     my $p = $path;
     while ($p ne '' && $p ne '/' && !-d $p) {
@@ -375,7 +386,14 @@ sub ensure_dir {
         $p = dirname($p);
     }
     for my $d (reverse @todo) {
-        mkdir $d, 0755;
+        my $parent = dirname($d);
+        my @pst = stat($parent);
+        my $mode = 0755;
+        # Inherit setgid bit from parent (like mkdir(2))
+        if (@pst && ($pst[2] & S_ISGID)) {
+            $mode |= S_ISGID;
+        }
+        mkdir $d, $mode;
     }
 }
 
@@ -866,6 +884,41 @@ my %MOUNT_FLAGS = (
     readonly    => MS_RDONLY,
 );
 
+# Recursive mount attributes that need mount_setattr() (kernel 5.12+)
+my %RECURSIVE_MOUNT_ATTRS = (
+    rro            => { set => MOUNT_ATTR_RDONLY,     clear => 0 },
+    rrw            => { set => 0,                     clear => MOUNT_ATTR_RDONLY },
+    rnosuid        => { set => MOUNT_ATTR_NOSUID,     clear => 0 },
+    rsuid          => { set => 0,                     clear => MOUNT_ATTR_NOSUID },
+    rnodev         => { set => MOUNT_ATTR_NODEV,      clear => 0 },
+    rdev           => { set => 0,                     clear => MOUNT_ATTR_NODEV },
+    rnoexec        => { set => MOUNT_ATTR_NOEXEC,     clear => 0 },
+    rexec          => { set => 0,                     clear => MOUNT_ATTR_NOEXEC },
+    ratime         => { set => 0,                     clear => 0, atime => 0 },  # relatime (default)
+    rnoatime       => { set => MOUNT_ATTR_NOATIME,    clear => 0, atime => 1 },
+    rstrictatime   => { set => MOUNT_ATTR_STRICTATIME, clear => 0, atime => 1 },
+    rnostrictatime => { set => 0,                     clear => 0, atime => 0 },
+    rrelatime      => { set => 0,                     clear => 0, atime => 0 },  # relatime
+    rnorelatime    => { set => 0,                     clear => 0, atime => 0 },
+    rnodiratime    => { set => MOUNT_ATTR_NODIRATIME,  clear => 0 },
+    rdiratime      => { set => 0,                     clear => MOUNT_ATTR_NODIRATIME },
+);
+
+sub do_mount_setattr {
+    my ($dirfd, $path, $flags, $attr_set, $attr_clr) = @_;
+    # struct mount_attr { __u64 attr_set, attr_clr, propagation, userns_fd; }
+    my $attr = pack('QQQQ', $attr_set, $attr_clr, 0, 0);
+    my $nr = SYS_mount_setattr + 0;
+    my $df = $dirfd + 0;
+    my $p  = $path . "\0";
+    my $fl = $flags + 0;
+    my $sz = length($attr) + 0;
+    my $ret;
+    do { $ret = syscall($nr, $df, $p, $fl, $attr, $sz) }
+        while ($ret == -1 && $! == EINTR);
+    return $ret == 0;
+}
+
 sub parse_mount_options {
     my ($opts_ref) = @_;
     my $flags = 0;
@@ -1002,22 +1055,41 @@ sub prepare_rootfs {
     do_mount($rootfs, $rootfs, '', MS_BIND | MS_REC, '')
         or fatal("bind mount rootfs: $!");
 
-    # Apply spec mounts
-    apply_mounts($spec, $rootfs);
+    # Apply spec mounts (returns whether /dev needs deferred ro remount)
+    my $dev_needs_ro = apply_mounts($spec, $rootfs);
 
     # Create default devices via bind mount
     create_devices($rootfs, $spec);
 
     # Create default symlinks
     create_symlinks($rootfs);
+
+    # Deferred /dev readonly remount (after devices are created)
+    if ($dev_needs_ro) {
+        do_mount('', "$rootfs/dev", '', MS_REMOUNT | MS_BIND | MS_RDONLY, '')
+            or warn "nacre: remount /dev ro: $!\n";
+    }
 }
 
 sub apply_mounts {
     my ($spec, $rootfs) = @_;
     log_debug("applying mounts, rootfs=$rootfs");
+
+    # Track /dev ro remount: defer MS_RDONLY on /dev until after device creation
+    my $dev_needs_ro = 0;
+
     for my $m (@{$spec->{mounts} // []}) {
         my $dest = "$rootfs$m->{destination}";
         my $mount_src = $m->{source} // '';
+        my $type = $m->{type} // '';
+
+        # Security: /proc and /sys must not be symlinks (CVE-2023-27561 / CVE-2019-19921)
+        if ($type eq 'proc' || $type eq 'sysfs') {
+            if (-l $dest) {
+                fatal("$m->{destination} must be mounted on ordinary directory");
+            }
+        }
+
         # For bind mounts of files, create a file mount point instead of dir
         if ($mount_src ne '' && -f $mount_src && grep { $_ eq 'bind' || $_ eq 'rbind' } @{$m->{options} // []}) {
             my $parent = dirname($dest);
@@ -1030,20 +1102,38 @@ sub apply_mounts {
             ensure_dir($dest);
         }
 
-        # Filter out OCI-specific pseudo-options before parsing
+        # Filter out OCI-specific pseudo-options and recursive mount attrs
         my @raw_opts = @{$m->{options} // []};
         my $tmpcopyup = 0;
         my @real_opts;
+        my @recursive_attrs;  # recursive mount_setattr options
         for my $o (@raw_opts) {
             if ($o eq 'tmpcopyup' || $o eq 'copy') {
                 $tmpcopyup = 1;
+            } elsif (exists $RECURSIVE_MOUNT_ATTRS{$o}) {
+                push @recursive_attrs, $o;
             } else {
                 push @real_opts, $o;
             }
         }
         my ($flags, $data) = parse_mount_options(\@real_opts);
-        my $type = $m->{type} // '';
         my $src  = $m->{source} // $type;
+
+        # For /dev tmpfs mount, defer ro flag until after device creation
+        if ($m->{destination} eq '/dev' && $type eq 'tmpfs' && ($flags & MS_RDONLY)) {
+            $flags &= ~MS_RDONLY;
+            $dev_needs_ro = 1;
+        }
+
+        # tmpfs mode= inherit: if mounting tmpfs without explicit mode=
+        # in the options, inherit the existing directory's permissions
+        if ($type eq 'tmpfs' && -d $dest && $data !~ /\bmode=/) {
+            my @st = stat($dest);
+            if (@st) {
+                my $mode = sprintf('%o', $st[2] & 07777);
+                $data = $data ? "$data,mode=$mode" : "mode=$mode";
+            }
+        }
 
         # tmpcopyup: bind-mount dest to a temp location, mount tmpfs,
         # then copy content from the temp back into the tmpfs.
@@ -1068,16 +1158,39 @@ sub apply_mounts {
                 or do { warn "nacre: mount $type on $dest: $!\n"; next; };
         }
 
+        # Apply recursive mount attributes via mount_setattr()
+        if (@recursive_attrs) {
+            my ($attr_set, $attr_clr) = (0, 0);
+            for my $ra (@recursive_attrs) {
+                my $def = $RECURSIVE_MOUNT_ATTRS{$ra};
+                if (exists $def->{atime} && $def->{atime}) {
+                    # Atime setting: clear all atime bits first, then set
+                    $attr_clr |= MOUNT_ATTR__ATIME;
+                    $attr_set = ($attr_set & ~MOUNT_ATTR__ATIME) | $def->{set};
+                } elsif (exists $def->{atime} && !$def->{atime}) {
+                    # Reset to relatime (clear atime flags)
+                    $attr_clr |= MOUNT_ATTR__ATIME;
+                } else {
+                    $attr_set |= $def->{set};
+                    $attr_clr |= $def->{clear};
+                }
+            }
+            if ($attr_set || $attr_clr) {
+                do_mount_setattr(-1, $dest, AT_RECURSIVE, $attr_set, $attr_clr)
+                    or warn "nacre: mount_setattr $dest: $!\n";
+            }
+        }
+
         # Restore tmpcopyup content
         if ($tmpcopy_src && -d $tmpcopy_src) {
             _copy_dir_contents($tmpcopy_src, $dest);
             # Unmount and remove the temporary bind mount
-            my $nr = SYS_umount2 + 0;
-            my $tgt = $tmpcopy_src . "\0";
-            syscall($nr, $tgt, 0);
+            do_umount($tmpcopy_src, 0);
             rmdir $tmpcopy_src;
         }
     }
+
+    return $dev_needs_ro;
 }
 
 sub create_devices {
@@ -4128,6 +4241,16 @@ sub cmd_exec {
             }
         }
 
+        # Apply rlimits from container spec (exec inherits init's rlimits,
+        # but process.json can override). runc exec always applies the
+        # container's rlimits to the exec'd process.
+        if ($exec_proc && $exec_proc->{rlimits}) {
+            my $fake_spec = { process => $exec_proc };
+            apply_rlimits($fake_spec);
+        } elsif ($spec->{process}{rlimits}) {
+            apply_rlimits($spec);
+        }
+
         # Apply iopriority/scheduler from process.json if given,
         # otherwise inherit from init (which already set them from config.json)
         if ($exec_proc) {
@@ -4376,9 +4499,12 @@ sub cmd_events {
         }
 
         # PSI (pressure stall information) - io, cpu, memory
+        # Nest under each controller as {psi: {some: ..., full: ...}}
+        # to match runc's JSON format (e.g. data.cpu.psi.some.avg10)
         for my $psi_type (qw(cpu io memory)) {
             my $psi_data = read_file("$cgpath/$psi_type.pressure");
             if (defined $psi_data) {
+                my %psi;
                 for my $line (split /\n/, $psi_data) {
                     # Format: some avg10=0.00 avg60=0.00 avg300=0.00 total=0
                     #         full avg10=0.00 avg60=0.00 avg300=0.00 total=0
@@ -4389,9 +4515,10 @@ sub cmd_events {
                             my ($k, $v) = ($1, $2);
                             $vals{$k} = ($k eq 'total') ? int($v) : $v + 0.0;
                         }
-                        $s{$psi_type . '_pressure'}{$level} = \%vals;
+                        $psi{$level} = \%vals;
                     }
                 }
+                $s{$psi_type}{psi} = \%psi if %psi;
             }
         }
 
