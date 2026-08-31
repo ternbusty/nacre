@@ -17,8 +17,6 @@
 #   nacre:idmap   idmap mounts not implemented
 #   nacre:netdev  network device move not implemented
 #   nacre:affin   CPU affinity not implemented
-#   nacre:mempol  memory policy not implemented
-#   nacre:ioprio  ioprio/scheduler not implemented
 #   nacre:keyring session keyring not implemented
 #   nacre:notify  seccomp SCMP_ACT_NOTIFY listener not implemented
 #   nacre:timens  time namespace offsets not implemented
@@ -221,16 +219,16 @@ runc run with RLIMIT_NOFILE(The same as system's hard value)
 [skip]runc run personality with exec for x86_64 # arch
 
 # --- run (memory policy) ---
-[skip]runc run empty memory policy # nacre:mempol
-[skip]runc run memory policy bind static # nacre:mempol
-[skip]runc run memory policy bind way too large a node number # nacre:mempol
-[skip]runc run memory policy calls syscall with invalid arguments # nacre:mempol
-[skip]runc run memory policy default with missing nodes # nacre:mempol
-[skip]runc run memory policy interleave without flags # nacre:mempol
-[skip]runc run memory policy with invalid flag # nacre:mempol
-[skip]runc run memory policy with missing mode # nacre:mempol
-[skip]runc run memory policy with non-existing mode # nacre:mempol
-[skip]runc run and exec memory policy prefer relative # nacre:mempol
+runc run empty memory policy
+runc run memory policy bind static
+runc run memory policy bind way too large a node number
+runc run memory policy calls syscall with invalid arguments
+runc run memory policy default with missing nodes
+runc run memory policy interleave without flags
+runc run memory policy with invalid flag
+runc run memory policy with missing mode
+runc run memory policy with non-existing mode
+runc run and exec memory policy prefer relative
 
 # --- run (env) ---
 empty HOME env var is overridden

@@ -2153,6 +2153,115 @@ sub apply_scheduler {
 }
 
 # ═══════════════════════════════════════════════════════════════════════
+# Memory Policy (set_mempolicy)
+# ═══════════════════════════════════════════════════════════════════════
+
+my %MPOL_MODE_MAP = (
+    MPOL_DEFAULT    => 0,
+    MPOL_PREFERRED  => 1,
+    MPOL_BIND       => 2,
+    MPOL_INTERLEAVE => 3,
+    MPOL_LOCAL      => 4,
+);
+
+my %MPOL_FLAG_MAP = (
+    MPOL_F_STATIC_NODES   => (1 << 15),
+    MPOL_F_RELATIVE_NODES => (1 << 14),
+    MPOL_F_NUMA_BALANCING => (1 << 13),
+);
+
+sub parse_node_list {
+    my ($nodes_str) = @_;
+    my @nodes;
+    for my $part (split /,/, $nodes_str) {
+        $part =~ s/^\s+|\s+$//g;
+        next if $part eq '';
+        if ($part =~ /^(\d+)-(\d+)$/) {
+            my ($lo, $hi) = ($1 + 0, $2 + 0);
+            fatal("invalid memory policy node: $part") if $hi > 1024 * 1024;
+            push @nodes, $lo .. $hi;
+        } elsif ($part =~ /^(\d+)$/) {
+            push @nodes, $1 + 0;
+        } else {
+            fatal("invalid memory policy node: $part");
+        }
+    }
+    return @nodes;
+}
+
+sub validate_memory_policy {
+    my ($spec) = @_;
+    my $mp = $spec->{linux}{memoryPolicy} // return;
+
+    my $mode_str = $mp->{mode} // '';
+    if (!defined $mp->{mode} && !keys %{$mp}) {
+        fatal("invalid memory policy");
+    }
+    if (!defined $mp->{mode} || $mode_str eq '') {
+        fatal("invalid memory policy mode: (empty)");
+    }
+    if (!exists $MPOL_MODE_MAP{$mode_str}) {
+        fatal("invalid memory policy mode: $mode_str");
+    }
+    for my $f (@{$mp->{flags} // []}) {
+        fatal("invalid memory policy flag: $f")
+            unless exists $MPOL_FLAG_MAP{$f};
+    }
+    my $nodes_str = $mp->{nodes} // '';
+    my @nodes = $nodes_str ne '' ? parse_node_list($nodes_str) : ();
+    if ($mode_str eq 'MPOL_DEFAULT' && @nodes > 0) {
+        fatal("set_mempolicy: mode requires 0 nodes but got " . scalar(@nodes));
+    }
+}
+
+sub apply_memory_policy {
+    my ($spec) = @_;
+    my $mp = $spec->{linux}{memoryPolicy} // return;
+
+    my $mode_str = $mp->{mode} // '';
+    if ($mode_str eq '' || !exists $MPOL_MODE_MAP{$mode_str}) {
+        return;  # validation already done
+    }
+    my $mode = $MPOL_MODE_MAP{$mode_str};
+
+    # Parse flags
+    my $flags = 0;
+    for my $f (@{$mp->{flags} // []}) {
+        $flags |= ($MPOL_FLAG_MAP{$f} // 0);
+    }
+    $mode |= $flags;
+
+    # Parse nodes
+    my $nodes_str = $mp->{nodes} // '';
+    my @nodes = $nodes_str ne '' ? parse_node_list($nodes_str) : ();
+
+    # Build nodemask bitmask
+    my $maxnode = 0;
+    my @mask;
+    if (@nodes) {
+        $maxnode = (sort { $b <=> $a } @nodes)[0] + 1;
+        # Round maxnode up to multiple of 64 for kernel alignment
+        my $mask_longs = int(($maxnode + 63) / 64);
+        @mask = (0) x $mask_longs;
+        for my $n (@nodes) {
+            my $idx = int($n / 64);
+            my $bit = $n % 64;
+            $mask[$idx] |= (1 << $bit);
+        }
+        $maxnode = $mask_longs * 64 + 1;
+    }
+
+    my $nodemask = @mask ? pack('Q*', @mask) : '';
+    my $nr = SYS_set_mempolicy + 0;
+    my $m  = $mode + 0;
+    my $mn = $maxnode + 0;
+    my $r = syscall($nr, $m, $nodemask, $mn);
+    if ($r == -1) {
+        fatal("set_mempolicy: $!");
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
 # Sysctls
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -2337,6 +2446,9 @@ sub run_init_process {
 
     # Apply scheduler
     apply_scheduler($spec);
+
+    # Apply memory policy
+    apply_memory_policy($spec);
 
     # Set environment
     %ENV = ();
@@ -2526,6 +2638,7 @@ sub cmd_create {
     # be mapped to kernel interfaces.
     validate_capabilities($spec);
     validate_rlimits($spec);
+    validate_memory_policy($spec);
 
     # Snapshot config.json — OCI spec: "Any updates to config.json
     # after this step MUST NOT affect the container."
