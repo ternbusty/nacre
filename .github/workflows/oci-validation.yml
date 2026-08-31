@@ -123,6 +123,13 @@ jobs:
           cat > /tmp/run-validation.sh << 'VALIDATION_SCRIPT'
           #!/usr/bin/env bash
           set +e
+          # Close ALL fds > 2 so no child process can inherit the Actions log
+          # pipe fd (which the runner leaks on fd 3+).  stdout/stderr are
+          # already redirected to /tmp/validation-main.log by the caller.
+          for _fd in /proc/self/fd/*; do
+            _n=$(basename "$_fd")
+            [ "$_n" -gt 2 ] 2>/dev/null && eval "exec ${_n}>&-" 2>/dev/null || true
+          done
           cd $HOME/runtime-tools
           RUNTIME=/opt/nacre/bin
           OUTDIR=$HOME/validation-out
