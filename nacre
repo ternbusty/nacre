@@ -505,15 +505,19 @@ sub get_pid_starttime {
 
 sub oci_state_json {
     my ($state) = @_;
-    return {
-        ociVersion => $state->{ociVersion} // '1.2.0',
-        id         => $state->{id},
-        status     => $state->{status},
-        pid        => $state->{pid} + 0,
-        bundle     => $state->{bundle},
+    my $out = {
+        ociVersion  => $state->{ociVersion} // '1.2.0',
+        id          => $state->{id},
+        status      => $state->{status},
+        bundle      => $state->{bundle},
         annotations => $state->{annotations} // {},
         created     => $state->{created} // '',
     };
+    # OCI spec: pid MUST NOT be present when the container is stopped
+    if ($state->{status} ne 'stopped') {
+        $out->{pid} = $state->{pid} + 0;
+    }
+    return $out;
 }
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -767,7 +771,7 @@ my @DEFAULT_DEVICES = (
     { path => '/dev/zero',    type => 'c', major => 1, minor => 5, mode => 0o666 },
     { path => '/dev/full',    type => 'c', major => 1, minor => 7, mode => 0o666 },
     { path => '/dev/random',  type => 'c', major => 1, minor => 8, mode => 0o666 },
-    { path => '/dev/urandom', type => 'c', major => 1, minor => 9, mode => 0o444 },
+    { path => '/dev/urandom', type => 'c', major => 1, minor => 9, mode => 0o666 },
     { path => '/dev/tty',     type => 'c', major => 5, minor => 0, mode => 0o666 },
 );
 
@@ -780,12 +784,25 @@ my @DEFAULT_SYMLINKS = (
     { path => '/dev/ptmx',   target => 'pts/ptmx'          },
 );
 
+my %PROPAGATION_FLAGS = (
+    slave    => MS_SLAVE    | MS_REC,
+    rslave   => MS_SLAVE    | MS_REC,
+    private  => MS_PRIVATE  | MS_REC,
+    rprivate => MS_PRIVATE  | MS_REC,
+    shared   => MS_SHARED   | MS_REC,
+    rshared  => MS_SHARED   | MS_REC,
+    unbindable  => MS_UNBINDABLE | MS_REC,
+    runbindable => MS_UNBINDABLE | MS_REC,
+);
+
 sub prepare_rootfs {
     my ($spec, $rootfs) = @_;
 
-    # Make everything slave to avoid mount events leaking
-    do_mount('', '/', '', MS_SLAVE | MS_REC, '')
-        or fatal("mount rslave /: $!");
+    # Apply rootfs propagation from spec (default: rslave)
+    my $propagation = $spec->{linux}{rootfsPropagation} // 'rslave';
+    my $prop_flags = $PROPAGATION_FLAGS{$propagation} // (MS_SLAVE | MS_REC);
+    do_mount('', '/', '', $prop_flags, '')
+        or fatal("mount propagation ($propagation) /: $!");
 
     # Bind mount rootfs on itself
     do_mount($rootfs, $rootfs, '', MS_BIND | MS_REC, '')
@@ -805,7 +822,18 @@ sub apply_mounts {
     my ($spec, $rootfs) = @_;
     for my $m (@{$spec->{mounts} // []}) {
         my $dest = "$rootfs$m->{destination}";
-        ensure_dir($dest);
+        my $mount_src = $m->{source} // '';
+        # For bind mounts of files, create a file mount point instead of dir
+        if ($mount_src ne '' && -f $mount_src && grep { $_ eq 'bind' || $_ eq 'rbind' } @{$m->{options} // []}) {
+            my $parent = dirname($dest);
+            ensure_dir($parent);
+            if (!-e $dest) {
+                open my $fh, '>', $dest;
+                close $fh if $fh;
+            }
+        } else {
+            ensure_dir($dest);
+        }
 
         my ($flags, $data) = parse_mount_options($m->{options});
         my $type = $m->{type} // '';
@@ -832,9 +860,9 @@ sub create_devices {
 
     my @devices = @DEFAULT_DEVICES;
 
-    # Add spec devices
+    # Spec devices override defaults by path
     for my $d (@{$spec->{linux}{devices} // []}) {
-        push @devices, {
+        my $spec_dev = {
             path  => $d->{path},
             type  => $d->{type} // 'c',
             major => $d->{major} // 0,
@@ -843,6 +871,15 @@ sub create_devices {
             uid   => $d->{uid},
             gid   => $d->{gid},
         };
+        my $found = 0;
+        for my $i (0..$#devices) {
+            if ($devices[$i]{path} eq $spec_dev->{path}) {
+                $devices[$i] = $spec_dev;
+                $found = 1;
+                last;
+            }
+        }
+        push @devices, $spec_dev unless $found;
     }
 
     for my $dev (@devices) {
@@ -1486,11 +1523,11 @@ sub apply_process_security {
         do_syscall(SYS_setgroups, 0, '');
     }
 
-    # 7. setgid then setuid
+    # 7. setgid then setuid (always call — uid/gid 0 is valid)
     my $gid = $proc->{user}{gid} // 0;
     my $uid = $proc->{user}{uid} // 0;
-    POSIX::setgid($gid) if $gid;
-    POSIX::setuid($uid) if $uid;
+    POSIX::setgid($gid + 0);
+    POSIX::setuid($uid + 0);
 }
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1604,7 +1641,7 @@ sub run_hooks {
 # ═══════════════════════════════════════════════════════════════════════
 
 sub run_init_process {
-    my ($spec, $rootfs, $notify_fd, $main_chan_w, $main_chan_r, $cgpath) = @_;
+    my ($spec, $rootfs, $notify_fd, $main_chan_w, $main_chan_r, $cgpath, $id, $bundle) = @_;
 
     # Setup rootfs (mounts, devices, symlinks)
     prepare_rootfs($spec, $rootfs);
@@ -1632,9 +1669,9 @@ sub run_init_process {
     # Set rootfs readonly if requested
     set_rootfs_readonly($spec->{root}{readonly});
 
-    # chdir to cwd
+    # chdir to cwd (OCI spec: MUST fail if cwd doesn't exist)
     my $cwd = $spec->{process}{cwd} // '/';
-    chdir($cwd) or warn "nacre: chdir $cwd: $!\n";
+    chdir($cwd) or fatal("chdir to cwd '$cwd': $!");
 
     # Signal main process: init ready
     channel_send($main_chan_w, { type => 'init_ready' });
@@ -1642,8 +1679,20 @@ sub run_init_process {
     # Wait for start signal
     wait_for_start($notify_fd);
 
-    # Run startContainer hooks
-    # (hooks run in the container namespace)
+    # Run startContainer hooks (run inside the container namespace)
+    if (my $hooks = $spec->{hooks}) {
+        if ($hooks->{startContainer}) {
+            my $hook_state = {
+                ociVersion => $spec->{ociVersion} // '1.2.0',
+                id         => $id // '',
+                status     => 'running',
+                pid        => $$,
+                bundle     => $bundle // '',
+                annotations => $spec->{annotations} // {},
+            };
+            run_hooks($hooks->{startContainer}, $hook_state);
+        }
+    }
 
     # Apply process security (NNP, seccomp, caps, setuid/setgid)
     apply_process_security($spec);
@@ -1777,11 +1826,12 @@ sub cmd_create {
 
     $bundle = abs_path($bundle);
 
-    # Check container doesn't already exist
+    # Check container doesn't already exist (OCI spec: MUST error if ID not unique)
     if (-d state_dir($root, $id)) {
         my $s = eval { load_state($root, $id) };
-        fatal("container '$id' already exists") if $s && $s->{status} ne 'stopped';
-        delete_state($root, $id) if $s;
+        fatal("container '$id' already exists") if $s;
+        # Directory exists but no valid state — clean up stale state
+        delete_state($root, $id);
     }
 
     my $spec = load_spec($bundle);
@@ -1912,7 +1962,7 @@ sub cmd_create {
         my $notify_srv = create_notify_listener($notify_path);
 
         # Run the init process
-        run_init_process($spec, $rootfs, $notify_srv, $main_w_fd, $init_r_fd, $cgpath);
+        run_init_process($spec, $rootfs, $notify_srv, $main_w_fd, $init_r_fd, $cgpath, $id, $bundle);
         _exit(1);  # Should not reach here
     }
 
@@ -1923,6 +1973,7 @@ sub cmd_create {
     # Handle messages from child
     my $init_pid;
     my $mapping_written = 0;
+    my $init_ready = 0;
 
     while (1) {
         my $msg = channel_recv($main_r_fd);
@@ -1945,6 +1996,7 @@ sub cmd_create {
             }
         }
         elsif ($msg->{type} eq 'init_ready') {
+            $init_ready = 1;
             last;
         }
     }
@@ -1953,6 +2005,14 @@ sub cmd_create {
     waitpid($child_pid, 0);
 
     fatal("init process failed to start") unless $init_pid;
+
+    # Check init process is actually alive and init_ready was received
+    unless ($init_ready) {
+        # Init process died during setup — try to get exit status
+        my $w = waitpid($init_pid, WNOHANG);
+        my $exit_msg = ($w > 0) ? " (exit status " . ($? >> 8) . ")" : "";
+        fatal("init process died during container setup${exit_msg}");
+    }
 
     # If cgroup wasn't set up yet (no CLONE_NEWCGROUP path)
     unless ($clone_flags & CLONE_NEWCGROUP) {
@@ -1987,6 +2047,7 @@ sub cmd_create {
     # Run createRuntime hooks
     if (my $hooks = $spec->{hooks}) {
         run_hooks($hooks->{createRuntime}, $state);
+        run_hooks($hooks->{createContainer}, $state);
         run_hooks($hooks->{prestart}, $state);
     }
 

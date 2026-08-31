@@ -211,6 +211,20 @@ jobs:
             fi
           done
 
+      - name: Show error test logs (no TAP output)
+        if: always()
+        run: |
+          for f in ~/validation-out/*.log; do
+            [ -f "$f" ] || continue
+            n_ok=$(grep -c "^ok " "$f" 2>/dev/null || true)
+            n_notok=$(grep -c "^not ok " "$f" 2>/dev/null || true)
+            if [ "${n_ok:-0}" -eq 0 ] && [ "${n_notok:-0}" -eq 0 ] && [ -s "$f" ]; then
+              echo "=== $(basename "$f") ==="
+              head -50 "$f"
+              echo ""
+            fi
+          done
+
       - name: Fail on validation failures
         if: steps.run-validation.outputs.validation_fail != '0' || steps.run-validation.outputs.validation_error != '0'
         run: |
