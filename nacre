@@ -1834,8 +1834,12 @@ sub cmd_create {
         for my $ns (@join_ns) {
             my $ns_fd;
             sysopen($ns_fd, $ns->{path}, O_RDONLY) or fatal("open ns $ns->{path}: $!");
-            do_syscall_int(SYS_setns, fileno($ns_fd), $ns->{info}{flag})
-                == 0 or fatal("setns $ns->{type}: $!");
+            my $nr  = SYS_setns + 0;
+            my $fd  = fileno($ns_fd) + 0;
+            my $flg = $ns->{info}{flag} + 0;
+            my $r;
+            do { $r = syscall($nr, $fd, $flg) } while ($r == -1 && $! == EINTR);
+            $r == 0 or fatal("setns $ns->{type}: $!");
             close $ns_fd;
         }
 
@@ -1843,8 +1847,11 @@ sub cmd_create {
         my $unshare_flags = $clone_flags & ~CLONE_NEWPID & ~CLONE_NEWCGROUP;
         if ($has_userns) {
             # Unshare user namespace first
-            do_syscall_int(SYS_unshare, CLONE_NEWUSER)
-                == 0 or fatal("unshare NEWUSER: $!");
+            my $nr  = SYS_unshare + 0;
+            my $flg = CLONE_NEWUSER + 0;
+            my $r;
+            do { $r = syscall($nr, $flg) } while ($r == -1 && $! == EINTR);
+            $r == 0 or fatal("unshare NEWUSER: $!");
             $unshare_flags &= ~CLONE_NEWUSER;
 
             # Signal parent to write UID/GID mappings
@@ -1856,50 +1863,25 @@ sub cmd_create {
         }
 
         # Unshare remaining namespaces (not PID, not cgroup).
+        # Use inline scalar variables for syscall() args — Perl's syscall()
+        # inspects SV type flags; constants and @_ aliases from map can carry
+        # stale POK flags that cause the kernel arg to be misinterpreted.
+        # Fresh lexical scalars (with $x + 0 coercion) ensure clean IOK SVs.
         if ($unshare_flags) {
-            # Debug: test raw syscall in this process context
-            {
-                my $dbg_nr  = SYS_unshare + 0;
-                my $dbg_flg = $unshare_flags + 0;
-                warn sprintf("nacre-debug: unshare combined: nr=%d flags=0x%x\n",
-                             $dbg_nr, $dbg_flg);
-                # Test with a raw syscall call (fresh IV args)
-                my $raw_ret = syscall($dbg_nr, $dbg_flg);
-                my $raw_err = int($!);
-                warn sprintf("nacre-debug: raw syscall(%d, 0x%x) = %d errno=%d (%s)\n",
-                             $dbg_nr, $dbg_flg, $raw_ret, $raw_err, $!);
-            }
-            # If the debug raw syscall above succeeded, do_syscall_int should
-            # also succeed (the namespace is already unshared).
-            # If it failed, try per-flag fallback.
-            if (do_syscall_int(SYS_unshare, $unshare_flags) != 0) {
-                my $comb_err = int($!);
-                warn sprintf("nacre-debug: do_syscall_int combined failed errno=%d (%s)\n",
-                             $comb_err, $!);
-                my @ordered = (
-                    [CLONE_NEWUSER,  'user'],
-                    [CLONE_NEWNS,    'mount'],
-                    [CLONE_NEWUTS,   'uts'],
-                    [CLONE_NEWIPC,   'ipc'],
-                    [CLONE_NEWNET,   'net'],
-                    [CLONE_NEWTIME,  'time'],
-                );
-                for my $pair (@ordered) {
-                    my ($flag, $name) = @$pair;
-                    next unless $unshare_flags & $flag;
-                    my $r = do_syscall_int(SYS_unshare, $flag);
-                    my $e = int($!);
-                    warn sprintf("nacre-debug: unshare %s (0x%x) = %d errno=%d (%s)\n",
-                                 $name, $flag, $r, $e, $!);
-                    $r == 0 or fatal("unshare $name: $!");
-                }
-            }
+            my $nr  = SYS_unshare + 0;
+            my $flg = $unshare_flags + 0;
+            my $ret;
+            do { $ret = syscall($nr, $flg) } while ($ret == -1 && $! == EINTR);
+            $ret == 0 or fatal(sprintf("unshare(0x%x): $!", $unshare_flags));
         }
 
         # Fork again for PID namespace (child becomes PID 1 in new PID ns)
         if ($has_pidns) {
-            do_syscall_int(SYS_unshare, CLONE_NEWPID)
-                == 0 or fatal("unshare NEWPID: $!");
+            my $nr  = SYS_unshare + 0;
+            my $flg = CLONE_NEWPID + 0;
+            my $ret;
+            do { $ret = syscall($nr, $flg) } while ($ret == -1 && $! == EINTR);
+            $ret == 0 or fatal("unshare NEWPID: $!");
         }
 
         my $init_pid = fork();
@@ -1919,7 +1901,11 @@ sub cmd_create {
             # Wait until parent has set up cgroups
             my $msg = channel_recv($init_r_fd);
             # Then unshare
-            do_syscall_int(SYS_unshare, CLONE_NEWCGROUP);
+            my $nr  = SYS_unshare + 0;
+            my $flg = CLONE_NEWCGROUP + 0;
+            my $r;
+            do { $r = syscall($nr, $flg) } while ($r == -1 && $! == EINTR);
+            # cgroup unshare failure is non-fatal (best-effort)
         }
 
         # Create notify listener
@@ -2281,9 +2267,12 @@ sub cmd_exec {
     if ($child == 0) {
         # Join namespaces
         for my $ns (@ns_fds) {
-            my $flag = 0;  # setns auto-detects from fd
-            do_syscall_int(SYS_setns, $ns->{fileno}, 0)
-                == 0 or warn "nacre: setns $ns->{name}: $!\n";
+            my $nr  = SYS_setns + 0;
+            my $fd  = $ns->{fileno} + 0;
+            my $flg = 0;
+            my $r;
+            do { $r = syscall($nr, $fd, $flg) } while ($r == -1 && $! == EINTR);
+            $r == 0 or warn "nacre: setns $ns->{name}: $!\n";
         }
 
         # chdir
