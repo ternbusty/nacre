@@ -344,6 +344,24 @@ sub fatal {
     die "nacre: @_\n";
 }
 
+# Parse human-readable byte sizes: 50M, 1G, 1024, -1
+# Returns integer bytes, or -1 for "unlimited".
+sub parse_size {
+    my ($s) = @_;
+    return undef unless defined $s;
+    $s =~ s/^\s+|\s+$//g;
+    return -1 if $s eq '-1';
+    if ($s =~ /^(-?\d+)$/i) {
+        return int($1);
+    } elsif ($s =~ /^(\d+(?:\.\d+)?)\s*([kmgtpe])b?$/i) {
+        my ($n, $u) = ($1, lc $2);
+        my %mult = (k => 1024, m => 1024**2, g => 1024**3,
+                     t => 1024**4, p => 1024**5, e => 1024**6);
+        return int($n * ($mult{$u} // 1));
+    }
+    fatal("invalid size: '$s'");
+}
+
 sub write_file {
     my ($path, $content) = @_;
     open my $fh, '>', $path or fatal("write $path: $!");
@@ -731,8 +749,15 @@ sub cgroup_apply_resources {
             cg_write($cgpath, 'cpu.weight', $weight);
         }
         if (defined $cpu->{quota} || defined $cpu->{period}) {
-            my $quota  = $cpu->{quota}  // 'max';
-            my $period = $cpu->{period} // 100000;
+            # When only one of quota/period is being updated, read the
+            # current value of the other from cpu.max.
+            my ($cur_quota, $cur_period) = ('max', 100000);
+            my $cur = read_file("$cgpath/cpu.max");
+            if (defined $cur && $cur =~ /^(\S+)\s+(\d+)/) {
+                ($cur_quota, $cur_period) = ($1, int($2));
+            }
+            my $quota  = $cpu->{quota}  // $cur_quota;
+            my $period = $cpu->{period} // $cur_period;
             cg_write($cgpath, 'cpu.max', "$quota $period");
         }
         if (defined $cpu->{burst}) {
@@ -841,9 +866,13 @@ sub cg_write {
 
 sub convert_cpu_shares {
     my ($shares) = @_;
-    return 100 if !$shares || $shares < 2;
-    return 1 if $shares == 2;
-    return int(1 + (($shares - 2) * 9999 / 262142));
+    return 0 if !$shares || $shares == 0;
+    return 1 if $shares <= 2;
+    return 10000 if $shares >= 262144;
+    # Logarithmic conversion matching runc's ConvertCPUSharesToCgroupV2Value
+    my $l = log($shares) / log(2);
+    my $exponent = ($l * $l + 125 * $l) / 612.0 - 7.0/34.0;
+    return int(exp($exponent * log(10)) + 0.99);
 }
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -4701,11 +4730,12 @@ sub cmd_update {
         # Build resources from CLI flags
         $resources = {};
         if (defined $p{pids_limit}) {
-            $resources->{pids} = { limit => $p{pids_limit} };
+            my $v = $p{pids_limit};
+            $resources->{pids} = { limit => ($v == -1) ? 'max' : $v };
         }
         my %cpu;
         $cpu{shares} = $p{cpu_share}   if defined $p{cpu_share};
-        $cpu{quota}  = $p{cpu_quota}   if defined $p{cpu_quota};
+        $cpu{quota}  = ($p{cpu_quota} == -1 ? 'max' : $p{cpu_quota}) if defined $p{cpu_quota};
         $cpu{period} = $p{cpu_period}  if defined $p{cpu_period};
         $cpu{burst}  = $p{cpu_burst}   if defined $p{cpu_burst};
         $cpu{idle}   = $p{cpu_idle}    if defined $p{cpu_idle};
@@ -4713,9 +4743,18 @@ sub cmd_update {
         $cpu{mems}   = $p{cpuset_mems} if defined $p{cpuset_mems};
         $resources->{cpu} = \%cpu if %cpu;
         my %mem;
-        $mem{limit}       = $p{memory}             if defined $p{memory};
-        $mem{swap}        = $p{memory_swap}        if defined $p{memory_swap};
-        $mem{reservation} = $p{memory_reservation} if defined $p{memory_reservation};
+        if (defined $p{memory}) {
+            my $v = parse_size($p{memory});
+            $mem{limit} = ($v == -1) ? 'max' : $v;
+        }
+        if (defined $p{memory_swap}) {
+            my $v = parse_size($p{memory_swap});
+            $mem{swap} = ($v == -1) ? 'max' : $v;
+        }
+        if (defined $p{memory_reservation}) {
+            my $v = parse_size($p{memory_reservation});
+            $mem{reservation} = ($v == -1) ? 'max' : $v;
+        }
         $resources->{memory} = \%mem if %mem;
     }
 
@@ -5122,9 +5161,9 @@ sub main {
             'cpu-quota=i'         => \$cpu_quota,
             'cpu-share=i'         => \$cpu_share,
             'cpu-burst=i'         => \$cpu_burst,
-            'memory=i'            => \$memory,
-            'memory-swap=i'       => \$memory_swap,
-            'memory-reservation=i' => \$memory_reservation,
+            'memory=s'            => \$memory,
+            'memory-swap=s'       => \$memory_swap,
+            'memory-reservation=s' => \$memory_reservation,
             'cpuset-cpus=s'       => \$cpuset_cpus,
             'cpuset-mems=s'       => \$cpuset_mems,
             'cpu-idle=i'          => \$cpu_idle,
