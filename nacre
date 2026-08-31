@@ -509,7 +509,6 @@ sub default_spec {
                 bounding   => [qw(CAP_AUDIT_WRITE CAP_KILL CAP_NET_BIND_SERVICE)],
                 effective  => [qw(CAP_AUDIT_WRITE CAP_KILL CAP_NET_BIND_SERVICE)],
                 permitted  => [qw(CAP_AUDIT_WRITE CAP_KILL CAP_NET_BIND_SERVICE)],
-                ambient    => [qw(CAP_AUDIT_WRITE CAP_KILL CAP_NET_BIND_SERVICE)],
             },
             rlimits => [
                 { type => 'RLIMIT_NOFILE', hard => 1024, soft => 1024 },
@@ -743,6 +742,17 @@ sub cgroup_apply_resources {
         my $new_val = (defined $new_limit && $new_limit ne 'max')
                         ? int($new_limit) : ~0;
 
+        # cgroup v2: memory.swap.max = swap-only, but OCI spec's "swap"
+        # field is memory+swap total.  Convert: swap_only = swap - limit.
+        if (defined $new_swap && $new_swap ne 'max') {
+            my $mem_for_sub = (defined $new_limit && $new_limit ne 'max')
+                              ? int($new_limit) : $cur_val;
+            if ($mem_for_sub != ~0) {
+                $new_swap = int($new_swap) - int($mem_for_sub);
+                $new_swap = 0 if $new_swap < 0;
+            }
+        }
+
         if ($new_val > $cur_val) {
             # Increasing memory.max — write limit first so swap stays valid
             cg_write($cgpath, 'memory.max',      $new_limit) if defined $new_limit;
@@ -771,7 +781,7 @@ sub cgroup_apply_resources {
             }
             my $quota  = $cpu->{quota}  // $cur_quota;
             my $period = $cpu->{period} // $cur_period;
-            cg_write($cgpath, 'cpu.max', "$quota $period");
+            cg_write($cgpath, 'cpu.max', "$quota $period", fatal => 1);
         }
         if (defined $cpu->{burst}) {
             cg_write($cgpath, 'cpu.max.burst', $cpu->{burst});
@@ -889,10 +899,16 @@ sub cgroup_pids {
 }
 
 sub cg_write {
-    my ($cgpath, $file, $value) = @_;
+    my ($cgpath, $file, $value, %opts) = @_;
     my $path = "$cgpath/$file";
     eval { write_file($path, "$value\n"); };
-    # Non-fatal: some cgroup files may not exist
+    if ($@ && $opts{fatal}) {
+        my $err = $@;
+        $err =~ s/ at \S+ line \d+.*//s;
+        chomp $err;
+        fatal("unable to write $file: $err");
+    }
+    # Non-fatal by default: some cgroup files may not exist
 }
 
 sub convert_cpu_shares {
@@ -1658,8 +1674,24 @@ sub apply_mounts {
                     or warn "nacre: remount $dest: $!\n";
             }
         } else {
-            do_mount($src, $dest, $type, $flags, $data)
+            # Propagation flags (MS_PRIVATE, MS_SHARED, MS_SLAVE, MS_UNBINDABLE)
+            # cannot be combined with a filesystem mount in a single mount(2)
+            # call — split them off and apply after the mount.
+            my $prop_mask = MS_PRIVATE | MS_SHARED | MS_SLAVE | MS_UNBINDABLE;
+            my $prop_flags = $flags & ($prop_mask | MS_REC);
+            my $mount_flags = $flags & ~$prop_mask;
+            # If ONLY propagation flags + MS_REC were set, strip MS_REC from
+            # the mount call (it's for propagation, not the fs mount).
+            if ($prop_flags && !($mount_flags & ~MS_REC)) {
+                $mount_flags &= ~MS_REC;
+            }
+            do_mount($src, $dest, $type, $mount_flags, $data)
                 or do { warn "nacre: mount $type on $dest: $!\n"; next; };
+            # Now apply propagation flags if any
+            if ($prop_flags & $prop_mask) {
+                do_mount('', $dest, '', $prop_flags, '')
+                    or warn "nacre: mount propagation $dest: $!\n";
+            }
         }
 
         # Apply recursive mount attributes via mount_setattr()
@@ -2980,6 +3012,15 @@ sub apply_process_security {
         do_syscall(SYS_prctl, PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
     }
 
+    # 3b. Rlimits — must be applied BEFORE dropping caps, because
+    #     raising hard limits beyond the current value requires
+    #     CAP_SYS_RESOURCE (which may not be in the target cap sets).
+    apply_rlimits($spec);
+
+    # 3c. Scheduler — must be applied BEFORE dropping caps, because
+    #     SCHED_DEADLINE and SCHED_FIFO require CAP_SYS_NICE.
+    apply_scheduler($spec);
+
     # 4. Seccomp (must be applied before dropping caps)
     my $seccomp_notify_fd = apply_seccomp_raw($spec);
 
@@ -3528,7 +3569,7 @@ sub run_hooks {
     return unless $hooks;
     my $must_succeed = $opts{must_succeed} // 0;
     my $hook_type    = $opts{type} // '';
-    my $hook_idx     = 1;  # runc uses 1-based indexing
+    my $hook_idx     = 0;  # runc uses 0-based indexing
     for my $hook (@$hooks) {
         # Prepare state JSON and pipe BEFORE forking so the child inherits
         # a real file descriptor that survives exec().
@@ -3812,14 +3853,12 @@ sub run_init_process {
         }
     }
 
-    # Apply rlimits
-    apply_rlimits($spec);
+    # (rlimits are applied in apply_process_security, before caps drop)
 
     # Apply IO priority
     apply_iopriority($spec);
 
-    # Apply scheduler
-    apply_scheduler($spec);
+    # (scheduler is applied in apply_process_security, before caps drop)
 
     # Apply memory policy
     apply_memory_policy($spec);
@@ -3839,7 +3878,7 @@ sub run_init_process {
     my @args = @{$spec->{process}{args} // ['sh']};
     $dbg->("exec: " . join(' ', @args) . " (PATH=$ENV{PATH})");
     # The debug fd is marked CLOEXEC (or closed by fallback); exec closes it.
-    { exec { $args[0] } @args };
+    { no warnings 'exec'; exec { $args[0] } @args };
     # runc-compatible error format — write directly to stderr and _exit.
     # The channel fd is already closed (fd cleanup loop above), so
     # fatal() → die → eval would lose the message.  runc also writes
@@ -5169,7 +5208,7 @@ sub cmd_exec {
                         @{$spec->{linux}{namespaces} // []};
 
     # Open namespace fds — only for namespaces in the spec
-    my @ns_order = qw(user mnt uts ipc net pid cgroup);
+    my @ns_order = qw(user mnt uts ipc net time pid cgroup);
     my @ns_fds;
     for my $ns (@ns_order) {
         my $spec_type = $procfs_to_spec{$ns} // $ns;
@@ -5307,6 +5346,9 @@ sub cmd_exec {
             sysopen(my $pts, $pts_path, O_RDWR)
                 or do { syswrite($err_w, "open PTY slave $pts_path: $!"); _exit(255); };
             my $pts_fd = fileno($pts);
+            # chown PTY to container user with gid 5 (tty group), matching runc
+            my $exec_uid = $exec_proc->{user}{uid} // $spec->{process}{user}{uid} // 0;
+            do_syscall(SYS_fchown, $pts_fd, $exec_uid, 5);
             POSIX::dup2($pts_fd, 0);
             POSIX::dup2($pts_fd, 1);
             POSIX::dup2($pts_fd, 2);
@@ -5630,7 +5672,11 @@ sub cmd_update {
         $cpu{quota}  = ($p{cpu_quota} == -1 ? 'max' : $p{cpu_quota}) if defined $p{cpu_quota};
         $cpu{period} = $p{cpu_period}  if defined $p{cpu_period};
         $cpu{burst}  = $p{cpu_burst}   if defined $p{cpu_burst};
-        $cpu{idle}   = $p{cpu_idle}    if defined $p{cpu_idle};
+        if (defined $p{cpu_idle}) {
+            fatal("invalid cpu-idle value: $p{cpu_idle} (must be 0 or 1)")
+                unless $p{cpu_idle} == 0 || $p{cpu_idle} == 1;
+            $cpu{idle} = $p{cpu_idle};
+        }
         $cpu{cpus}   = $p{cpuset_cpus} if defined $p{cpuset_cpus};
         $cpu{mems}   = $p{cpuset_mems} if defined $p{cpuset_mems};
         $resources->{cpu} = \%cpu if %cpu;
