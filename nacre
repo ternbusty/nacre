@@ -2557,27 +2557,15 @@ sub cmd_start {
     fatal("container '$id' is not in 'created' state (is '$state->{status}')")
         unless $state->{status} eq 'created';
 
-    # OCI spec: start MUST generate an error if process was not set.
-    # Use the cached spec snapshot from create time (config.json
+    # Load the cached spec snapshot from create time (config.json
     # modifications after create MUST NOT affect the container).
     my $spec = eval { load_cached_spec($root, $id, $state->{bundle}) };
     fatal("cannot load config: $@") unless $spec;
-    unless ($spec->{process} && $spec->{process}{args} && @{$spec->{process}{args}}) {
-        # Kill the init process so the container transitions to "stopped"
-        # and can be cleaned up.  cmd_create runs a fallback init even
-        # when process is unset; leaving it alive would strand the
-        # container in "created" state forever.  Wrap in eval so cleanup
-        # failures don't change the exit code from fatal().
-        eval {
-            if (my $pid = $state->{pid}) {
-                kill(9, $pid) if $pid > 0;
-            }
-            $state->{status} = 'stopped';
-            $state->{pid} = 0;
-            save_state($root, $state);
-        };
-        fatal("process is not set in config.json — cannot start container");
-    }
+
+    # process.args may be empty or process may be nil — the OCI spec
+    # allows omitting spec.process entirely.  In that case, create/start
+    # still succeeds and the init process exits cleanly without exec'ing
+    # a user program (matches kontainer-runtime / runc behaviour).
 
     # Connect to notify socket
     my $notify_path = state_dir($root, $id) . '/notify.sock';
@@ -2763,9 +2751,6 @@ sub cmd_run {
             # +24 si_status (int)
             my $si_code   = unpack('i', substr($siginfo, 8, 4));
             my $si_status = unpack('i', substr($siginfo, 24, 4));
-            warn "nacre-dbg: waitid ok code=$si_code status=$si_status hex=" .
-                 unpack('H*', substr($siginfo, 0, 32)) . "\n"
-                if $ENV{NACRE_RUN_DEBUG};
             if ($si_code == 1) {    # CLD_EXITED
                 $exit_code = $si_status;
             } else {
