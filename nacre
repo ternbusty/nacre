@@ -822,12 +822,30 @@ sub cgroup_apply_resources {
                 cg_write($cgpath, 'io.max', "$d->{major}:$d->{minor} wbps=$d->{rate}");
             }
         }
+        if (my $tbd = $bio->{throttleReadIOPSDevice}) {
+            for my $d (@$tbd) {
+                cg_write($cgpath, 'io.max', "$d->{major}:$d->{minor} riops=$d->{rate}");
+            }
+        }
+        if (my $tbd = $bio->{throttleWriteIOPSDevice}) {
+            for my $d (@$tbd) {
+                cg_write($cgpath, 'io.max', "$d->{major}:$d->{minor} wiops=$d->{rate}");
+            }
+        }
     }
 
     # Unified (raw cgroup file writes)
     if (my $u = $res->{unified}) {
         for my $key (keys %$u) {
-            cg_write($cgpath, $key, $u->{$key});
+            my $val = $u->{$key};
+            # Multi-line values: write each line separately (cgroup files
+            # like io.max only process one device-line per write syscall)
+            for my $line (split /\n/, $val) {
+                $line =~ s/^\s+//;
+                $line =~ s/\s+$//;
+                next unless $line ne '';
+                cg_write($cgpath, $key, $line);
+            }
         }
     }
 }
@@ -1837,7 +1855,10 @@ sub apply_rootfs_propagation {
 
 sub apply_masked_paths {
     my ($paths) = @_;
+    my %seen;
     for my $p (@{$paths // []}) {
+        # Deduplicate: don't mask the same path twice (runc compat)
+        next if $seen{$p}++;
         # Security: refuse to mask through symlinks — a symlink at /proc
         # or /sys could redirect the mask to an attacker-controlled path.
         if (-l $p) {
@@ -1855,8 +1876,14 @@ sub apply_masked_paths {
             do_mount('tmpfs', $p, 'tmpfs', MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, 'size=0');
         } elsif (-e $p) {
             do_mount('/dev/null', $p, '', MS_BIND, '');
-            # Remount as read-only so rm/write gives EROFS, matching runc behavior
-            do_mount('', $p, '', MS_REMOUNT | MS_BIND | MS_RDONLY, '');
+            # Remount as read-only so rm/write gives EROFS, matching runc behavior.
+            # The remount must carry the mount flags from the underlying fs
+            # (devtmpfs has nosuid+noexec on many distros).  Try the most
+            # restrictive combo first, then relax.
+            do_mount('', $p, '', MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, '')
+             || do_mount('', $p, '', MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NOSUID | MS_NODEV, '')
+             || do_mount('', $p, '', MS_REMOUNT | MS_BIND | MS_RDONLY, '')
+             || log_debug("maskedPaths: could not remount $p read-only: $!");
         }
     }
 }
@@ -1953,7 +1980,10 @@ sub apply_capabilities_final {
     # Raise ambient capabilities
     for my $name (@{$caps->{ambient} // []}) {
         my $n = $CAP_NUM{$name} // next;
-        do_syscall(SYS_prctl, PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, $n, 0, 0);
+        my $ret = do_syscall(SYS_prctl, PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, $n, 0, 0);
+        if ($ret == -1) {
+            warn "nacre: can't raise ambient capability $name: $!\n";
+        }
     }
 }
 
@@ -2476,10 +2506,11 @@ sub apply_device_cgroup {
     my $cgdir_fd = fileno($cgdir_fh);
 
     # bpf_attr for BPF_PROG_ATTACH
+    # struct { __u32 target_fd, attach_bpf_fd, attach_type, attach_flags }
     my $attach_attr = pack('L L L L',
-        BPF_CGROUP_DEVICE,  # attach_type at offset 0
-        $cgdir_fd,          # target_fd at offset 4
-        $prog_fd,           # attach_bpf_fd at offset 8
+        $cgdir_fd,          # target_fd at offset 0
+        $prog_fd,           # attach_bpf_fd at offset 4
+        BPF_CGROUP_DEVICE,  # attach_type at offset 8
         BPF_F_ALLOW_MULTI,  # attach_flags at offset 12
     );
     $attach_attr .= "\0" x (256 - length($attach_attr)) if length($attach_attr) < 256;
@@ -3283,7 +3314,7 @@ sub apply_exec_cpu_affinity {
             # Log in nsexec-compatible format for bats tests
             my $hex_mask = 0;
             for my $c (@cpus) { $hex_mask |= (1 << $c); }
-            $dbg->(sprintf("nsexec container setup: affinity: 0x%x", $hex_mask)) if $dbg;
+            $dbg->(sprintf("nsexec: affinity: 0x%x", $hex_mask)) if $dbg;
         }
     }
 
@@ -3311,13 +3342,17 @@ sub apply_final_cpu_affinity {
 # ═══════════════════════════════════════════════════════════════════════
 
 sub apply_exec_caps {
-    # Apply capabilities added via `runc exec --cap CAP_FOO --cap CAP_BAR`.
-    # runc semantics: --cap adds to bounding+permitted+effective.
-    # If the container's spec has inheritable caps, also add to ambient.
+    # Apply capabilities for exec'd processes.
+    # Always applies the container's capability config from the spec.
+    # If $cap_list has entries (from --cap), those are added to
+    # bounding+permitted+effective (runc semantics).
     my ($cap_list, $spec) = @_;
-    return unless $cap_list && @$cap_list;
 
-    my $spec_caps = $spec->{process}{capabilities} // {};
+    my $spec_caps = $spec->{process}{capabilities};
+    # If no capabilities in spec and no --cap additions, nothing to do
+    return unless $spec_caps || ($cap_list && @$cap_list);
+    $spec_caps //= {};
+
     my $has_inheritable = $spec_caps->{inheritable} && @{$spec_caps->{inheritable}};
 
     # Build the full capability sets from spec + additions
@@ -3327,7 +3362,7 @@ sub apply_exec_caps {
     my %inh_caps  = map { $_ => 1 } @{$spec_caps->{inheritable}// []};
     my %amb_caps  = map { $_ => 1 } @{$spec_caps->{ambient}    // []};
 
-    for my $cap (@$cap_list) {
+    for my $cap (@{$cap_list // []}) {
         my $name = $cap;
         $name = "CAP_$name" unless $name =~ /^CAP_/;
         $name = uc($name);
@@ -3758,9 +3793,8 @@ sub run_main_process {
     my $rootfs = $spec->{root}{path} // 'rootfs';
     $rootfs = "$bundle/$rootfs" unless $rootfs =~ m{^/};
 
-    # Setup cgroup
-    eval { cgroup_setup($cgpath, $spec); };
-    warn "nacre: cgroup setup: $@" if $@;
+    # Setup cgroup — don't silence "non-empty cgroup" errors
+    cgroup_setup($cgpath, $spec) if $cgpath;
 
     # Add init process to cgroup
     eval { cgroup_add_process($cgpath, $init_pid); };
@@ -4098,7 +4132,8 @@ sub cmd_create {
             my $flg = CLONE_NEWCGROUP + 0;
             my $r;
             do { $r = syscall($nr, $flg) } while ($r == -1 && $! == EINTR);
-            # cgroup unshare failure is non-fatal (best-effort)
+            log_debug("unshare cgroup: " . ($r == 0 ? "ok" : "failed: $!"))
+                if $r != 0;
         }
 
         # Create notify listener
@@ -4150,7 +4185,9 @@ sub cmd_create {
             # Tell init that cgroup is ready (for CLONE_NEWCGROUP)
             if ($clone_flags & CLONE_NEWCGROUP) {
                 eval { cgroup_setup($cgpath, $spec); };
+                if ($@) { log_debug("cgroup_setup in NEWCGROUP path: $@"); }
                 eval { cgroup_add_process($cgpath, $init_pid); };
+                if ($@) { log_debug("cgroup_add_process in NEWCGROUP path: $@"); }
                 eval { apply_device_cgroup($cgpath, $spec); };
                 channel_send($init_w_fd, { type => 'cgroup_done' });
             }
@@ -4290,10 +4327,21 @@ sub cmd_create {
     }
 
     # Run createRuntime hooks (OCI spec: MUST error if these fail)
+    # If a hook fails, clean up state so the container id can be reused.
     if (my $hooks = $spec->{hooks}) {
-        run_hooks($hooks->{createRuntime}, $state, must_succeed => 1, type => 'createRuntime');
-        run_hooks($hooks->{createContainer}, $state, must_succeed => 1, type => 'createContainer');
-        run_hooks($hooks->{prestart}, $state, must_succeed => 1, type => 'prestart');
+        eval {
+            run_hooks($hooks->{createRuntime}, $state, must_succeed => 1, type => 'createRuntime');
+            run_hooks($hooks->{createContainer}, $state, must_succeed => 1, type => 'createContainer');
+            run_hooks($hooks->{prestart}, $state, must_succeed => 1, type => 'prestart');
+        };
+        if ($@) {
+            my $err = $@;
+            # Kill the init process and clean up state
+            kill 9, $init_pid if $init_pid;
+            waitpid($init_pid, 0) if $init_pid;
+            delete_state($root, $id);
+            die $err;
+        }
     }
 
     # Return PTY master fd for foreground relay
@@ -4757,7 +4805,7 @@ sub exec_tty_relay {
     my $stdin_fl = fcntl_getfl($stdin_fd);
     fcntl_setfl($stdin_fd, $stdin_fl | O_NONBLOCK) if defined $stdin_fl;
 
-    my $done = 0;
+    my $child_exited = 0;
     my $exit_status = 0;
     local $SIG{CHLD} = sub {
         my $ret = waitpid($child_pid, WNOHANG);
@@ -4767,11 +4815,12 @@ sub exec_tty_relay {
             } elsif (WIFSIGNALED($?)) {
                 $exit_status = 128 + WTERMSIG($?);
             }
-            $done = 1;
+            $child_exited = 1;
         }
     };
 
-    while (!$done) {
+    my $pty_eof = 0;
+    while (!$child_exited && !$pty_eof) {
         my $rin = '';
         vec($rin, $master_fd, 1) = 1;
         vec($rin, $stdin_fd,  1) = 1;
@@ -4786,9 +4835,9 @@ sub exec_tty_relay {
             if (defined $n && $n > 0) {
                 syswrite(STDOUT, $buf, $n);
             } elsif (!defined $n && $! != EAGAIN && $! != EWOULDBLOCK && $! != EINTR) {
-                $done = 1;
+                $pty_eof = 1;
             } elsif (defined $n && $n == 0) {
-                $done = 1;
+                $pty_eof = 1;
             }
         }
 
@@ -4828,7 +4877,7 @@ sub exec_tty_relay {
     POSIX::close($master_fd);
 
     # Reap if not yet done
-    unless ($done) {
+    unless ($child_exited) {
         waitpid($child_pid, 0);
         if (WIFEXITED($?)) {
             $exit_status = WEXITSTATUS($?);
@@ -4862,9 +4911,15 @@ sub fcntl_setfl {
 # Container: exec
 # ═══════════════════════════════════════════════════════════════════════
 
+sub exec_fatal {
+    # Like fatal(), but exits 255 for exec internal errors (runc convention)
+    warn "nacre: @_\n";
+    exit 255;
+}
+
 sub cmd_exec {
     my (%p) = @_;
-    my $id             = $p{id}             // fatal("container id required");
+    my $id             = $p{id}             // exec_fatal("container id required");
     my $root           = $p{root}           // $DEFAULT_ROOT;
     my @cmd            = @{$p{command}      // []};
     my $exec_cwd       = $p{cwd};
@@ -4887,9 +4942,9 @@ sub cmd_exec {
     my $exec_proc;  # process.json data for ioprio/scheduler
     if ($process_file) {
         my $pdata = read_file($process_file);
-        fatal("cannot read process file '$process_file'") unless defined $pdata;
+        exec_fatal("cannot read process file '$process_file'") unless defined $pdata;
         $exec_proc = eval { $JSON->decode($pdata) };
-        fatal("invalid process JSON: $@") if $@;
+        exec_fatal("invalid process JSON: $@") if $@;
         @cmd = @{$exec_proc->{args} // []} unless @cmd;
         $exec_cwd  //= $exec_proc->{cwd};
         $exec_env  = $exec_proc->{env} if $exec_proc->{env} && !($exec_env && @$exec_env);
@@ -4899,9 +4954,10 @@ sub cmd_exec {
             if $exec_proc->{user} && $exec_proc->{user}{additionalGids};
         $tty //= $exec_proc->{terminal};
     }
-    fatal("command required for exec") unless @cmd;
+    exec_fatal("command required for exec") unless @cmd;
 
-    my $state = load_state($root, $id);
+    my $state = eval { load_state($root, $id) };
+    exec_fatal("container '$id' does not exist") unless $state;
 
     # Refuse paused container (unless --ignore-paused)
     if ($state->{status} eq 'paused') {
@@ -4919,16 +4975,16 @@ sub cmd_exec {
                 my $s2 = eval { load_state($root, $id) };
                 last unless $s2;
                 if ($s2->{status} ne 'paused' && $s2->{status} ne 'running') {
-                    fatal("container '$id' is not running");
+                    exec_fatal("container '$id' is not running");
                 }
                 last if $s2->{status} eq 'running';
                 select(undef, undef, undef, 0.1);
             }
         } else {
-            fatal("cannot exec in a paused container, use --ignore-paused to wait");
+            exec_fatal("cannot exec in a paused container, use --ignore-paused to wait");
         }
     } elsif ($state->{status} ne 'running' && $state->{status} ne 'created') {
-        fatal("container '$id' is not running");
+        exec_fatal("container '$id' is not running");
     }
 
     my $init_pid = $state->{pid};
@@ -4938,7 +4994,7 @@ sub cmd_exec {
     if ($pid_file) {
         my $pid_dir = $pid_file;
         $pid_dir =~ s{/[^/]*$}{};
-        fatal("open pidfile: open $pid_file: no such file or directory")
+        exec_fatal("open pidfile: open $pid_file: no such file or directory")
             if $pid_dir ne $pid_file && ! -d $pid_dir;
     }
 
@@ -5177,10 +5233,9 @@ sub cmd_exec {
             apply_scheduler($fake_spec);
         }
 
-        # Apply exec --cap capabilities
-        if ($cap_add && @$cap_add) {
-            apply_exec_caps($cap_add, $spec);
-        }
+        # Apply capabilities: always apply the container's capability
+        # config to exec'd processes, merging in any --cap additions.
+        apply_exec_caps($cap_add, $spec);
 
         # Apply CPU affinity for exec
         my $exec_affinity = ($exec_proc && $exec_proc->{execCPUAffinity})
@@ -5215,7 +5270,7 @@ sub cmd_exec {
         # Apply final CPU affinity right before exec
         apply_final_cpu_affinity($final_affinity) if $final_affinity;
 
-        { exec { $cmd[0] } @cmd };
+        { no warnings 'exec'; exec { $cmd[0] } @cmd };
         my $msg = "exec $cmd[0]: " . lc("$!");
         syswrite($err_w, $msg);
         _exit(255);
