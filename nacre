@@ -495,7 +495,7 @@ sub load_cached_spec {
 sub default_spec {
     return {
         ociVersion => '1.2.0',
-        root => { path => 'rootfs', readonly => JSON::PP::false },
+        root => { path => 'rootfs', readonly => JSON::PP::true },
         process => {
             terminal => JSON::PP::true,
             user => { uid => 0, gid => 0 },
@@ -1976,6 +1976,12 @@ sub apply_capabilities_final {
         if ($n < 32) { $prm_lo |= (1 << $n); } else { $prm_hi |= (1 << ($n - 32)); }
     }
     for my $name (@{$caps->{inheritable} // []}) {
+        my $n = $CAP_NUM{$name} // next;
+        if ($n < 32) { $inh_lo |= (1 << $n); } else { $inh_hi |= (1 << ($n - 32)); }
+    }
+    # Ambient caps require the cap in BOTH permitted AND inheritable sets.
+    # Merge ambient into inheritable (same as runc's ApplyCaps).
+    for my $name (@{$caps->{ambient} // []}) {
         my $n = $CAP_NUM{$name} // next;
         if ($n < 32) { $inh_lo |= (1 << $n); } else { $inh_hi |= (1 << ($n - 32)); }
     }
@@ -3505,7 +3511,7 @@ sub run_hooks {
     return unless $hooks;
     my $must_succeed = $opts{must_succeed} // 0;
     my $hook_type    = $opts{type} // '';
-    my $hook_idx     = 0;
+    my $hook_idx     = 1;  # runc uses 1-based indexing
     for my $hook (@$hooks) {
         # Prepare state JSON and pipe BEFORE forking so the child inherits
         # a real file descriptor that survives exec().
@@ -5364,6 +5370,13 @@ sub cmd_exec {
         # Apply capabilities: always apply the container's capability
         # config to exec'd processes, merging in any --cap additions.
         apply_exec_caps($cap_add, $spec);
+
+        # Apply no_new_privs from container spec (exec inherits this setting).
+        # Must come after capabilities — PR_SET_NO_NEW_PRIVS is irreversible
+        # and prevents capability gain during exec (root-magic disabled).
+        if ($spec->{process}{noNewPrivileges}) {
+            do_syscall(SYS_prctl, PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+        }
 
         # Apply CPU affinity for exec
         my $exec_affinity = ($exec_proc && $exec_proc->{execCPUAffinity})
