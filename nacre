@@ -1829,6 +1829,10 @@ sub create_devices {
                 close $fh if $fh;
             }
             if (do_mount($host_dev, $dest, '', MS_BIND, '')) {
+                # Apply ownership: default to uid=0 gid=0 per OCI spec
+                my $d_uid = $dev->{uid} // 0;
+                my $d_gid = $dev->{gid} // 0;
+                chown($d_uid, $d_gid, $dest);
                 next;  # success
             }
         }
@@ -3296,7 +3300,7 @@ sub apply_memory_policy {
         $maxnode = $mask_longs * 64 + 1;
     }
 
-    my $nodemask = @mask ? pack('Q*', @mask) : '';
+    my $nodemask = @mask ? pack('Q*', @mask) : 0;  # 0 = NULL pointer
     my $nr = SYS_set_mempolicy + 0;
     my $m  = $mode + 0;
     my $mn = $maxnode + 0;
@@ -3416,10 +3420,12 @@ sub apply_exec_cpu_affinity {
             my $pid = 0 + 0;
             my $l   = $len + 0;
             syscall($nr, $pid, $l, $mask);
-            # Log in nsexec-compatible format for bats tests
+            # Log in nsexec-compatible format for bats tests.
+            # Print directly to stderr (like runc's nsexec.c does),
+            # not through the debug logger, so the pattern matches.
             my $hex_mask = 0;
             for my $c (@cpus) { $hex_mask |= (1 << $c); }
-            $dbg->(sprintf("nsexec: affinity: 0x%x", $hex_mask)) if $dbg;
+            printf STDERR "nsexec: affinity: 0x%x\n", $hex_mask;
         }
     }
 
@@ -5232,10 +5238,13 @@ sub cmd_exec {
     my $flags = fcntl($err_w, F_GETFD, 0);
     fcntl($err_w, F_SETFD, $flags | FD_CLOEXEC);
 
+    # Sync pipe: parent signals child after cgroup write
+    pipe(my $sync_r, my $sync_w) or fatal("pipe: $!");
+
     # Move internal fds above the preserve-fds range so they don't
     # clobber user-inherited fds 3..2+preserve_fds.
     my $min_fd = 3 + $preserve_fds;
-    for my $fh ($err_r, $err_w, ($pty_parent_fh ? $pty_parent_fh : ()), ($pty_child_fh ? $pty_child_fh : ())) {
+    for my $fh ($err_r, $err_w, $sync_r, $sync_w, ($pty_parent_fh ? $pty_parent_fh : ()), ($pty_child_fh ? $pty_child_fh : ())) {
         my $cur = fileno($fh);
         if (defined $cur && $cur >= 3 && $cur < $min_fd) {
             my $new = POSIX::dup($cur);
@@ -5265,6 +5274,7 @@ sub cmd_exec {
 
     if ($child == 0) {
         close $err_r;
+        close $sync_w;
         close $pty_parent_fh if $pty_parent_fh;
 
         log_debug("nsexec container setup");
@@ -5286,6 +5296,10 @@ sub cmd_exec {
         # Close namespace fds
         my $joined_pid_ns = grep { $_->{name} eq 'pid' } @ns_fds;
         for my $ns (@ns_fds) { close $ns->{fd}; }
+
+        # Wait for parent to write us to the cgroup
+        sysread($sync_r, my $sync_buf, 1);
+        close $sync_r;
 
         # After setns(CLONE_NEWPID), the calling thread stays in the old
         # PID namespace; only its children enter the new one.  Fork so
@@ -5433,6 +5447,9 @@ sub cmd_exec {
             apply_scheduler($spec);
         }
 
+        # Apply memory policy
+        apply_memory_policy($spec);
+
         # Apply capabilities: always apply the container's capability
         # config to exec'd processes, merging in any --cap additions.
         apply_exec_caps($cap_add, $spec);
@@ -5486,24 +5503,7 @@ sub cmd_exec {
     # Parent
     close $err_w;
     close $pty_child_fh if $pty_child_fh;
-
-    # Receive PTY master fd from child
-    my $pty_master_fd;
-    if ($tty && $pty_parent_fh) {
-        $pty_master_fd = recv_fd_over_fd(fileno($pty_parent_fh));
-        close $pty_parent_fh;
-        if ($pty_master_fd < 0) {
-            warn "nacre: failed to receive PTY master fd\n";
-            $pty_master_fd = undef;
-        }
-    }
-
-    # For detached exec with tty and console socket: send master to console socket
-    if ($detach && $tty && $console_socket && defined $pty_master_fd) {
-        send_fd_via_socket($console_socket, $pty_master_fd);
-        POSIX::close($pty_master_fd);
-        $pty_master_fd = undef;
-    }
+    close $sync_r;
 
     # Write pid file
     if ($pid_file) {
@@ -5515,7 +5515,7 @@ sub cmd_exec {
         }
     }
 
-    # Move exec process into the container's cgroup
+    # Move exec process into the container's cgroup (before signalling child)
     my $container_cgpath = $state->{cgroupPath};
     if ($exec_cgroup) {
         # --cgroup: move to a specific sub-cgroup
@@ -5571,6 +5571,28 @@ sub cmd_exec {
                 }
             }
         }
+    }
+
+    # Signal child that cgroup write is done
+    syswrite($sync_w, "x", 1);
+    close $sync_w;
+
+    # Receive PTY master fd from child (after sync so child is unblocked)
+    my $pty_master_fd;
+    if ($tty && $pty_parent_fh) {
+        $pty_master_fd = recv_fd_over_fd(fileno($pty_parent_fh));
+        close $pty_parent_fh;
+        if ($pty_master_fd < 0) {
+            warn "nacre: failed to receive PTY master fd\n";
+            $pty_master_fd = undef;
+        }
+    }
+
+    # For detached exec with tty and console socket: send master to console socket
+    if ($detach && $tty && $console_socket && defined $pty_master_fd) {
+        send_fd_via_socket($console_socket, $pty_master_fd);
+        POSIX::close($pty_master_fd);
+        $pty_master_fd = undef;
     }
 
     # Send pidfd via socket if requested
