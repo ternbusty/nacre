@@ -748,53 +748,43 @@ sub do_mount {
     # Perl's syscall() passes strings as pointers, integers as values.
     # The kernel's mount(2) expects NULL pointers for unused args, not
     # pointers to empty strings (which it tries to resolve as paths → ENOENT).
+    #
+    # IMPORTANT: we call syscall() directly here instead of going through
+    # do_syscall(), because Perl's @_ aliasing chain corrupts the argument
+    # types when mixing integer 0 (NULL pointer) and string arguments.
+    # Fresh lexical scalars with + 0 coercion guarantee clean IOK-only SVs.
+    my $nr       = SYS_mount + 0;
     my $src_arg  = (defined $src    && $src    ne '') ? ($src    . "\0") : 0;
-    my $fs_arg   = (defined $fstype && $fstype ne '') ? ($fstype . "\0") : 0;
-    my $data_arg = (defined $data   && $data   ne '') ? ($data   . "\0") : 0;
     my $tgt_arg  = $target . "\0";
-
-    # DEBUG: print mount args for propagation calls
-    if ($target eq '/') {
-        use B;
-        my $dump = sub {
-            my ($name, $val) = @_;
-            my $sv = B::svref_2object(\$val);
-            my $fl = $sv->FLAGS;
-            my $is_iok = ($fl & B::SVf_IOK()) ? 1 : 0;
-            my $is_pok = ($fl & B::SVf_POK()) ? 1 : 0;
-            my $is_rok = ($fl & B::SVf_ROK()) ? 1 : 0;
-            warn sprintf("  %s: val=%s IOK=%d POK=%d ROK=%d flags=0x%x\n",
-                $name, defined($val) ? $val : 'undef', $is_iok, $is_pok, $is_rok, $fl);
-        };
-        warn "DEBUG do_mount: target='$target' src='$src' fstype='$fstype' flags=$flags data='$data'\n";
-        $dump->('src_arg', $src_arg);
-        $dump->('tgt_arg', $tgt_arg);
-        $dump->('fs_arg', $fs_arg);
-        $dump->('flags', $flags);
-        $dump->('data_arg', $data_arg);
-        warn sprintf("  SYS_mount=%d\n", SYS_mount);
-    }
-
-    my $ret = do_syscall(SYS_mount,
-        $src_arg, $tgt_arg, $fs_arg,
-        $flags, $data_arg);
-
-    if ($target eq '/') {
-        warn "DEBUG do_mount result: ret=$ret errno=" . int($!) . " ($!)\n";
-    }
-
+    my $fs_arg   = (defined $fstype && $fstype ne '') ? ($fstype . "\0") : 0;
+    my $fl       = $flags + 0;
+    my $data_arg = (defined $data   && $data   ne '') ? ($data   . "\0") : 0;
+    my $ret;
+    do {
+        $ret = syscall($nr, $src_arg, $tgt_arg, $fs_arg, $fl, $data_arg);
+    } while ($ret == -1 && $! == EINTR);
     return $ret == 0;
 }
 
 sub do_umount {
     my ($target, $flags) = @_;
     $flags //= 0;
-    return do_syscall(SYS_umount2, $target . "\0", $flags) == 0;
+    my $nr  = SYS_umount2 + 0;
+    my $tgt = $target . "\0";
+    my $fl  = $flags + 0;
+    my $ret;
+    do { $ret = syscall($nr, $tgt, $fl) } while ($ret == -1 && $! == EINTR);
+    return $ret == 0;
 }
 
 sub do_pivot_root {
     my ($new_root, $put_old) = @_;
-    return do_syscall(SYS_pivot_root, $new_root . "\0", $put_old . "\0") == 0;
+    my $nr  = SYS_pivot_root + 0;
+    my $nrt = $new_root . "\0";
+    my $pot = $put_old . "\0";
+    my $ret;
+    do { $ret = syscall($nr, $nrt, $pot) } while ($ret == -1 && $! == EINTR);
+    return $ret == 0;
 }
 
 # Default devices to create
@@ -934,16 +924,21 @@ sub create_devices {
 
         # Fallback: mknod (requires privileges)
         unlink $dest;
-        my $dev_num = ($dev->{major} << 8) | $dev->{minor};
+        my $dev_num = (($dev->{major} << 8) | $dev->{minor}) + 0;
         my $ftype = $dev->{type} eq 'b' ? S_IFBLK : S_IFCHR;
+        my $mode  = ($ftype | ($dev->{mode} & 0o7777)) + 0;
+        my $path  = $dest . "\0";
         my $ret;
         if (SYS_mknod > 0) {
-            $ret = do_syscall(SYS_mknod,
-                $dest . "\0", $ftype | ($dev->{mode} & 0o7777), $dev_num);
+            my $nr = SYS_mknod + 0;
+            do { $ret = syscall($nr, $path, $mode, $dev_num) }
+                while ($ret == -1 && $! == EINTR);
         } else {
             # aarch64: use mknodat with AT_FDCWD (-100)
-            $ret = do_syscall(SYS_mknodat, -100,
-                $dest . "\0", $ftype | ($dev->{mode} & 0o7777), $dev_num);
+            my $nr    = SYS_mknodat + 0;
+            my $dirfd = -100 + 0;
+            do { $ret = syscall($nr, $dirfd, $path, $mode, $dev_num) }
+                while ($ret == -1 && $! == EINTR);
         }
         if ($ret != 0) {
             # Non-fatal in user namespaces
@@ -1054,7 +1049,8 @@ sub apply_capabilities {
     my $data = pack('III III',
         $eff_lo, $prm_lo, $inh_lo,
         $eff_hi, $prm_hi, $inh_hi);
-    do_syscall(SYS_capset, $hdr, $data);
+    my $nr_capset = SYS_capset + 0;
+    syscall($nr_capset, $hdr, $data);
 
     # Clear keepcaps
     do_syscall(SYS_prctl, PR_SET_KEEPCAPS, 0, 0, 0, 0);
@@ -1208,8 +1204,10 @@ sub apply_seccomp_ffi {
             my $sock_fprog = pack('S x![P] P', $filter_count, unpack('Q', pack('P', $bpf_prog)));
 
             # Use a more portable approach: write to a buffer and pass pointer
-            my $flags = 0;
-            do_syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, $flags, $sock_fprog);
+            my $nr_sec = SYS_seccomp + 0;
+            my $op     = SECCOMP_SET_MODE_FILTER + 0;
+            my $fl     = 0;
+            syscall($nr_sec, $op, $fl, $sock_fprog);
         }
     } else {
         close $rd;
@@ -1259,7 +1257,12 @@ sub apply_device_cgroup {
     # Pad to expected size
     $attr .= "\0" x (256 - length($attr)) if length($attr) < 256;
 
-    my $prog_fd = do_syscall(SYS_bpf, BPF_PROG_LOAD, $attr, length($attr));
+    my $nr_bpf = SYS_bpf + 0;
+    my $bpf_cmd = BPF_PROG_LOAD + 0;
+    my $attr_len = length($attr) + 0;
+    my $prog_fd;
+    do { $prog_fd = syscall($nr_bpf, $bpf_cmd, $attr, $attr_len) }
+        while ($prog_fd == -1 && $! == EINTR);
     if ($prog_fd < 0) {
         warn "nacre: BPF_PROG_LOAD failed: $!\n";
         return;
@@ -1279,7 +1282,11 @@ sub apply_device_cgroup {
     );
     $attach_attr .= "\0" x (256 - length($attach_attr)) if length($attach_attr) < 256;
 
-    my $ret = do_syscall(SYS_bpf, BPF_PROG_ATTACH, $attach_attr, length($attach_attr));
+    my $bpf_attach = BPF_PROG_ATTACH + 0;
+    my $attach_len = length($attach_attr) + 0;
+    my $ret;
+    do { $ret = syscall($nr_bpf, $bpf_attach, $attach_attr, $attach_len) }
+        while ($ret == -1 && $! == EINTR);
     warn "nacre: BPF_PROG_ATTACH failed: $!\n" if $ret < 0;
 
     close $cgdir_fh;
@@ -1549,10 +1556,14 @@ sub apply_process_security {
 
     # 6. Set supplementary groups
     if (my $groups = $proc->{user}{additionalGids}) {
-        my $packed = pack('L*', @$groups);
-        do_syscall(SYS_setgroups, scalar @$groups, $packed);
+        my $nr = SYS_setgroups + 0;
+        my $n  = scalar(@$groups) + 0;
+        my $pk = pack('L*', @$groups);
+        syscall($nr, $n, $pk);
     } else {
-        do_syscall(SYS_setgroups, 0, '');
+        my $nr = SYS_setgroups + 0;
+        my $pk = '';
+        syscall($nr, 0, $pk);
     }
 
     # 7. setgid then setuid (always call — uid/gid 0 is valid)
@@ -1593,8 +1604,10 @@ sub apply_rlimits {
         my $soft = $rl->{soft} // 0;
         my $hard = $rl->{hard} // 0;
         # prlimit64(pid=0, resource, new_rlim, old_rlim=NULL)
+        my $nr = SYS_prlimit64 + 0;
+        my $t  = $type + 0;
         my $new_rlim = pack('QQ', $soft, $hard);
-        do_syscall(SYS_prlimit64, 0, $type, $new_rlim, 0);
+        syscall($nr, 0, $t, $new_rlim, 0);
     }
 }
 
@@ -1675,36 +1688,24 @@ sub run_hooks {
 sub run_init_process {
     my ($spec, $rootfs, $notify_fd, $main_chan_w, $main_chan_r, $cgpath, $id, $bundle) = @_;
 
-    # DEBUG: test do_mount directly before prepare_rootfs
-    {
-        warn "DEBUG: direct mount test - PID=$$ uid=$< euid=$>\n";
-        # Test do_mount with the same args prepare_rootfs uses
-        warn "DEBUG: calling do_mount('', '/', '', MS_SLAVE|MS_REC, '')\n";
-        my $ok = do_mount('', '/', '', MS_SLAVE | MS_REC, '');
-        my $e = int($!);
-        warn "DEBUG: do_mount result: ok=$ok errno=$e ($!)\n";
-        if (!$ok) {
-            # Try direct syscall for comparison
-            my $nr  = SYS_mount + 0;
-            my $fl  = (MS_SLAVE | MS_REC) + 0;
-            my $tgt = "/\0";
-            my $r = syscall($nr, 0, $tgt, 0, $fl, 0);
-            warn "DEBUG: direct syscall result: r=$r errno=" . int($!) . " ($!)\n";
-        }
-    }
-
     # Setup rootfs (mounts, devices, symlinks)
     prepare_rootfs($spec, $rootfs);
 
     # pivot_root
     apply_pivot_root($rootfs);
 
-    # Hostname
+    # Hostname — call syscall() directly (mixed string/integer args)
     if (my $hostname = $spec->{hostname}) {
-        do_syscall(SYS_sethostname, $hostname . "\0", length($hostname));
+        my $nr = SYS_sethostname + 0;
+        my $h  = $hostname . "\0";
+        my $l  = length($hostname) + 0;
+        syscall($nr, $h, $l);
     }
     if (my $domainname = $spec->{domainname}) {
-        do_syscall(SYS_setdomainname, $domainname . "\0", length($domainname));
+        my $nr = SYS_setdomainname + 0;
+        my $d  = $domainname . "\0";
+        my $l  = length($domainname) + 0;
+        syscall($nr, $d, $l);
     }
 
     # Sysctls (after pivot_root, /proc/sys is the container's)
