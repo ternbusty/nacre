@@ -1501,7 +1501,7 @@ sub run_hooks {
             my $state_json = $JSON_COMPACT->encode(oci_state_json($state));
             open STDIN, '<', \$state_json;
             my @args = @{$hook->{args} // [$hook->{path}]};
-            exec { $hook->{path} } @args;
+            { exec { $hook->{path} } @args };
             _exit(1);
         }
         my $timeout = $hook->{timeout} // 30;
@@ -1590,8 +1590,8 @@ sub run_init_process {
 
     # Exec
     my @args = @{$spec->{process}{args} // ['sh']};
-    exec { $args[0] } @args
-        or fatal("exec $args[0]: $!");
+    { exec { $args[0] } @args };
+    fatal("exec $args[0]: $!");
 }
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2191,7 +2191,7 @@ sub cmd_exec {
             }
         }
 
-        exec { $cmd[0] } @cmd;
+        { exec { $cmd[0] } @cmd };
         _exit(1);
     }
 

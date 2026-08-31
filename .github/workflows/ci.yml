@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  syntax-check:
+    name: Perl syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check Perl version
+        run: perl -v | head -5
+
+      - name: Syntax check
+        run: perl -c nacre
+
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check Perl version
+        run: perl -v | head -5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y busybox-static jq python3
+
+      - name: Syntax check
+        run: perl -c nacre
+
+      - name: Run integration tests
+        run: |
+          chmod +x test/run-tests.sh
+          sudo test/run-tests.sh
