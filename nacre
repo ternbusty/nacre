@@ -373,8 +373,8 @@ sub parse_size {
 sub write_file {
     my ($path, $content) = @_;
     open my $fh, '>', $path or fatal("write $path: $!");
-    print $fh $content;
-    close $fh;
+    print $fh $content or fatal("write $path: $!");
+    close $fh or fatal("close $path: $!");
 }
 
 sub read_file {
@@ -1824,7 +1824,9 @@ sub create_devices {
         unlink $dest if -e $dest;
         my $dev_num = (($dev->{major} << 8) | $dev->{minor}) + 0;
         my $ftype = $dev->{type} eq 'b' ? S_IFBLK : S_IFCHR;
-        my $mode  = ($ftype | ($dev->{mode} & 0o7777)) + 0;
+        # OCI spec default fileMode is 0666 when not specified
+        my $file_mode = defined $dev->{mode} ? ($dev->{mode} & 0o7777) : 0o666;
+        my $mode  = ($ftype | $file_mode) + 0;
         my $path  = $dest . "\0";
         my $ret;
         if (SYS_mknod > 0) {
@@ -3433,7 +3435,8 @@ sub apply_exec_cpu_affinity {
     my ($affinity, $dbg) = @_;
     return unless $affinity;
 
-    if (my $initial = $affinity->{initial}) {
+    # Use 'defined' because Perl treats the string "0" (CPU 0 only) as falsy.
+    if (defined(my $initial = $affinity->{initial})) {
         my @cpus = parse_cpu_list($initial);
         if (@cpus) {
             my ($mask, $len) = cpu_list_to_mask(@cpus);
@@ -3451,7 +3454,7 @@ sub apply_exec_cpu_affinity {
     }
 
     # Return final affinity info for post-setns application
-    if (my $final = $affinity->{final}) {
+    if (defined(my $final = $affinity->{final})) {
         return $final;
     }
     return;
@@ -5307,10 +5310,16 @@ sub cmd_exec {
     # Sync pipe: parent signals child after cgroup write
     pipe(my $sync_r, my $sync_w) or fatal("pipe: $!");
 
+    # Grandchild PID pipe: when exec double-forks for PID namespace,
+    # the intermediate sends the grandchild's host PID to the parent
+    # so the PID file and pidfd contain the actual exec'd process.
+    pipe(my $gc_pid_r, my $gc_pid_w) or fatal("pipe: $!");
+    my $has_pid_ns_in_exec = grep { $_->{name} eq 'pid' } @ns_fds;
+
     # Move internal fds above the preserve-fds range so they don't
     # clobber user-inherited fds 3..2+preserve_fds.
     my $min_fd = 3 + $preserve_fds;
-    for my $fh ($err_r, $err_w, $sync_r, $sync_w, ($pty_parent_fh ? $pty_parent_fh : ()), ($pty_child_fh ? $pty_child_fh : ())) {
+    for my $fh ($err_r, $err_w, $sync_r, $sync_w, $gc_pid_r, $gc_pid_w, ($pty_parent_fh ? $pty_parent_fh : ()), ($pty_child_fh ? $pty_child_fh : ())) {
         my $cur = fileno($fh);
         if (defined $cur && $cur >= 3 && $cur < $min_fd) {
             my $new = POSIX::dup($cur);
@@ -5341,6 +5350,7 @@ sub cmd_exec {
     if ($child == 0) {
         close $err_r;
         close $sync_w;
+        close $gc_pid_r;
         close $pty_parent_fh if $pty_parent_fh;
 
         log_debug("nsexec container setup");
@@ -5377,7 +5387,10 @@ sub cmd_exec {
                 _exit(255);
             }
             if ($pid2 > 0) {
-                # Intermediate: wait for grandchild, propagate exit status
+                # Intermediate: send grandchild's host PID to parent
+                syswrite($gc_pid_w, pack("L", $pid2));
+                close $gc_pid_w;
+                # Wait for grandchild, propagate exit status
                 close $err_w;
                 close $pty_child_fh if $pty_child_fh;
                 waitpid($pid2, 0);
@@ -5386,6 +5399,7 @@ sub cmd_exec {
                 _exit($rc);
             }
             # Grandchild: now in container's PID namespace
+            close $gc_pid_w;
         }
 
         # chdir into container root after joining mount ns
@@ -5570,16 +5584,7 @@ sub cmd_exec {
     close $err_w;
     close $pty_child_fh if $pty_child_fh;
     close $sync_r;
-
-    # Write pid file
-    if ($pid_file) {
-        if (open my $pf, '>', $pid_file) {
-            print $pf "$child\n";
-            close $pf;
-        } else {
-            warn "nacre: cannot write pid-file '$pid_file': $!\n";
-        }
-    }
+    close $gc_pid_w;
 
     # Move exec process into the container's cgroup (before signalling child)
     my $container_cgpath = $state->{cgroupPath};
@@ -5643,6 +5648,28 @@ sub cmd_exec {
     syswrite($sync_w, "x", 1);
     close $sync_w;
 
+    # When the exec joins a PID namespace, the child double-forks.
+    # The intermediate sends the grandchild's host PID so the PID
+    # file and pidfd refer to the actual exec'd process.
+    my $final_pid = $child;
+    if ($has_pid_ns_in_exec) {
+        sysread($gc_pid_r, my $gc_pid_buf, 4);
+        if (defined $gc_pid_buf && length($gc_pid_buf) == 4) {
+            $final_pid = unpack("L", $gc_pid_buf);
+        }
+    }
+    close $gc_pid_r;
+
+    # Write pid file (after sync so we have the grandchild PID)
+    if ($pid_file) {
+        if (open my $pf, '>', $pid_file) {
+            print $pf "$final_pid\n";
+            close $pf;
+        } else {
+            warn "nacre: cannot write pid-file '$pid_file': $!\n";
+        }
+    }
+
     # Receive PTY master fd from child (after sync so child is unblocked)
     my $pty_master_fd;
     if ($tty && $pty_parent_fh) {
@@ -5661,12 +5688,12 @@ sub cmd_exec {
         $pty_master_fd = undef;
     }
 
-    # Send pidfd via socket if requested
+    # Send pidfd via socket if requested (use final_pid for actual exec process)
     if ($pidfd_socket) {
         my $pidfd_nr = SYS_pidfd_open + 0;
-        my $pid_arg  = $child + 0;
+        my $pid_arg  = $final_pid + 0;
         my $pidfd    = syscall($pidfd_nr, $pid_arg, 0);
-        fatal("pidfd_open($child): $!") if $pidfd < 0;
+        fatal("pidfd_open($final_pid): $!") if $pidfd < 0;
         send_fd_via_socket($pidfd_socket, $pidfd);
         POSIX::close($pidfd);
     }
@@ -5776,6 +5803,12 @@ sub cmd_update {
         if (defined $p{memory_swap}) {
             my $v = parse_size($p{memory_swap});
             $mem{swap} = ($v == -1) ? 'max' : $v;
+        }
+        # cgroup v2 compat: when memory is set to unlimited and swap is
+        # not explicitly specified, also set swap to unlimited (matching
+        # runc's ConvertMemorySwapToCgroupV2Value behaviour).
+        if (defined $mem{limit} && $mem{limit} eq 'max' && !defined $mem{swap}) {
+            $mem{swap} = 'max';
         }
         if (defined $p{memory_reservation}) {
             my $v = parse_size($p{memory_reservation});
