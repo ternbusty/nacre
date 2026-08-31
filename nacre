@@ -1095,9 +1095,7 @@ sub apply_seccomp_raw {
         return apply_seccomp_ffi($spec);
     }
 
-    # Fallback: apply a simple default-allow or default-kill filter via raw BPF
-    # This is a minimal implementation
-    warn "nacre: seccomp: FFI::Platypus not available, using minimal raw BPF\n";
+    # Fallback: build and load BPF program directly via seccomp(2)
     apply_seccomp_minimal($seccomp);
 }
 
@@ -1211,10 +1209,147 @@ sub apply_seccomp_ffi {
     seccomp_release($ctx);
 }
 
+my %_SYSCALL_NR;   # lazily populated from system headers
+
+sub _init_syscall_table {
+    return if %_SYSCALL_NR;
+    require Config;
+    my $arch = $Config::Config{archname} // '';
+
+    my @hdrs;
+    if ($arch =~ /x86_64|amd64/i) {
+        @hdrs = (
+            '/usr/include/x86_64-linux-gnu/asm/unistd_64.h',
+            '/usr/include/asm/unistd_64.h',
+        );
+    } elsif ($arch =~ /aarch64|arm64/i) {
+        @hdrs = (
+            '/usr/include/aarch64-linux-gnu/asm/unistd.h',
+            '/usr/include/asm-generic/unistd.h',
+        );
+    } else {
+        @hdrs = ('/usr/include/asm/unistd.h');
+    }
+
+    for my $hdr (@hdrs) {
+        open my $fh, '<', $hdr or next;
+        while (<$fh>) {
+            $_SYSCALL_NR{$1} = $2 + 0
+                if /^\s*#\s*define\s+__NR(?:3264)?_(\w+)\s+(\d+)/;
+        }
+        close $fh;
+        last if %_SYSCALL_NR;
+    }
+}
+
+sub _resolve_seccomp_syscall {
+    my ($name) = @_;
+    _init_syscall_table();
+    return $_SYSCALL_NR{$name};
+}
+
+# Map OCI seccomp action strings to kernel SECCOMP_RET values
+my %_SECCOMP_RET = (
+    SCMP_ACT_KILL         => 0x00000000,
+    SCMP_ACT_KILL_PROCESS => 0x80000000,
+    SCMP_ACT_TRAP         => 0x00030000,
+    SCMP_ACT_LOG          => 0x7ffc0000,
+    SCMP_ACT_ALLOW        => 0x7fff0000,
+);
+
+sub _seccomp_action_val {
+    my ($str) = @_;
+    return $_SECCOMP_RET{$str} if exists $_SECCOMP_RET{$str};
+    if ($str =~ /^SCMP_ACT_ERRNO\((\d+)\)$/) {
+        return 0x00050000 | ($1 & 0xffff);
+    }
+    if ($str =~ /^SCMP_ACT_TRACE\((\d+)\)$/) {
+        return 0x7ff00000 | ($1 & 0xffff);
+    }
+    return undef;
+}
+
+# BPF opcodes
+use constant {
+    _BPF_LD_W_ABS  => 0x20,   # BPF_LD  | BPF_W | BPF_ABS
+    _BPF_JMP_JEQ_K => 0x15,   # BPF_JMP | BPF_JEQ | BPF_K
+    _BPF_JMP_JGE_K => 0x35,   # BPF_JMP | BPF_JGE | BPF_K
+    _BPF_JMP_JA    => 0x05,   # BPF_JMP | BPF_JA
+    _BPF_RET_K     => 0x06,   # BPF_RET | BPF_K
+};
+
+# AUDIT_ARCH values
+use constant {
+    _AUDIT_ARCH_X86_64  => 0xc000003e,
+    _AUDIT_ARCH_AARCH64 => 0xc00000b7,
+};
+
 sub apply_seccomp_minimal {
     my ($seccomp) = @_;
-    # Minimal: just set NNP which is usually wanted anyway
-    # Full seccomp requires FFI::Platypus
+
+    my $default_str = $seccomp->{defaultAction} // 'SCMP_ACT_ALLOW';
+    my $default_ret = _seccomp_action_val($default_str)
+        // do { warn "nacre: seccomp: unknown default action $default_str\n"; return };
+
+    # Collect (syscall_nr → ret_val) pairs whose action differs from default
+    my @rules;
+    for my $rule (@{$seccomp->{syscalls} // []}) {
+        my $act = $rule->{action} // $default_str;
+        my $ret = _seccomp_action_val($act);
+        next unless defined $ret;
+        next if $ret == $default_ret;   # same as default — skip
+        for my $name (@{$rule->{names} // []}) {
+            my $nr = _resolve_seccomp_syscall($name);
+            unless (defined $nr) {
+                warn "nacre: seccomp: unknown syscall '$name', skipping\n";
+                next;
+            }
+            push @rules, [$nr, $ret];
+        }
+    }
+
+    # ---- build BPF program (array of packed sock_filter, 8 bytes each) ----
+    # struct sock_filter { __u16 code; __u8 jt; __u8 jf; __u32 k; }
+    my @insns;
+
+    # 1. Validate architecture
+    require Config;
+    my $arch_val = ($Config::Config{archname} // '') =~ /aarch64|arm64/i
+        ? _AUDIT_ARCH_AARCH64 : _AUDIT_ARCH_X86_64;
+    push @insns, pack('SCCL', _BPF_LD_W_ABS,  0, 0, 4);            # load arch
+    push @insns, pack('SCCL', _BPF_JMP_JEQ_K, 1, 0, $arch_val);    # if arch==native skip 1
+    push @insns, pack('SCCL', _BPF_RET_K,     0, 0, 0x00000000);    # KILL (bad arch)
+
+    # 2. Load syscall number
+    push @insns, pack('SCCL', _BPF_LD_W_ABS, 0, 0, 0);             # load nr
+
+    # 3. Per-rule checks — each rule is two instructions (JEQ + RET)
+    for my $r (@rules) {
+        my ($nr, $ret) = @$r;
+        push @insns, pack('SCCL', _BPF_JMP_JEQ_K, 0, 1, $nr);      # if nr==X fall-through, else skip
+        push @insns, pack('SCCL', _BPF_RET_K,     0, 0, $ret);      # return action
+    }
+
+    # 4. Default action
+    push @insns, pack('SCCL', _BPF_RET_K, 0, 0, $default_ret);
+
+    # ---- assemble sock_fprog and call seccomp(2) ----
+    my $filter = join('', @insns);
+    my $ninsns = scalar @insns;
+
+    # struct sock_fprog { unsigned short len; <pad>; struct sock_filter *filter; }
+    # We need to pass a *pointer* to the filter buffer.  Perl's syscall() passes
+    # string args by reference, so we embed the pointer in sock_fprog and pass
+    # sock_fprog as a string.  'P' in pack produces a raw pointer to the scalar.
+    my $fprog = pack('S x![Q] P', $ninsns, $filter);
+
+    my $nr = SYS_seccomp + 0;
+    my $op = SECCOMP_SET_MODE_FILTER + 0;
+    my $fl = 0 + 0;
+    my $ret = syscall($nr, $op, $fl, $fprog);
+    if ($ret != 0) {
+        warn "nacre: seccomp: BPF load failed (errno=$!), filter has $ninsns insns\n";
+    }
 }
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2270,6 +2405,13 @@ sub cmd_start {
     fatal("container '$id' is not in 'created' state (is '$state->{status}')")
         unless $state->{status} eq 'created';
 
+    # OCI spec: start MUST generate an error if process was not set
+    my $spec = eval { load_spec($state->{bundle}) };
+    fatal("cannot load config.json from bundle '$state->{bundle}': $@")
+        unless $spec;
+    fatal("process is not set in config.json — cannot start container")
+        unless $spec->{process} && $spec->{process}{args} && @{$spec->{process}{args}};
+
     # Connect to notify socket
     my $notify_path = state_dir($root, $id) . '/notify.sock';
     notify_container_start($notify_path);
@@ -2278,9 +2420,8 @@ sub cmd_start {
     $state->{status} = 'running';
     save_state($root, $state);
 
-    # Run poststart hooks
-    my $spec = eval { load_spec($state->{bundle}) };
-    if ($spec && $spec->{hooks}) {
+    # Run poststart hooks ($spec already loaded above)
+    if ($spec->{hooks}) {
         run_hooks($spec->{hooks}{poststart}, $state);
     }
 }

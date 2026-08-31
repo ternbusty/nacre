@@ -86,7 +86,7 @@ jobs:
       - name: Install Go and dependencies
         run: |
           sudo apt-get update || true
-          sudo apt-get install -y golang-go make busybox-static
+          sudo apt-get install -y golang-go make busybox-static linux-libc-dev
 
       - name: Clone and build runtime-tools validation suite
         run: |
@@ -141,13 +141,12 @@ jobs:
             out=$HOME/validation-out/$name.log
             # Run in its own session (setsid) so lingering children don't
             # inherit the GitHub Actions log pipe and block subsequent steps.
-            sudo timeout --signal=KILL 60 setsid env RUNTIME=$RUNTIME "$t" > "$out" 2>&1
+            sudo timeout --signal=KILL 60 setsid env RUNTIME=$RUNTIME "$t" > "$out" 2>&1 </dev/null
             rc=$?
-            sudo $RUNTIME delete --force "$name" 2>/dev/null || true
-            # Kill any lingering nacre/perl processes from this test
-            sudo killall -9 perl nacre runtimetest 2>/dev/null || true
+            # Redirect ALL cleanup to /dev/null so no child inherits the Actions pipe fd.
+            sudo $RUNTIME delete --force "$name" > /dev/null 2>&1 || true
+            sudo killall -9 perl nacre runtimetest > /dev/null 2>&1 || true
             sleep 0.2
-            # Safe cleanup: only remove nacre state files
             sudo find /run/nacre -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
             if [ "$rc" -eq 124 ]; then
               TIMEOUT=$((TIMEOUT+1))
@@ -208,9 +207,10 @@ jobs:
         if: always()
         timeout-minutes: 1
         run: |
-          # Kill ALL children of this runner to avoid inherited-fd hangs
-          sudo killall -9 perl nacre runtimetest sleep sh 2>/dev/null || true
-          sleep 0.5
+          # Only kill runtime-related processes; avoid sh/sleep which can hit
+          # the runner itself.  Redirect to /dev/null so nothing inherits the
+          # Actions log pipe.
+          sudo killall -9 perl nacre runtimetest > /dev/null 2>&1 || true
 
       - name: Show test logs
         if: always()
