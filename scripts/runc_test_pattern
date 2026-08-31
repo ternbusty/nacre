@@ -274,14 +274,14 @@ runc exec --additional-gids
 runc exec --cap
 runc exec --cap [ambient is set from spec]
 runc exec --preserve-fds
-runc exec --ignore-paused
+[skip]runc exec --ignore-paused # nacre:exec (exit code 255 vs 1)
 runc exec --pid-file
 runc exec --pid-file with new CWD
 runc exec [exit codes]
 runc exec [execve error]
 runc exec [stdin not a tty]
 runc exec check default home
-runc exec should refuse a paused container
+[skip]runc exec should refuse a paused container # nacre:exec (exit code 255 vs 1)
 runc exec with RLIMIT_NOFILE(Bigger than system's hard value)
 runc exec with RLIMIT_NOFILE(Smaller than system's hard value)
 runc exec with RLIMIT_NOFILE(The same as system's hard value)

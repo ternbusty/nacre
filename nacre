@@ -66,6 +66,7 @@ BEGIN {
             SYS_fsopen            => 430,
             SYS_fsconfig          => 431,
             SYS_fsmount           => 432,
+            SYS_fchown            => 93,
             SYS_sendmsg           => 46,
             SYS_recvmsg           => 47,
             SYS_epoll_create1     => 291,
@@ -111,6 +112,7 @@ BEGIN {
             SYS_fsopen            => 430,
             SYS_fsconfig          => 431,
             SYS_fsmount           => 432,
+            SYS_fchown            => 55,
             SYS_sendmsg           => 211,
             SYS_recvmsg           => 212,
             SYS_epoll_create1     => 20,
@@ -1532,8 +1534,10 @@ sub apply_seccomp_ffi {
     for my $rule (@{$seccomp->{syscalls} // []}) {
         my $action_str = $rule->{action} // $default_action_str;
         my $action;
-        if ($action_str eq 'SCMP_ACT_ERRNO' && defined $ffi_default_errno_ret) {
-            $action = SCMP_ACT_ERRNO_BASE | ($ffi_default_errno_ret & 0xffff);
+        if ($action_str eq 'SCMP_ACT_ERRNO') {
+            # Bare SCMP_ACT_ERRNO: rule errnoRet → defaultErrnoRet → EPERM(1)
+            my $ev = $rule->{errnoRet} // $ffi_default_errno_ret // 1;
+            $action = SCMP_ACT_ERRNO_BASE | ($ev & 0xffff);
         } elsif ($action_str =~ /^SCMP_ACT_ERRNO\((\d+)\)$/) {
             $action = SCMP_ACT_ERRNO_BASE | ($1 & 0xffff);
         } else {
@@ -1581,12 +1585,20 @@ sub apply_seccomp_ffi {
                 $fl |= ($ffi_flag_map{$fn} // 0);
             }
             $fl += 0;
-            syscall($nr_sec, $op, $fl, $sock_fprog);
+            my $sec_ret = syscall($nr_sec, $op, $fl, $sock_fprog);
+            if ($sec_ret != 0) {
+                seccomp_release($ctx);
+                fatal("seccomp: BPF load failed via FFI (errno=$!)");
+            }
         }
     } else {
         close $rd;
         # Fallback to seccomp_load (sets NNP)
-        seccomp_load($ctx);
+        my $lr = seccomp_load($ctx);
+        if ($lr != 0) {
+            seccomp_release($ctx);
+            fatal("seccomp: seccomp_load failed (ret=$lr)");
+        }
     }
 
     seccomp_release($ctx);
@@ -1641,10 +1653,15 @@ my %_SECCOMP_RET = (
 );
 
 sub _seccomp_action_val {
-    my ($str) = @_;
+    my ($str, $errno_override) = @_;
     return $_SECCOMP_RET{$str} if exists $_SECCOMP_RET{$str};
     if ($str =~ /^SCMP_ACT_ERRNO\((\d+)\)$/) {
         return 0x00050000 | ($1 & 0xffff);
+    }
+    # Bare SCMP_ACT_ERRNO (no parenthesized value): use override or default EPERM
+    if ($str eq 'SCMP_ACT_ERRNO') {
+        my $ev = $errno_override // 1;   # EPERM
+        return 0x00050000 | ($ev & 0xffff);
     }
     if ($str =~ /^SCMP_ACT_TRACE\((\d+)\)$/) {
         return 0x7ff00000 | ($1 & 0xffff);
@@ -1685,12 +1702,9 @@ sub apply_seccomp_minimal {
         my $act = $rule->{action} // $default_str;
         my $ret;
 
-        # Apply defaultErrnoRet when action is SCMP_ACT_ERRNO without explicit value
-        if ($act eq 'SCMP_ACT_ERRNO' && defined $default_errno_ret) {
-            $ret = 0x00050000 | ($default_errno_ret & 0xffff);
-        } else {
-            $ret = _seccomp_action_val($act);
-        }
+        # For SCMP_ACT_ERRNO: check rule's errnoRet, then defaultErrnoRet, then EPERM(1)
+        my $errno_val = $rule->{errnoRet} // $default_errno_ret;
+        $ret = _seccomp_action_val($act, $errno_val);
         next unless defined $ret;
         next if $ret == $default_ret;   # same as default — skip
         for my $name (@{$rule->{names} // []}) {
@@ -1761,7 +1775,7 @@ sub apply_seccomp_minimal {
     $fl += 0;
     my $ret = syscall($nr, $op, $fl, $fprog);
     if ($ret != 0) {
-        warn "nacre: seccomp: BPF load failed (errno=$!), filter has $ninsns insns\n";
+        fatal("seccomp: BPF load failed (errno=$!), filter has $ninsns insns");
     }
 }
 
@@ -2932,7 +2946,7 @@ sub run_init_process {
         # chown the PTY to the container's uid with gid 5 (tty group)
         # runc compat: PTY ownership is set before setuid, while still root
         my $uid = $spec->{process}{user}{uid} // 0;
-        POSIX::fchown($pts_fd, $uid, 5);
+        do_syscall(SYS_fchown, $pts_fd, $uid, 5);
 
         my $r0 = POSIX::dup2($pts_fd, 0);
         my $r1 = POSIX::dup2($pts_fd, 1);
@@ -2962,7 +2976,12 @@ sub run_init_process {
     # Wait for start signal
     wait_for_start($notify_fd);
 
-    # Run startContainer hooks (run inside the container namespace)
+    # Apply process security (NNP, seccomp, caps, setuid/setgid)
+    # Must happen BEFORE startContainer hooks so hooks run with seccomp applied
+    $dbg->("apply_process_security");
+    apply_process_security($spec);
+
+    # Run startContainer hooks (run inside the container namespace, with seccomp active)
     if (my $hooks = $spec->{hooks}) {
         if ($hooks->{startContainer}) {
             my $hook_state = {
@@ -2976,10 +2995,6 @@ sub run_init_process {
             run_hooks($hooks->{startContainer}, $hook_state, must_succeed => 1, type => 'startContainer');
         }
     }
-
-    # Apply process security (NNP, seccomp, caps, setuid/setgid)
-    $dbg->("apply_process_security");
-    apply_process_security($spec);
 
     # Apply rlimits
     apply_rlimits($spec);
