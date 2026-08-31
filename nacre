@@ -1856,11 +1856,26 @@ sub cmd_create {
         }
 
         # Unshare remaining namespaces (not PID, not cgroup).
-        # Try all at once; if that fails, fall back to one-at-a-time to
-        # isolate which namespace is the problem and to handle kernels or
-        # environments that only support individual unshare calls.
         if ($unshare_flags) {
+            # Debug: test raw syscall in this process context
+            {
+                my $dbg_nr  = SYS_unshare + 0;
+                my $dbg_flg = $unshare_flags + 0;
+                warn sprintf("nacre-debug: unshare combined: nr=%d flags=0x%x\n",
+                             $dbg_nr, $dbg_flg);
+                # Test with a raw syscall call (fresh IV args)
+                my $raw_ret = syscall($dbg_nr, $dbg_flg);
+                my $raw_err = int($!);
+                warn sprintf("nacre-debug: raw syscall(%d, 0x%x) = %d errno=%d (%s)\n",
+                             $dbg_nr, $dbg_flg, $raw_ret, $raw_err, $!);
+            }
+            # If the debug raw syscall above succeeded, do_syscall_int should
+            # also succeed (the namespace is already unshared).
+            # If it failed, try per-flag fallback.
             if (do_syscall_int(SYS_unshare, $unshare_flags) != 0) {
+                my $comb_err = int($!);
+                warn sprintf("nacre-debug: do_syscall_int combined failed errno=%d (%s)\n",
+                             $comb_err, $!);
                 my @ordered = (
                     [CLONE_NEWUSER,  'user'],
                     [CLONE_NEWNS,    'mount'],
@@ -1872,8 +1887,11 @@ sub cmd_create {
                 for my $pair (@ordered) {
                     my ($flag, $name) = @$pair;
                     next unless $unshare_flags & $flag;
-                    do_syscall_int(SYS_unshare, $flag)
-                        == 0 or fatal("unshare $name: $!");
+                    my $r = do_syscall_int(SYS_unshare, $flag);
+                    my $e = int($!);
+                    warn sprintf("nacre-debug: unshare %s (0x%x) = %d errno=%d (%s)\n",
+                                 $name, $flag, $r, $e, $!);
+                    $r == 0 or fatal("unshare $name: $!");
                 }
             }
         }
