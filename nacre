@@ -2633,7 +2633,7 @@ sub run_hooks {
 # ═══════════════════════════════════════════════════════════════════════
 
 sub run_init_process {
-    my ($spec, $rootfs, $notify_fd, $main_chan_w, $main_chan_r, $cgpath, $id, $bundle, $pts_fd, $debug_fd, $no_pivot, $foreground) = @_;
+    my ($spec, $rootfs, $notify_fd, $main_chan_w, $main_chan_r, $cgpath, $id, $bundle, $console_socket_path, $debug_fd, $no_pivot, $foreground) = @_;
 
     my $dbg = sub {
         return unless defined $debug_fd && $debug_fd >= 0;
@@ -2641,10 +2641,48 @@ sub run_init_process {
         POSIX::write($debug_fd, $msg, length($msg));
     };
 
-    $dbg->("init_process: start, pts_fd=" . (defined $pts_fd ? $pts_fd : 'undef'));
+    $dbg->("init_process: start, console_socket=" . (defined $console_socket_path ? $console_socket_path : 'undef'));
 
     # Setup rootfs (mounts, devices, symlinks)
     prepare_rootfs($spec, $rootfs);
+
+    # Allocate PTY from the container's devpts (set up by prepare_rootfs).
+    # This must happen BEFORE pivot_root so the console-socket path is still
+    # reachable, but AFTER prepare_rootfs so the container's devpts is mounted.
+    # Using $rootfs/dev/pts/ptmx ensures readlink shows /dev/pts/N inside
+    # the container (not a host devpts path).
+    my $pts_fd;
+    if (defined $console_socket_path) {
+        sysopen(my $ptm, "$rootfs/dev/pts/ptmx", O_RDWR | O_NOCTTY | O_CLOEXEC)
+            or fatal("open PTY master ($rootfs/dev/pts/ptmx): $!");
+        my $ptn_buf = pack('i', 0);
+        ioctl($ptm, TIOCGPTN, $ptn_buf) or fatal("TIOCGPTN: $!");
+        my $ptn = unpack('i', $ptn_buf);
+        my $unlock = pack('i', 0);
+        ioctl($ptm, TIOCSPTLCK, $unlock) or fatal("TIOCSPTLCK: $!");
+
+        my $pts_path = "$rootfs/dev/pts/$ptn";
+        sysopen(my $pts, $pts_path, O_RDWR | O_NOCTTY)
+            or fatal("open PTY slave $pts_path: $!");
+
+        # Set console size from spec if given
+        if ($spec->{process}{consoleSize}) {
+            my $h = $spec->{process}{consoleSize}{height} // 0;
+            my $w = $spec->{process}{consoleSize}{width}  // 0;
+            my $ws = pack('S4', $h + 0, $w + 0, 0, 0);
+            ioctl($ptm, TIOCSWINSZ, $ws);
+        }
+
+        # Send master to console socket (path still reachable before pivot_root)
+        send_fd_via_socket($console_socket_path, fileno($ptm));
+        close($ptm);
+
+        # Dup the slave fd so it survives filehandle scope
+        $pts_fd = POSIX::dup(fileno($pts));
+        fatal("dup PTY slave: $!") unless defined $pts_fd && $pts_fd >= 0;
+        close($pts);
+        $dbg->("PTY allocated from container devpts: slave fd=$pts_fd, pts=$ptn");
+    }
 
     # pivot_root or chroot
     if ($no_pivot) {
@@ -2701,6 +2739,11 @@ sub run_init_process {
     # runc does this before the created→started transition so the fd leak
     # test sees clean FDs (only 0,1,2 + exec.fifo).
     if (defined $pts_fd) {
+        # chown the PTY to the container's uid with gid 5 (tty group)
+        # runc compat: PTY ownership is set before setuid, while still root
+        my $uid = $spec->{process}{user}{uid} // 0;
+        POSIX::fchown($pts_fd, $uid, 5);
+
         my $r0 = POSIX::dup2($pts_fd, 0);
         my $r1 = POSIX::dup2($pts_fd, 1);
         my $r2 = POSIX::dup2($pts_fd, 2);
@@ -3073,13 +3116,10 @@ sub cmd_create {
         # === Init process (PID 1 in new PID namespace) ===
         setsid();
 
-        # Set up PTY console if terminal is requested and a console socket
-        # was provided.  Must happen before pivot_root (host paths needed).
-        my $pts_fd;
-        my $terminal = $spec->{process}{terminal};
-        if ($terminal && $p{console_socket}) {
-            $pts_fd = setup_pty_console($p{console_socket});
-        }
+        # PTY setup is done inside run_init_process AFTER prepare_rootfs,
+        # using the container's devpts so readlink shows /dev/pts/X.
+        my $console_socket_path = ($spec->{process}{terminal} && $p{console_socket})
+            ? $p{console_socket} : undef;
 
         # Open a debug log in the state directory (host filesystem, before
         # pivot_root).  The fd survives pivot_root and close_range(CLOEXEC),
@@ -3115,7 +3155,7 @@ sub cmd_create {
         # Run the init process (eval captures die from fatal so we can
         # report the actual error to the parent through the channel).
         eval {
-            run_init_process($spec, $rootfs, $notify_srv, $main_w_fd, $init_r_fd, $cgpath, $id, $bundle, $pts_fd, $init_debug_fd, $no_pivot, $p{foreground});
+            run_init_process($spec, $rootfs, $notify_srv, $main_w_fd, $init_r_fd, $cgpath, $id, $bundle, $console_socket_path, $init_debug_fd, $no_pivot, $p{foreground});
         };
         if ($@) {
             my $err = "$@";
