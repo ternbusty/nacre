@@ -260,6 +260,7 @@ jobs:
 
       - name: Upload per-test logs
         if: always()
+        timeout-minutes: 2
         uses: actions/upload-artifact@v4
         with:
           name: validation-logs
