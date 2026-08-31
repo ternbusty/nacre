@@ -954,6 +954,41 @@ my %PROPAGATION_FLAGS = (
     runbindable => MS_UNBINDABLE | MS_REC,
 );
 
+sub _copy_dir_contents {
+    my ($src, $dst) = @_;
+    opendir(my $dh, $src) or return;
+    while (my $ent = readdir($dh)) {
+        next if $ent eq '.' || $ent eq '..';
+        my $s = "$src/$ent";
+        my $d = "$dst/$ent";
+        if (-d $s && !-l $s) {
+            mkdir $d, 0755;
+            _copy_dir_contents($s, $d);
+            # Preserve permissions
+            my @st = stat($s);
+            chmod $st[2] & 07777, $d if @st;
+        } elsif (-l $s) {
+            my $target = readlink($s);
+            symlink($target, $d) if defined $target;
+        } else {
+            # Copy file content
+            if (open my $in, '<:raw', $s) {
+                if (open my $out, '>:raw', $d) {
+                    my $buf;
+                    while (sysread($in, $buf, 65536)) {
+                        print $out $buf;
+                    }
+                    close $out;
+                    my @st = stat($s);
+                    chmod $st[2] & 07777, $d if @st;
+                }
+                close $in;
+            }
+        }
+    }
+    closedir $dh;
+}
+
 sub prepare_rootfs {
     my ($spec, $rootfs) = @_;
 
@@ -995,9 +1030,29 @@ sub apply_mounts {
             ensure_dir($dest);
         }
 
-        my ($flags, $data) = parse_mount_options($m->{options});
+        # Filter out OCI-specific pseudo-options before parsing
+        my @raw_opts = @{$m->{options} // []};
+        my $tmpcopyup = 0;
+        my @real_opts;
+        for my $o (@raw_opts) {
+            if ($o eq 'tmpcopyup' || $o eq 'copy') {
+                $tmpcopyup = 1;
+            } else {
+                push @real_opts, $o;
+            }
+        }
+        my ($flags, $data) = parse_mount_options(\@real_opts);
         my $type = $m->{type} // '';
         my $src  = $m->{source} // $type;
+
+        # tmpcopyup: bind-mount dest to a temp location, mount tmpfs,
+        # then copy content from the temp back into the tmpfs.
+        my $tmpcopy_src;
+        if ($tmpcopyup && -d $dest) {
+            $tmpcopy_src = "$dest.tmpcopyup.$$";
+            mkdir $tmpcopy_src, 0755;
+            do_mount($dest, $tmpcopy_src, '', MS_BIND, '');
+        }
 
         if ($flags & MS_BIND) {
             # Bind mount
@@ -1011,6 +1066,16 @@ sub apply_mounts {
         } else {
             do_mount($src, $dest, $type, $flags, $data)
                 or do { warn "nacre: mount $type on $dest: $!\n"; next; };
+        }
+
+        # Restore tmpcopyup content
+        if ($tmpcopy_src && -d $tmpcopy_src) {
+            _copy_dir_contents($tmpcopy_src, $dest);
+            # Unmount and remove the temporary bind mount
+            my $nr = SYS_umount2 + 0;
+            my $tgt = $tmpcopy_src . "\0";
+            syscall($nr, $tgt, 0);
+            rmdir $tmpcopy_src;
         }
     }
 }
@@ -2858,10 +2923,14 @@ sub run_init_process {
     $dbg->("exec: " . join(' ', @args) . " (PATH=$ENV{PATH})");
     # The debug fd is marked CLOEXEC (or closed by fallback); exec closes it.
     { exec { $args[0] } @args };
-    # runc-compatible error format: "exec <cmd>: <error>" (lowercase)
+    # runc-compatible error format — write directly to stderr and _exit.
+    # The channel fd is already closed (fd cleanup loop above), so
+    # fatal() → die → eval would lose the message.  runc also writes
+    # directly to stderr from the init process on exec failure.
     my $err = lc("$!");
     $dbg->("exec FAILED: $err");
-    fatal("exec $args[0]: $err");
+    print STDERR "exec $args[0]: $err\n";
+    POSIX::_exit(1);
 }
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -3724,7 +3793,7 @@ sub exec_tty_relay {
             close $efh;
         }
     }
-    warn "nacre: $err_msg\n" if $err_msg ne '';
+    warn "$err_msg\n" if $err_msg ne '';
 
     # Restore stdin
     fcntl_setfl($stdin_fd, $stdin_fl) if defined $stdin_fl;
@@ -4158,7 +4227,7 @@ sub cmd_exec {
         }
         close $err_r;
         if ($err_msg ne '') {
-            warn "nacre: $err_msg\n";
+            warn "$err_msg\n";
             exit(255);
         }
         POSIX::close($pty_master_fd) if defined $pty_master_fd;
@@ -4180,7 +4249,7 @@ sub cmd_exec {
     close $err_r;
 
     if ($err_msg ne '') {
-        warn "nacre: $err_msg\n";
+        warn "$err_msg\n";
     }
 
     if (WIFEXITED($?)) {
