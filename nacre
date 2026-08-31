@@ -312,7 +312,22 @@ sub write_file_atomic {
 
 sub ensure_dir {
     my ($path) = @_;
-    make_path($path, { mode => 0o755 }) unless -d $path;
+    return if -d $path;
+    # make_path uses stat() internally, which can fail with EOVERFLOW in
+    # user namespaces when the parent directory's owner UID is not mapped.
+    # Fall back to simple recursive mkdir on failure.
+    eval { make_path($path, { mode => 0o755 }) };
+    return if -d $path;
+    # Fallback: walk up to find an existing ancestor, then mkdir down
+    my @todo;
+    my $p = $path;
+    while ($p ne '' && $p ne '/' && !-d $p) {
+        push @todo, $p;
+        $p = dirname($p);
+    }
+    for my $d (reverse @todo) {
+        mkdir $d, 0755;
+    }
 }
 
 sub iso8601_now {
