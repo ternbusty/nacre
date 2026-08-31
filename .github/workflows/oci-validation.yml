@@ -135,9 +135,28 @@ jobs:
               done
             fi
           } >> "$GITHUB_STEP_SUMMARY"
-          # Don't fail CI yet — report results only
           echo "validation_pass=$PASS" >> "$GITHUB_OUTPUT"
           echo "validation_fail=$FAIL" >> "$GITHUB_OUTPUT"
+          echo "validation_timeout=$TIMEOUT" >> "$GITHUB_OUTPUT"
+          echo "validation_error=$ERROR" >> "$GITHUB_OUTPUT"
+
+      - name: Show failing test logs
+        if: always()
+        run: |
+          for f in ~/validation-out/*.log; do
+            [ -f "$f" ] || continue
+            if grep -q "^not ok" "$f" 2>/dev/null; then
+              echo "=== $(basename "$f") ==="
+              cat "$f"
+              echo ""
+            fi
+          done
+
+      - name: Fail on validation failures
+        if: steps.run-validation.outputs.validation_fail != '0' || steps.run-validation.outputs.validation_error != '0'
+        run: |
+          echo "::error::OCI validation failed: ${{ steps.run-validation.outputs.validation_fail }} failures, ${{ steps.run-validation.outputs.validation_error }} errors"
+          exit 1
 
       - name: Upload per-test logs
         if: always()
