@@ -2401,13 +2401,21 @@ sub cmd_create {
         };
 
         # Detach stdin so the init never blocks on terminal reads.
-        # Keep stdout/stderr as inherited from the caller — the OCI
-        # test harness (runtime-tools) redirects the runtime's stdout
-        # to a file and reads it back via ReadStandardStreams, so the
-        # container process's output must flow through the inherited fd.
+        # For stdout/stderr: if the fd is a pipe (e.g., shell's
+        # output=$(...) capture), redirect to /dev/null so the pipe
+        # closes when the parent exits and the shell doesn't hang.
+        # If the fd is a regular file (e.g., runtime-tools' exec.Command
+        # redirecting to a file), keep it so the container's output
+        # (runtimetest TAP) flows through the inherited fd.
         # For 'run' (foreground), all three stay connected.
         if (!$p{foreground}) {
             open STDIN, '<', '/dev/null';
+            if (-p STDOUT) {
+                open STDOUT, '>', '/dev/null';
+            }
+            if (-p STDERR) {
+                open STDERR, '>', '/dev/null';
+            }
         }
 
         # Unshare cgroup namespace
