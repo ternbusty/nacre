@@ -8,7 +8,7 @@ jobs:
   validate:
     name: runtime-tools validation
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -34,16 +34,6 @@ jobs:
           perl -e 'use Config; print "archname=$Config{archname}\n"'
           echo "=== Nacre version ==="
           perl /opt/nacre/nacre version 2>&1 || true
-          echo "=== syscall() sanity check ==="
-          perl -e '
-            use Config;
-            my $arch = $Config{archname};
-            my $sys_getpid = ($arch =~ /x86_64|amd64/i) ? 39 : 172;
-            my $pid = syscall($sys_getpid);
-            print "arch=$arch\n";
-            print "sys_getpid=$sys_getpid result=$pid real=$$\n";
-            print "match=" . ($pid == $$ ? "YES" : "NO") . "\n";
-          '
 
       - name: Install Go and dependencies
         run: |
@@ -77,13 +67,9 @@ jobs:
         id: run-validation
         run: |
           # ---------------------------------------------------------------
-          # CRITICAL: Close ALL fds > 2 in THIS step shell immediately.
-          #
-          # The Actions runner leaks its log-pipe on high fds.  If any child
-          # process inherits one of those fds, the runner never sees EOF and
-          # this step (plus every subsequent one) hangs until the job times
-          # out.  Closing them here means sudo / setsid / bash / test-procs
-          # can never inherit the pipe on fd 3+.
+          # Close ALL fds > 2 in this step shell.  The Actions runner
+          # leaks its log-pipe on high fds; children that inherit it
+          # block subsequent steps (and job cleanup) indefinitely.
           # ---------------------------------------------------------------
           for _fd in /proc/self/fd/*; do
             _n=$(basename "$_fd")
@@ -166,14 +152,15 @@ jobs:
           VALIDATION_SCRIPT
           chmod +x /tmp/run-validation.sh
 
-          # Run as root, in a new session, ALL stdio to a log file.
-          # The test loop has zero access to Actions fds.
-          sudo -E setsid bash /tmp/run-validation.sh \
+          # Run as root. stdout/stderr go to a log file so they don't
+          # flood the Actions log. No setsid — keep all processes in
+          # this step's process group so the runner can kill them.
+          sudo -E bash /tmp/run-validation.sh \
             > /tmp/validation-main.log 2>&1 </dev/null
 
           # Kill ALL lingering processes from the validation run
-          sudo pkill -9 -f 'nacre|runtimetest|validation\.t' 2>/dev/null || true
-          sleep 1
+          sudo pkill -9 -f 'nacre|runtimetest' 2>/dev/null || true
+          sleep 0.5
 
           # Display results (set +e so grep failures don't kill the step)
           set +eo pipefail
@@ -198,7 +185,7 @@ jobs:
 
           # Show errored/timed-out test logs
           echo "::group::Error and timeout details"
-          grep -E "^(ERROR|TIMEOUT)" /tmp/validation-main.log | while IFS= read -r line; do
+          grep -E "^(ERROR|TIMEOUT)" /tmp/validation-main.log 2>/dev/null | while IFS= read -r line; do
             tname=$(echo "$line" | awk '{print $2}')
             f="$OUTDIR/$tname.log"
             if [ -f "$f" ]; then
@@ -232,13 +219,13 @@ jobs:
             echo
             if [ "$FAIL" -gt 0 ]; then
               echo "### Failing tests"
-              grep "^FAIL " /tmp/validation-main.log | while IFS= read -r line; do
+              grep "^FAIL " /tmp/validation-main.log 2>/dev/null | while IFS= read -r line; do
                 echo "- $line"
               done
             fi
             if [ "$TIMEOUT" -gt 0 ]; then
               echo "### Timeouts"
-              grep "^TIMEOUT " /tmp/validation-main.log | while IFS= read -r line; do
+              grep "^TIMEOUT " /tmp/validation-main.log 2>/dev/null | while IFS= read -r line; do
                 echo "- $line"
               done
             fi
@@ -249,28 +236,8 @@ jobs:
           echo "validation_timeout=$TIMEOUT" >> "$GITHUB_OUTPUT"
           echo "validation_error=$ERROR"     >> "$GITHUB_OUTPUT"
 
-          # Final cleanup — kill anything still alive
-          sudo pkill -9 -f 'nacre|runtimetest' 2>/dev/null || true
-
-      - name: Fail on validation failures
-        if: steps.run-validation.outputs.validation_fail != '0' || steps.run-validation.outputs.validation_error != '0'
-        run: |
-          echo "::error::OCI validation failed: ${{ steps.run-validation.outputs.validation_fail }} failures, ${{ steps.run-validation.outputs.validation_error }} errors"
-          exit 1
-
-      - name: Kill lingering processes
-        if: always()
-        timeout-minutes: 1
-        continue-on-error: true
-        run: |
-          # Close leaked fds in this step shell too
-          for _fd in /proc/self/fd/*; do
-            _n=$(basename "$_fd")
-            [ "$_n" -gt 2 ] 2>/dev/null && eval "exec ${_n}>&-" 2>/dev/null || true
-          done
-          sudo pkill -9 -f 'nacre|runtimetest|validation' 2>/dev/null || true
-          sudo pkill -9 -f '/opt/nacre' 2>/dev/null || true
-          # Also kill any Go test binaries that might be lingering
-          sudo pkill -9 -f '\.t$' 2>/dev/null || true
-          sleep 1
-          echo "Cleanup complete"
+          # Final exit code: fail if any tests failed or errored
+          if [ "$FAIL" -gt 0 ] || [ "$ERROR" -gt 0 ]; then
+            echo "::error::OCI validation: $FAIL failures, $ERROR errors"
+            exit 1
+          fi
