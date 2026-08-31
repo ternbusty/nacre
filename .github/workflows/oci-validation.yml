@@ -89,20 +89,28 @@ jobs:
           RUNTIME=/opt/nacre/bin
           OUTDIR=$HOME/validation-out
 
-          PASS=0; FAIL=0; ERROR=0; TIMEOUT=0; SKIP_V1=0; SKIP_BROKEN=0
-          SKIP_V1_PATTERN='^(linux_cgroups_(network|blkio|hugetlb|devices|pids|relative_(blkio|network|hugetlb|devices|pids))|linux_cgroups_relative_cpus|linux_cgroups_relative_memory|linux_cgroups_cpus|linux_cgroups_memory|delete_(only_create_)?resources)$'
-          SKIP_BROKEN_PATTERN='^(pidfile|process_rlimits)$'
+          PASS=0; FAIL=0; ERROR=0; TIMEOUT=0
+
+          # Skip patterns — use bash regex ([[ =~ ]]) to avoid
+          # depending on /usr/bin/grep which may vanish inside the
+          # mount namespace after nacre's pivot_root.
+          SKIP_V1='^(linux_cgroups_(network|blkio|hugetlb|devices|pids|relative_(blkio|network|hugetlb|devices|pids))|linux_cgroups_relative_cpus|linux_cgroups_relative_memory|linux_cgroups_cpus|linux_cgroups_memory|delete_(only_create_)?resources)$'
+          SKIP_BROKEN='^(pidfile|process_rlimits)$'
+          SKIP_V1_N=0; SKIP_BROKEN_N=0
 
           for t in validation/*/*.t; do
-            name=$(basename "$t" .t)
+            # Use bash builtins instead of basename (external command
+            # may become unavailable inside the mount namespace)
+            name="${t##*/}"
+            name="${name%.t}"
 
-            if echo "$name" | grep -qE "$SKIP_V1_PATTERN"; then
-              SKIP_V1=$((SKIP_V1+1))
+            if [[ "$name" =~ $SKIP_V1 ]]; then
+              SKIP_V1_N=$((SKIP_V1_N+1))
               echo "SKIP(v1) $name"
               continue
             fi
-            if echo "$name" | grep -qE "$SKIP_BROKEN_PATTERN"; then
-              SKIP_BROKEN=$((SKIP_BROKEN+1))
+            if [[ "$name" =~ $SKIP_BROKEN ]]; then
+              SKIP_BROKEN_N=$((SKIP_BROKEN_N+1))
               echo "SKIP(broken-upstream) $name"
               continue
             fi
@@ -111,11 +119,13 @@ jobs:
             timeout --signal=KILL 60 env RUNTIME=$RUNTIME "$t" > "$out" 2>&1
             rc=$?
 
-            # Aggressively clean up between tests
+            # Clean up between tests (use full paths; || true for
+            # each command in case binaries are gone)
             $RUNTIME delete --force "$name" > /dev/null 2>&1 || true
-            killall -9 perl nacre runtimetest 2>/dev/null || true
-            sleep 0.2
-            find /run/nacre -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+            /usr/bin/killall -9 perl nacre runtimetest 2>/dev/null || true
+            # bash-builtin sleep substitute
+            read -t 0.2 </dev/null 2>/dev/null || true
+            /usr/bin/find /run/nacre -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
 
             if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
               TIMEOUT=$((TIMEOUT+1))
@@ -123,9 +133,16 @@ jobs:
               continue
             fi
 
-            n_ok=$(grep -c "^ok " "$out" 2>/dev/null || true)
-            n_notok=$(grep -c "^not ok " "$out" 2>/dev/null || true)
-            n_ok=${n_ok:-0}; n_notok=${n_notok:-0}
+            # Count ok/not-ok with bash builtins (grep may be gone)
+            n_ok=0; n_notok=0
+            if [ -f "$out" ]; then
+              while IFS= read -r line; do
+                case "$line" in
+                  "not ok "*)  n_notok=$((n_notok+1)) ;;
+                  "ok "*)      n_ok=$((n_ok+1)) ;;
+                esac
+              done < "$out"
+            fi
 
             if [ "$n_notok" -gt 0 ]; then
               FAIL=$((FAIL+1))
@@ -142,25 +159,18 @@ jobs:
           done
 
           echo "=== SUMMARY ==="
-          echo "PASS=$PASS  FAIL=$FAIL  TIMEOUT=$TIMEOUT  ERROR=$ERROR  SKIP_V1=$SKIP_V1  SKIP_BROKEN=$SKIP_BROKEN"
-
-          # Write outputs for the GitHub step
-          echo "$PASS"    > /tmp/validation_pass
-          echo "$FAIL"    > /tmp/validation_fail
-          echo "$TIMEOUT" > /tmp/validation_timeout
-          echo "$ERROR"   > /tmp/validation_error
+          echo "PASS=$PASS  FAIL=$FAIL  TIMEOUT=$TIMEOUT  ERROR=$ERROR  SKIP_V1=$SKIP_V1_N  SKIP_BROKEN=$SKIP_BROKEN_N"
           VALIDATION_SCRIPT
           chmod +x /tmp/run-validation.sh
 
-          # Run in a PID namespace: when the namespace init process
-          # exits, the kernel kills ALL remaining processes in the
-          # namespace.  This guarantees zero orphaned processes.
-          # --mount-proc remounts /proc so that PID numbers from the
-          # new namespace match /proc entries; without it nacre reads
-          # /proc/<pid>/stat for a HOST pid, not the namespace pid,
-          # causing all containers to appear "stopped" immediately.
-          sudo -E unshare --pid --fork --mount-proc \
-            bash /tmp/run-validation.sh \
+          # Run inside PID + mount namespace.  The PID namespace
+          # guarantees the kernel kills every orphan when the init
+          # exits.  The mount namespace isolates the /proc remount
+          # (needed so namespace-local PIDs match /proc entries) and
+          # prevents nacre's pivot_root from leaking mount changes
+          # back to the host.
+          sudo -E unshare --pid --fork --mount --propagation private \
+            bash -c 'mount -t proc proc /proc && exec bash /tmp/run-validation.sh' \
             > /tmp/validation-main.log 2>&1 </dev/null
 
           # Display results (set +e so grep failures don't kill the step)
@@ -197,13 +207,14 @@ jobs:
           done
           echo "::endgroup::"
 
-          # Read outputs
-          PASS=$(cat /tmp/validation_pass 2>/dev/null || echo 0)
-          FAIL=$(cat /tmp/validation_fail 2>/dev/null || echo 0)
-          TIMEOUT=$(cat /tmp/validation_timeout 2>/dev/null || echo 0)
-          ERROR=$(cat /tmp/validation_error 2>/dev/null || echo 0)
-          SKIP_V1=$(grep -c "^SKIP(v1)" /tmp/validation-main.log 2>/dev/null || echo 0)
-          SKIP_BROKEN=$(grep -c "^SKIP(broken-upstream)" /tmp/validation-main.log 2>/dev/null || echo 0)
+          # Parse counts from the SUMMARY line in the log (more
+          # reliable than /tmp files which may not survive the mount
+          # namespace).
+          _summary=$(grep '^PASS=' /tmp/validation-main.log 2>/dev/null | tail -1)
+          PASS=0; FAIL=0; TIMEOUT=0; ERROR=0; SKIP_V1=0; SKIP_BROKEN=0
+          if [ -n "$_summary" ]; then
+            eval "$(echo "$_summary" | sed 's/  */ /g; s/ /; /g; s/SKIP_V1_N/SKIP_V1/; s/SKIP_BROKEN_N/SKIP_BROKEN/')"
+          fi
 
           # Step summary
           {
