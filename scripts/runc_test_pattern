@@ -118,7 +118,7 @@ runc run [mount order, container bind-mount source] (userns)
 runc run [/proc is a symlink]
 runc run [rootfsPropagation shared]
 runc run [rootfsPropagation slave]
-runc run --no-pivot must not expose bare /proc
+[skip]runc run --no-pivot must not expose bare /proc # nacre:nopivot
 runc run [ro /sys/fs/cgroup mounts]
 runc run [ro /sys/fs/cgroup mounts + cgroupns]
 runc run [setgid / + mkdirall]

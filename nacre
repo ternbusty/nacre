@@ -269,6 +269,52 @@ my $JSON = JSON::PP->new->utf8->canonical->pretty->allow_nonref;
 my $JSON_COMPACT = JSON::PP->new->utf8->canonical->allow_nonref;
 
 # ═══════════════════════════════════════════════════════════════════════
+# Debug logging (--debug / --log / --log-format)
+# ═══════════════════════════════════════════════════════════════════════
+
+our $LOG_DEBUG  = 0;         # set by --debug
+our $LOG_FH     = undef;     # file handle for --log (or STDERR)
+our $LOG_FORMAT = 'text';    # 'text' or 'json'
+
+sub setup_logging {
+    my (%p) = @_;
+    $LOG_DEBUG  = $p{debug}  // 0;
+    $LOG_FORMAT = $p{format} // 'text';
+    if ($p{log_file}) {
+        open($LOG_FH, '>>', $p{log_file})
+            or die "nacre: cannot open log file $p{log_file}: $!\n";
+        $LOG_FH->autoflush(1);
+    } else {
+        $LOG_FH = \*STDERR;
+    }
+}
+
+sub log_msg {
+    my ($level, $msg) = @_;
+    return unless $LOG_FH;
+    # Only emit debug messages when --debug is set
+    return if $level eq 'debug' && !$LOG_DEBUG;
+
+    my @t = gmtime();
+    my $ts = sprintf('%04d-%02d-%02dT%02d:%02d:%02dZ',
+        $t[5]+1900, $t[4]+1, $t[3], $t[2], $t[1], $t[0]);
+
+    if ($LOG_FORMAT eq 'json') {
+        my $entry = $JSON_COMPACT->encode({
+            level => $level, msg => $msg, time => $ts,
+        });
+        print $LOG_FH "$entry\n";
+    } else {
+        print $LOG_FH "time=\"$ts\" level=$level msg=\"$msg\"\n";
+    }
+}
+
+sub log_debug { log_msg('debug', $_[0]) }
+sub log_info  { log_msg('info',  $_[0]) }
+sub log_warn  { log_msg('warning', $_[0]) }
+sub log_error { log_msg('error', $_[0]) }
+
+# ═══════════════════════════════════════════════════════════════════════
 # Utility functions
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -597,6 +643,7 @@ sub cgroup_setup {
 }
 
 sub cgroup_apply_resources {
+    log_debug("applying cgroup resources");
     my ($cgpath, $spec, %opts) = @_;
     my $res = $spec->{linux}{resources} // {};
 
@@ -877,6 +924,7 @@ sub prepare_rootfs {
 
 sub apply_mounts {
     my ($spec, $rootfs) = @_;
+    log_debug("applying mounts, rootfs=$rootfs");
     for my $m (@{$spec->{mounts} // []}) {
         my $dest = "$rootfs$m->{destination}";
         my $mount_src = $m->{source} // '';
@@ -995,6 +1043,7 @@ sub create_symlinks {
 }
 
 sub apply_pivot_root {
+    log_debug("applying pivot_root");
     my ($rootfs) = @_;
     chdir($rootfs) or fatal("chdir to rootfs: $!");
 
@@ -1021,6 +1070,19 @@ sub apply_rootfs_propagation {
 sub apply_masked_paths {
     my ($paths) = @_;
     for my $p (@{$paths // []}) {
+        # Security: refuse to mask through symlinks — a symlink at /proc
+        # or /sys could redirect the mask to an attacker-controlled path.
+        if (-l $p) {
+            warn "nacre: maskedPaths: refusing to mask symlink $p\n";
+            next;
+        }
+        # Check for symlink components in the path (resolve and compare)
+        my $resolved = eval { Cwd::abs_path($p) };
+        if (defined $resolved && $resolved ne $p) {
+            # Path contains symlink components — skip silently for safety
+            # (runc also skips these)
+            next;
+        }
         if (-d $p) {
             do_mount('tmpfs', $p, 'tmpfs', MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, 'size=0');
         } elsif (-e $p) {
@@ -1229,11 +1291,16 @@ sub apply_seccomp_ffi {
         seccomp_arch_add($ctx, $arch_val);
     }
 
+    # defaultErrnoRet: if set, SCMP_ACT_ERRNO without explicit errno uses this value
+    my $ffi_default_errno_ret = $seccomp->{defaultErrnoRet};
+
     # Add syscall rules
     for my $rule (@{$seccomp->{syscalls} // []}) {
         my $action_str = $rule->{action} // $default_action_str;
         my $action;
-        if ($action_str =~ /^SCMP_ACT_ERRNO\((\d+)\)$/) {
+        if ($action_str eq 'SCMP_ACT_ERRNO' && defined $ffi_default_errno_ret) {
+            $action = SCMP_ACT_ERRNO_BASE | ($ffi_default_errno_ret & 0xffff);
+        } elsif ($action_str =~ /^SCMP_ACT_ERRNO\((\d+)\)$/) {
             $action = SCMP_ACT_ERRNO_BASE | ($1 & 0xffff);
         } else {
             $action = $action_map{$action_str} // next;
@@ -1265,10 +1332,21 @@ sub apply_seccomp_ffi {
             my $filter_count = length($bpf_prog) / 8;  # each sock_filter is 8 bytes
             my $sock_fprog = pack('S x![P] P', $filter_count, unpack('Q', pack('P', $bpf_prog)));
 
-            # Use a more portable approach: write to a buffer and pass pointer
             my $nr_sec = SYS_seccomp + 0;
             my $op     = SECCOMP_SET_MODE_FILTER + 0;
-            my $fl     = 0;
+            # Map OCI seccomp.flags to kernel flag bits
+            my %ffi_flag_map = (
+                SECCOMP_FILTER_FLAG_TSYNC     => SECCOMP_FILTER_FLAG_TSYNC,
+                SECCOMP_FILTER_FLAG_LOG       => SECCOMP_FILTER_FLAG_LOG,
+                SECCOMP_FILTER_FLAG_SPEC_ALLOW => (1 << 2),
+                SECCOMP_FILTER_FLAG_NEW_LISTENER => SECCOMP_FILTER_FLAG_NEW_LISTENER,
+                SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV => SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV,
+            );
+            my $fl = 0;
+            for my $fn (@{$seccomp->{flags} // []}) {
+                $fl |= ($ffi_flag_map{$fn} // 0);
+            }
+            $fl += 0;
             syscall($nr_sec, $op, $fl, $sock_fprog);
         }
     } else {
@@ -1359,6 +1437,11 @@ sub apply_seccomp_minimal {
     my ($seccomp) = @_;
 
     my $default_str = $seccomp->{defaultAction} // 'SCMP_ACT_ALLOW';
+
+    # Handle defaultErrnoRet: if set, SCMP_ACT_ERRNO without explicit errno
+    # should use this value instead of the default EPERM(1).
+    my $default_errno_ret = $seccomp->{defaultErrnoRet};
+
     my $default_ret = _seccomp_action_val($default_str)
         // do { warn "nacre: seccomp: unknown default action $default_str\n"; return };
 
@@ -1366,7 +1449,14 @@ sub apply_seccomp_minimal {
     my @rules;
     for my $rule (@{$seccomp->{syscalls} // []}) {
         my $act = $rule->{action} // $default_str;
-        my $ret = _seccomp_action_val($act);
+        my $ret;
+
+        # Apply defaultErrnoRet when action is SCMP_ACT_ERRNO without explicit value
+        if ($act eq 'SCMP_ACT_ERRNO' && defined $default_errno_ret) {
+            $ret = 0x00050000 | ($default_errno_ret & 0xffff);
+        } else {
+            $ret = _seccomp_action_val($act);
+        }
         next unless defined $ret;
         next if $ret == $default_ret;   # same as default — skip
         for my $name (@{$rule->{names} // []}) {
@@ -1414,9 +1504,27 @@ sub apply_seccomp_minimal {
     # sock_fprog as a string.  'P' in pack produces a raw pointer to the scalar.
     my $fprog = pack('S x![Q] P', $ninsns, $filter);
 
+    # Map OCI seccomp.flags to kernel SECCOMP_FILTER_FLAG_* values
+    my %flag_map = (
+        SECCOMP_FILTER_FLAG_TSYNC     => SECCOMP_FILTER_FLAG_TSYNC,
+        SECCOMP_FILTER_FLAG_LOG       => SECCOMP_FILTER_FLAG_LOG,
+        SECCOMP_FILTER_FLAG_SPEC_ALLOW => (1 << 2),
+        SECCOMP_FILTER_FLAG_NEW_LISTENER => SECCOMP_FILTER_FLAG_NEW_LISTENER,
+        SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV => SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV,
+    );
+    my $fl = 0;
+    for my $flag_name (@{$seccomp->{flags} // []}) {
+        my $fv = $flag_map{$flag_name};
+        if (defined $fv) {
+            $fl |= $fv;
+        } else {
+            warn "nacre: seccomp: unknown flag '$flag_name'\n";
+        }
+    }
+
     my $nr = SYS_seccomp + 0;
     my $op = SECCOMP_SET_MODE_FILTER + 0;
-    my $fl = 0 + 0;
+    $fl += 0;
     my $ret = syscall($nr, $op, $fl, $fprog);
     if ($ret != 0) {
         warn "nacre: seccomp: BPF load failed (errno=$!), filter has $ninsns insns\n";
@@ -2238,6 +2346,7 @@ sub cmd_create {
     my $root   = $p{root}   // $DEFAULT_ROOT;
 
     $bundle = abs_path($bundle);
+    log_debug("create container id=$id bundle=$bundle root=$root");
 
     # Check container doesn't already exist (OCI spec: MUST error if ID not unique)
     if (-d state_dir($root, $id)) {
@@ -2552,6 +2661,7 @@ sub cmd_start {
     my (%p) = @_;
     my $id   = $p{id}   // fatal("container id required");
     my $root = $p{root} // $DEFAULT_ROOT;
+    log_debug("start container id=$id");
 
     my $state = load_state($root, $id);
     fatal("container '$id' is not in 'created' state (is '$state->{status}')")
@@ -2643,11 +2753,18 @@ sub cmd_delete {
     my $id    = $p{id}    // fatal("container id required");
     my $root  = $p{root}  // $DEFAULT_ROOT;
     my $force = $p{force} // 0;
+    log_debug("delete container id=$id force=$force");
 
     my $state = load_state($root, $id);
 
-    if ($state->{status} eq 'running' || $state->{status} eq 'created') {
+    if ($state->{status} eq 'running' || $state->{status} eq 'created'
+        || $state->{status} eq 'paused') {
         if ($force) {
+            # Unfreeze first for paused containers so SIGKILL can be delivered
+            if ($state->{status} eq 'paused' && $state->{cgroupPath}) {
+                eval { write_file("$state->{cgroupPath}/cgroup.freeze", "0\n") };
+                select(undef, undef, undef, 0.1);
+            }
             # Force kill
             if ($state->{pid} > 0) {
                 kill 9, $state->{pid};
@@ -2686,6 +2803,7 @@ sub cmd_run {
     my $id     = $p{id}     // fatal("container id required");
     my $root   = $p{root}   // $DEFAULT_ROOT;
     my $bundle = $p{bundle} // getcwd();
+    log_debug("run container id=$id bundle=$bundle detach=" . ($p{detach}//0));
     my $detach = $p{detach};
 
     if ($detach) {
@@ -2828,7 +2946,11 @@ sub cmd_list {
             push @containers, $st;
         }
         closedir($dh);
+    } elsif ($p{root_explicit}) {
+        # Explicit --root with non-existent directory is an error
+        fatal("root directory '$root' does not exist");
     }
+    # Default root that doesn't exist is fine — just show empty list
 
     if ($quiet) {
         print "$_->{id}\n" for @containers;
@@ -2892,6 +3014,7 @@ sub cmd_exec {
     my $exec_cwd   = $p{cwd};
     my $exec_env   = $p{env};
     my $exec_user  = $p{user};
+    log_debug("exec in container id=$id");
 
     my $state = load_state($root, $id);
     fatal("container '$id' is not running")
@@ -3000,7 +3123,20 @@ sub cmd_events {
     my (%p) = @_;
     my $id       = $p{id}       // fatal("container id required");
     my $root     = $p{root}     // $DEFAULT_ROOT;
-    my $interval = $p{interval} // 5;
+    # Parse Go-style duration: "100ms", "1s", "5s", or plain number (seconds)
+    my $interval_raw = $p{interval} // '5s';
+    my $interval;
+    if ($interval_raw =~ /^(\d+(?:\.\d+)?)ms$/i) {
+        $interval = $1 / 1000.0;
+    } elsif ($interval_raw =~ /^(\d+(?:\.\d+)?)s$/i) {
+        $interval = $1 + 0;
+    } elsif ($interval_raw =~ /^(\d+(?:\.\d+)?)m$/i) {
+        $interval = $1 * 60;
+    } elsif ($interval_raw =~ /^(\d+(?:\.\d+)?)$/) {
+        $interval = $1 + 0;
+    } else {
+        $interval = 5;
+    }
     my $stats    = $p{stats};
 
     my $state = load_state($root, $id);
@@ -3033,6 +3169,26 @@ sub cmd_events {
             $s{memory}{$k} = int($v) if defined $v;
         }
 
+        # PSI (pressure stall information) - io, cpu, memory
+        for my $psi_type (qw(cpu io memory)) {
+            my $psi_data = read_file("$cgpath/$psi_type.pressure");
+            if (defined $psi_data) {
+                for my $line (split /\n/, $psi_data) {
+                    # Format: some avg10=0.00 avg60=0.00 avg300=0.00 total=0
+                    #         full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+                    if ($line =~ /^(some|full)\s+(.*)/) {
+                        my ($level, $rest) = ($1, $2);
+                        my %vals;
+                        while ($rest =~ /(\w+)=([0-9.]+)/g) {
+                            my ($k, $v) = ($1, $2);
+                            $vals{$k} = ($k eq 'total') ? int($v) : $v + 0.0;
+                        }
+                        $s{$psi_type . '_pressure'}{$level} = \%vals;
+                    }
+                }
+            }
+        }
+
         # Build JSON with runc-compatible field order (type, id, data)
         printf qq({"type":"stats","id":%s,"data":%s}\n),
             $JSON_COMPACT->encode($id),
@@ -3046,7 +3202,12 @@ sub cmd_events {
 
     while (1) {
         $print_stats->();
-        sleep $interval;
+        # Use select for sub-second sleep
+        if ($interval < 1) {
+            select(undef, undef, undef, $interval);
+        } else {
+            sleep int($interval);
+        }
         # Refresh state to check if still alive
         $state = eval { load_state($root, $id) };
         last unless $state;
@@ -3145,6 +3306,7 @@ sub cmd_features {
 
 sub main {
     my $root = $DEFAULT_ROOT;
+    my $root_explicit = 0;
     my $log_level = 'warn';
     my $log_format = 'text';
     my $debug = 0;
@@ -3153,14 +3315,23 @@ sub main {
     # Parse global options (before command)
     Getopt::Long::Configure('pass_through', 'no_auto_abbrev');
     GetOptions(
-        'root=s'           => \$root,
+        'root=s'           => sub { $root = $_[1]; $root_explicit = 1; },
         'log=s'            => \my $log_file,
         'log-format=s'     => \$log_format,
         'debug'            => \$debug,
         'systemd-cgroup'   => \$systemd_cgroup,
     );
 
+    # Initialize logging subsystem
+    setup_logging(
+        debug    => $debug,
+        log_file => $log_file,
+        format   => $log_format,
+    );
+
     my $command = shift @ARGV // usage();
+
+    log_debug("nacre starting, command=$command root=$root");
 
     # Handle `<command> -h` / `<command> --help` for any subcommand (runc compat)
     if ($command !~ /^-/ && $command ne 'help'
@@ -3179,7 +3350,8 @@ sub main {
         );
         my $id = shift @ARGV // fatal("container id required");
         cmd_create(id => $id, bundle => $bundle, root => $root,
-                   pid_file => $pid_file, console_socket => $console_socket);
+                   pid_file => $pid_file, console_socket => $console_socket,
+                   no_pivot => $no_pivot);
     }
     elsif ($command eq 'start') {
         my $id = shift @ARGV // fatal("container id required");
@@ -3214,7 +3386,7 @@ sub main {
         my $id = shift @ARGV // fatal("container id required");
         cmd_run(id => $id, bundle => $bundle, root => $root,
                 pid_file => $pid_file, console_socket => $console_socket,
-                detach => $detach);
+                detach => $detach, no_pivot => $no_pivot);
     }
     elsif ($command eq 'list') {
         my ($format, $quiet);
@@ -3222,7 +3394,8 @@ sub main {
             'format|f=s' => \$format,
             'quiet|q'    => \$quiet,
         );
-        cmd_list(root => $root, format => $format, quiet => $quiet);
+        cmd_list(root => $root, format => $format, quiet => $quiet,
+                 root_explicit => $root_explicit);
     }
     elsif ($command eq 'pause') {
         my $id = shift @ARGV // fatal("container id required");
@@ -3276,7 +3449,7 @@ sub main {
     elsif ($command eq 'events') {
         my ($interval, $stats);
         GetOptions(
-            'interval|i=i' => \$interval,
+            'interval|i=s' => \$interval,
             'stats'        => \$stats,
         );
         my $id = shift @ARGV // fatal("container id required");
