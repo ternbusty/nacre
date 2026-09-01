@@ -1603,7 +1603,12 @@ sub apply_mounts {
     my %dest_preexisted;
 
     for my $m (@{$spec->{mounts} // []}) {
-        my $dest = "$rootfs$m->{destination}";
+        # If the destination already starts with the rootfs path (e.g.
+        # container-relative bind mount sources use full paths), use it
+        # as-is to avoid doubling the prefix.
+        my $dest = (index($m->{destination}, $rootfs) == 0)
+            ? $m->{destination}
+            : "$rootfs$m->{destination}";
         my $mount_src = $m->{source} // '';
         my $type = $m->{type} // '';
 
