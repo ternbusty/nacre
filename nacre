@@ -1443,15 +1443,11 @@ sub _copy_dir_contents {
 sub prepare_rootfs {
     my ($spec, $rootfs, $mount_source_fds, $chan_w, $chan_r) = @_;
 
-    # During setup, use the spec's rootfsPropagation (or MS_SLAVE|MS_REC
-    # as default) to prevent mount events from leaking to the parent mount
-    # namespace.  The spec's propagation is re-applied AFTER pivot_root
-    # (see apply_rootfs_propagation).
-    my $prep_prop = MS_SLAVE | MS_REC;
-    if (my $rp = $spec->{linux}{rootfsPropagation}) {
-        $prep_prop = $PROPAGATION_FLAGS{$rp} // $prep_prop;
-    }
-    do_mount('', '/', '', $prep_prop, '')
+    # ALWAYS make "/" rslave before any rootfs setup to prevent mount
+    # events from propagating back to the parent mount namespace.
+    # The spec's rootfsPropagation (shared, rslave, etc.) is applied
+    # AFTER pivot_root by apply_rootfs_propagation, not here.
+    do_mount('', '/', '', MS_SLAVE | MS_REC, '')
         or fatal("mount propagation (setup) /: $!");
 
     # Make the rootfs mount point (or its nearest parent mount) private.
