@@ -1,6 +1,5 @@
 package Nacre::IPC;
-use strict;
-use warnings;
+use v5.38;
 use Exporter 'import';
 use Nacre::Const;
 use Nacre::Util;
@@ -18,15 +17,13 @@ sub create_channel {
     return (fileno($a), fileno($b), $a, $b);
 }
 
-sub channel_send {
-    my ($fd, $msg) = @_;
+sub channel_send ($fd, $msg) {
     my $data = $JSON_COMPACT->encode($msg);
     my $ret = POSIX::write($fd, $data, length($data));
     fatal("channel_send: $!") unless defined $ret && $ret > 0;
 }
 
-sub channel_recv {
-    my ($fd) = @_;
+sub channel_recv ($fd) {
     my $buf;
     my $ret = POSIX::read($fd, $buf, 65536);
     return undef unless defined $ret && $ret > 0;
@@ -37,8 +34,7 @@ sub channel_recv {
 # Notify Socket (for start command)
 # ═══════════════════════════════════════════════════════════════════════
 
-sub create_notify_listener {
-    my ($sock_path) = @_;
+sub create_notify_listener ($sock_path) {
     unlink $sock_path;
     socket(my $srv, AF_UNIX, SOCK_STREAM, 0) or fatal("socket: $!");
     bind($srv, pack_sockaddr_un($sock_path))  or fatal("bind $sock_path: $!");
@@ -46,8 +42,7 @@ sub create_notify_listener {
     return $srv;
 }
 
-sub wait_for_start {
-    my ($srv_fh) = @_;
+sub wait_for_start ($srv_fh) {
     accept(my $cli, $srv_fh) or fatal("accept on notify socket: $!");
     my $buf;
     sysread($cli, $buf, 4096);
@@ -55,8 +50,7 @@ sub wait_for_start {
     return 1;
 }
 
-sub notify_container_start {
-    my ($sock_path) = @_;
+sub notify_container_start ($sock_path) {
     socket(my $s, AF_UNIX, SOCK_STREAM, 0) or fatal("socket: $!");
     connect($s, pack_sockaddr_un($sock_path)) or fatal("connect $sock_path: $!");
     syswrite($s, "start container");
@@ -70,8 +64,7 @@ sub notify_container_start {
 # Send a file descriptor over a Unix domain socket using SCM_RIGHTS.
 # Optional $payload is sent as the data (instead of a single NUL byte);
 # this is used for seccomp notify listener metadata.
-sub send_fd_via_socket {
-    my ($socket_path, $fd, $payload) = @_;
+sub send_fd_via_socket ($socket_path, $fd, $payload = undef) {
 
     socket(my $sock, AF_UNIX, SOCK_STREAM, 0) or fatal("socket: $!");
     connect($sock, pack_sockaddr_un($socket_path))
@@ -108,8 +101,7 @@ sub send_fd_via_socket {
 }
 
 # Send a file descriptor over an already-connected socket fd (not a path).
-sub send_fd_over_fd {
-    my ($sock_fd, $fd) = @_;
+sub send_fd_over_fd ($sock_fd, $fd) {
     $sock_fd = $sock_fd + 0;
     my $data = "\x00";
     my $iov  = pack('P L!', $data, 1);
@@ -132,8 +124,7 @@ sub send_fd_over_fd {
 }
 
 # Receive a file descriptor over a socket fd.
-sub recv_fd_over_fd {
-    my ($sock_fd) = @_;
+sub recv_fd_over_fd ($sock_fd) {
     $sock_fd = $sock_fd + 0;
     my $data = "\0";
     my $iov  = pack('P L!', $data, 1);
@@ -165,8 +156,7 @@ sub recv_fd_over_fd {
 # slave file descriptor (as an integer fd number).  Must be called before
 # pivot_root so that both /dev/ptmx and the console-socket path are
 # reachable on the host filesystem.
-sub setup_pty_console {
-    my ($console_socket_path) = @_;
+sub setup_pty_console ($console_socket_path) {
 
     # Open PTY master
     sysopen(my $ptm, '/dev/ptmx', O_RDWR | O_NOCTTY | O_CLOEXEC)
@@ -205,8 +195,7 @@ sub setup_pty_console {
 # Set a PTY fd to raw mode (cfmakeraw equivalent).
 # Disables OPOST/ONLCR so \n is not converted to \r\n, ECHO so input
 # is not reflected, and line-editing (ICANON) so reads return immediately.
-sub pty_set_raw {
-    my ($fd) = @_;
+sub pty_set_raw ($fd) {
     # TCGETS = 0x5401, TCSETS = 0x5402 on Linux x86_64/aarch64
     use constant TCGETS_C => 0x5401;
     use constant TCSETS_C => 0x5402;

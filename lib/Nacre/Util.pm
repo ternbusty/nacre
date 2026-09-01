@@ -1,6 +1,5 @@
 package Nacre::Util;
-use strict;
-use warnings;
+use v5.38;
 use Exporter 'import';
 use JSON::PP;
 use File::Basename qw(dirname);
@@ -20,8 +19,7 @@ our $LOG_DEBUG  = 0;
 our $LOG_FH     = undef;
 our $LOG_FORMAT = 'text';
 
-sub setup_logging {
-    my (%p) = @_;
+sub setup_logging (%p) {
     $LOG_DEBUG  = $p{debug}  // 0;
     $LOG_FORMAT = $p{format} // 'text';
     if ($p{log_file}) {
@@ -33,8 +31,7 @@ sub setup_logging {
     }
 }
 
-sub log_msg {
-    my ($level, $msg) = @_;
+sub log_msg ($level, $msg) {
     return unless $LOG_FH;
     return if $level eq 'debug' && !$LOG_DEBUG;
 
@@ -52,23 +49,22 @@ sub log_msg {
     }
 }
 
-sub log_debug { log_msg('debug', $_[0]) }
-sub log_info  { log_msg('info',  $_[0]) }
-sub log_warn  { log_msg('warning', $_[0]) }
-sub log_error { log_msg('error', $_[0]) }
+sub log_debug ($msg) { log_msg('debug', $msg) }
+sub log_info  ($msg) { log_msg('info',  $msg) }
+sub log_warn  ($msg) { log_msg('warning', $msg) }
+sub log_error ($msg) { log_msg('error', $msg) }
 
 # ═══════════════════════════════════════════════════════════════════════
 # Utility functions
 # ═══════════════════════════════════════════════════════════════════════
 
-sub fatal {
+sub fatal (@args) {
     $! = 0;
     $? = 0;
-    die "nacre: @_\n";
+    die "nacre: @args\n";
 }
 
-sub parse_size {
-    my ($s) = @_;
+sub parse_size ($s) {
     return undef unless defined $s;
     $s =~ s/^\s+|\s+$//g;
     return -1 if $s eq '-1';
@@ -83,15 +79,13 @@ sub parse_size {
     fatal("invalid size: '$s'");
 }
 
-sub write_file {
-    my ($path, $content) = @_;
+sub write_file ($path, $content) {
     open my $fh, '>', $path or fatal("write $path: $!");
     print $fh $content or fatal("write $path: $!");
     close $fh or fatal("close $path: $!");
 }
 
-sub read_file {
-    my ($path) = @_;
+sub read_file ($path) {
     open my $fh, '<', $path or return undef;
     local $/;
     my $data = <$fh>;
@@ -99,22 +93,19 @@ sub read_file {
     return $data;
 }
 
-sub read_file_or_die {
-    my ($path) = @_;
+sub read_file_or_die ($path) {
     my $data = read_file($path);
     fatal("cannot read $path: $!") unless defined $data;
     return $data;
 }
 
-sub write_file_atomic {
-    my ($path, $content) = @_;
+sub write_file_atomic ($path, $content) {
     my $tmp = "$path.tmp.$$";
     write_file($tmp, $content);
     rename($tmp, $path) or do { unlink $tmp; fatal("rename $tmp -> $path: $!"); };
 }
 
-sub ensure_dir {
-    my ($path) = @_;
+sub ensure_dir ($path) {
     return if -d $path;
     my @todo;
     my $p = $path;
@@ -142,9 +133,9 @@ sub iso8601_now {
         $t[5]+1900, $t[4]+1, $t[3], $t[2], $t[1], $t[0]);
 }
 
-sub do_syscall {
-    my ($a0,$a1,$a2,$a3,$a4,$a5) = map { $_ + 0 } @_;
-    my $n = scalar @_;
+sub do_syscall (@args) {
+    my ($a0,$a1,$a2,$a3,$a4,$a5) = map { $_ + 0 } @args;
+    my $n = scalar @args;
     my $ret;
     do {
         if    ($n <= 1) { $ret = syscall($a0); }

@@ -1,7 +1,8 @@
 #!/usr/bin/perl
 # nacre — a Linux OCI container runtime written in Perl
-use strict;
-use warnings;
+use v5.38;
+use feature 'try', 'defer';
+no warnings 'experimental::try', 'experimental::defer';
 use POSIX qw(setsid _exit dup2 mkfifo WNOHANG WIFEXITED WEXITSTATUS
              WIFSIGNALED WTERMSIG :sys_wait_h :signal_h :errno_h);
 use Socket qw(AF_UNIX SOCK_STREAM pack_sockaddr_un);
@@ -34,8 +35,12 @@ my $DEFAULT_ROOT = '/run/nacre';
 # Init Process (runs inside the container)
 # ═══════════════════════════════════════════════════════════════════════
 
-sub run_init_process {
-    my ($spec, $rootfs, $notify_fd, $main_chan_w, $main_chan_r, $cgpath, $id, $bundle, $console_socket_path, $debug_fd, $no_pivot, $foreground, $pty_sock_fd, $mount_source_fds, $console_socket_prefd) = @_;
+sub run_init_process (
+    $spec, $rootfs, $notify_fd, $main_chan_w, $main_chan_r,
+    $cgpath, $id, $bundle, $console_socket_path, $debug_fd,
+    $no_pivot, $foreground, $pty_sock_fd, $mount_source_fds,
+    $console_socket_prefd,
+) {
 
     my $dbg = sub {
         return unless defined $debug_fd && $debug_fd >= 0;
@@ -327,8 +332,7 @@ sub run_init_process {
 # Main Process (runs on the host, coordinates init setup)
 # ═══════════════════════════════════════════════════════════════════════
 
-sub run_main_process {
-    my (%p) = @_;
+sub run_main_process (%p) {
     my $spec       = $p{spec};
     my $id         = $p{id};
     my $bundle     = $p{bundle};
@@ -391,8 +395,7 @@ sub run_main_process {
 # User namespace UID/GID mapping
 # ═══════════════════════════════════════════════════════════════════════
 
-sub write_id_mappings {
-    my ($pid, $spec) = @_;
+sub write_id_mappings ($pid, $spec) {
     my $linux = $spec->{linux} // return;
 
     my $uid_maps = $linux->{uidMappings};
@@ -421,8 +424,7 @@ sub write_id_mappings {
 # Container Lifecycle: create
 # ═══════════════════════════════════════════════════════════════════════
 
-sub cmd_create {
-    my (%p) = @_;
+sub cmd_create (%p) {
     my $id       = $p{id}       // fatal("container id required");
     my $bundle   = $p{bundle}   // getcwd();
     my $root     = $p{root}     // $DEFAULT_ROOT;
@@ -820,17 +822,16 @@ sub cmd_create {
         # even when a user namespace remaps our UID on the host FS).
         # $notify_srv is inherited from the parent scope.
 
-        # Run the init process (eval captures die from fatal so we can
+        # Run the init process (try/catch captures die from fatal so we can
         # report the actual error to the parent through the channel).
-        eval {
+        try {
             run_init_process($spec, $rootfs, $notify_srv, $main_w_fd, $init_r_fd, $cgpath, $id, $bundle, $console_socket_path, $init_debug_fd, $no_pivot, $p{foreground}, $pty_sock_fd, \%mount_source_fds, $console_socket_preconnected_fd);
-        };
-        if ($@) {
-            my $err = "$@";
+        } catch ($e) {
+            my $err = "$e";
             chomp $err;
             # Write error directly to stderr (which is the PTY slave in
             # terminal mode, or the original stderr otherwise).  The die
-            # message was caught by eval and never reached stderr, and
+            # message was caught by try and never reached stderr, and
             # the channel fd is already closed (fd cleanup after init_ready),
             # so this is the only way to get the message to the parent.
             POSIX::write(2, "$err\n", length($err) + 1);
@@ -875,8 +876,8 @@ sub cmd_create {
                 # cgroup_setup must NOT be silenced — "non-empty cgroup"
                 # is a real error that must propagate.
                 cgroup_setup($cgpath, $spec) if $cgpath;
-                eval { cgroup_add_process($cgpath, $init_pid); };
-                if ($@) { log_debug("cgroup_add_process in NEWCGROUP path: $@"); }
+                try { cgroup_add_process($cgpath, $init_pid); }
+                catch ($e) { log_debug("cgroup_add_process in NEWCGROUP path: $e"); }
                 eval { apply_device_cgroup($cgpath, $spec); };
                 channel_send($init_w_fd, { type => 'cgroup_done' });
             }
@@ -979,7 +980,7 @@ sub cmd_create {
                 my $listener_path = $spec->{linux}{seccomp}{listenerPath} // '';
                 my $listener_meta = $spec->{linux}{seccomp}{listenerMetadata} // '';
                 if ($listener_path ne '') {
-                    eval {
+                    try {
                         # Build ContainerProcessState JSON per OCI spec.
                         # The seccompagent expects this as the data payload
                         # alongside the fd via SCM_RIGHTS.
@@ -999,9 +1000,8 @@ sub cmd_create {
                         };
                         my $payload = $JSON_COMPACT->encode($container_state);
                         send_fd_via_socket($listener_path, $notify_fd, $payload);
-                    };
-                    if ($@) {
-                        my $err = "$@";
+                    } catch ($e) {
+                        my $err = "$e";
                         chomp $err;
                         warn "nacre: failed to connect with seccomp agent at $listener_path: $err\n";
                         POSIX::close($notify_fd);
@@ -1102,18 +1102,16 @@ sub cmd_create {
     # Run createRuntime hooks (OCI spec: MUST error if these fail)
     # If a hook fails, clean up state so the container id can be reused.
     if (my $hooks = $spec->{hooks}) {
-        eval {
+        try {
             run_hooks($hooks->{createRuntime}, $state, must_succeed => 1, type => 'createRuntime');
             run_hooks($hooks->{createContainer}, $state, must_succeed => 1, type => 'createContainer');
             run_hooks($hooks->{prestart}, $state, must_succeed => 1, type => 'prestart');
-        };
-        if ($@) {
-            my $err = $@;
+        } catch ($e) {
             # Kill the init process and clean up state
             kill 9, $init_pid if $init_pid;
             waitpid($init_pid, 0) if $init_pid;
             delete_state($root, $id);
-            die $err;
+            die $e;
         }
     }
 
@@ -1127,8 +1125,7 @@ sub cmd_create {
 # Container Lifecycle: start
 # ═══════════════════════════════════════════════════════════════════════
 
-sub cmd_start {
-    my (%p) = @_;
+sub cmd_start (%p) {
     my $id   = $p{id}   // fatal("container id required");
     my $root = $p{root} // $DEFAULT_ROOT;
     log_debug("start container id=$id");
@@ -1160,13 +1157,11 @@ sub cmd_start {
     # (matching runc behaviour — the container HAS started, but the run
     # command reports failure).
     if ($spec->{hooks}) {
-        eval {
+        try {
             run_hooks($spec->{hooks}{poststart}, $state, must_succeed => 1, type => 'poststart');
-        };
-        if ($@) {
-            my $err = $@;
+        } catch ($e) {
             eval { kill 9, $state->{pid} if $state->{pid}; };
-            die $err;
+            die $e;
         }
     }
 }
@@ -1175,8 +1170,7 @@ sub cmd_start {
 # Container Lifecycle: state
 # ═══════════════════════════════════════════════════════════════════════
 
-sub cmd_state {
-    my (%p) = @_;
+sub cmd_state (%p) {
     my $id   = $p{id}   // fatal("container id required");
     my $root = $p{root} // $DEFAULT_ROOT;
 
@@ -1188,8 +1182,7 @@ sub cmd_state {
 # Container Lifecycle: kill
 # ═══════════════════════════════════════════════════════════════════════
 
-sub cmd_kill {
-    my (%p) = @_;
+sub cmd_kill (%p) {
     my $id     = $p{id}     // fatal("container id required");
     my $root   = $p{root}   // $DEFAULT_ROOT;
     my $signal = $p{signal} // 'TERM';
@@ -1263,8 +1256,7 @@ sub cmd_kill {
 # Container Lifecycle: delete
 # ═══════════════════════════════════════════════════════════════════════
 
-sub cmd_delete {
-    my (%p) = @_;
+sub cmd_delete (%p) {
     my $id    = $p{id}    // fatal("container id required");
     my $root  = $p{root}  // $DEFAULT_ROOT;
     my $force = $p{force} // 0;
@@ -1321,8 +1313,7 @@ sub cmd_delete {
 # Container Lifecycle: run (create + start + wait + delete)
 # ═══════════════════════════════════════════════════════════════════════
 
-sub cmd_run {
-    my (%p) = @_;
+sub cmd_run (%p) {
     my $id     = $p{id}     // fatal("container id required");
     my $root   = $p{root}   // $DEFAULT_ROOT;
     my $bundle = $p{bundle} // getcwd();
@@ -1558,8 +1549,7 @@ sub cmd_run {
 # Container: list
 # ═══════════════════════════════════════════════════════════════════════
 
-sub cmd_list {
-    my (%p) = @_;
+sub cmd_list (%p) {
     my $root   = $p{root}   // $DEFAULT_ROOT;
     my $format = $p{format} // 'table';
     my $quiet  = $p{quiet}  // 0;
@@ -1616,8 +1606,7 @@ sub cmd_list {
 # Container: pause / resume
 # ═══════════════════════════════════════════════════════════════════════
 
-sub cmd_pause {
-    my (%p) = @_;
+sub cmd_pause (%p) {
     my $id   = $p{id}   // fatal("container id required");
     my $root = $p{root} // $DEFAULT_ROOT;
 
@@ -1629,8 +1618,7 @@ sub cmd_pause {
     save_state($root, $state);
 }
 
-sub cmd_resume {
-    my (%p) = @_;
+sub cmd_resume (%p) {
     my $id   = $p{id}   // fatal("container id required");
     my $root = $p{root} // $DEFAULT_ROOT;
 
@@ -1646,8 +1634,7 @@ sub cmd_resume {
 # Exec TTY I/O relay
 # ═══════════════════════════════════════════════════════════════════════
 
-sub exec_tty_relay {
-    my ($child_pid, $master_fd, $err_r_fd) = @_;
+sub exec_tty_relay ($child_pid, $master_fd, $err_r_fd) {
 
     # Relay I/O between PTY master and our stdin/stdout.
     # This runs until the child process exits.
@@ -1764,8 +1751,7 @@ sub exec_tty_relay {
 }
 
 # Helper: fcntl F_GETFL / F_SETFL
-sub fcntl_getfl {
-    my ($fd) = @_;
+sub fcntl_getfl ($fd) {
     return undef unless defined $fd;
     # Use +<& (dup) instead of +<&= to avoid closing the original fd
     # when $fh goes out of scope.
@@ -1774,8 +1760,7 @@ sub fcntl_getfl {
     return defined $fl ? ($fl + 0) : undef;
 }
 
-sub fcntl_setfl {
-    my ($fd, $fl) = @_;
+sub fcntl_setfl ($fd, $fl) {
     return undef unless defined $fd;
     open my $fh, '+<&', $fd or return undef;
     return fcntl($fh, Fcntl::F_SETFL(), $fl);
@@ -1791,8 +1776,7 @@ sub exec_fatal {
     exit 255;
 }
 
-sub cmd_exec {
-    my (%p) = @_;
+sub cmd_exec (%p) {
     my $id             = $p{id}             // exec_fatal("container id required");
     my $root           = $p{root}           // $DEFAULT_ROOT;
     my @cmd            = @{$p{command}      // []};
@@ -1817,8 +1801,8 @@ sub cmd_exec {
     if ($process_file) {
         my $pdata = read_file($process_file);
         exec_fatal("cannot read process file '$process_file'") unless defined $pdata;
-        $exec_proc = eval { $JSON->decode($pdata) };
-        exec_fatal("invalid process JSON: $@") if $@;
+        try { $exec_proc = $JSON->decode($pdata); }
+        catch ($e) { exec_fatal("invalid process JSON: $e"); }
         @cmd = @{$exec_proc->{args} // []} unless @cmd;
         $exec_cwd  //= $exec_proc->{cwd};
         $exec_env  = $exec_proc->{env} if $exec_proc->{env} && !($exec_env && @$exec_env);
@@ -2358,22 +2342,24 @@ sub cmd_exec {
     if ($exec_target_cgpath && $has_pid_ns_in_exec) {
         $deferred_exec_cg_path = $exec_target_cgpath;
     } elsif ($exec_target_cgpath) {
-        eval { write_file("$exec_target_cgpath/cgroup.procs", "$child\n") };
-        if ($@) {
+        try {
+            write_file("$exec_target_cgpath/cgroup.procs", "$child\n");
+        } catch ($e) {
             # The container's cgroup may be an internal node (domain
             # controllers enabled via subtree_control).  Fall back to
             # init's actual cgroup — but ONLY when --cgroup was NOT
             # explicitly set (explicit --cgroup should fail hard).
             if (!$exec_cgroup && $init_actual_cgpath
                 && $init_actual_cgpath ne $exec_target_cgpath) {
-                eval { write_file("$init_actual_cgpath/cgroup.procs", "$child\n") };
-                if ($@) {
-                    my $err = $@; chomp $err;
+                try {
+                    write_file("$init_actual_cgpath/cgroup.procs", "$child\n");
+                } catch ($e2) {
+                    my $err = "$e2"; chomp $err;
                     fatal("adding pid $child to cgroups: $err");
                 }
                 $exec_target_cgpath = $init_actual_cgpath;
             } else {
-                my $err = $@; chomp $err;
+                my $err = "$e"; chomp $err;
                 fatal("adding pid $child to cgroups: $err");
             }
         }
@@ -2401,9 +2387,10 @@ sub cmd_exec {
     # may have already exited by the time we write, producing ESRCH.
     if ($deferred_exec_cg_path) {
         my $cg_pid = $final_pid;
-        eval { write_file("$deferred_exec_cg_path/cgroup.procs", "$cg_pid\n") };
-        if ($@) {
-            my $err = $@; chomp $err;
+        try {
+            write_file("$deferred_exec_cg_path/cgroup.procs", "$cg_pid\n");
+        } catch ($e) {
+            my $err = "$e"; chomp $err;
             if ($exec_cgroup) {
                 # Explicit --cgroup: always fatal on failure (e.g. EBUSY
                 # when the cgroup is an internal node).
@@ -2451,9 +2438,9 @@ sub cmd_exec {
                     },
                 };
                 my $payload = $JSON_COMPACT->encode($container_state);
-                eval { send_fd_via_socket($listener_path, $notify_fd, $payload) };
-                if ($@) {
-                    warn "nacre: failed to send seccomp notify fd to $listener_path: $@\n";
+                try { send_fd_via_socket($listener_path, $notify_fd, $payload) }
+                catch ($e) {
+                    warn "nacre: failed to send seccomp notify fd to $listener_path: $e\n";
                 }
             }
             POSIX::close($notify_fd);
@@ -2550,8 +2537,7 @@ sub cmd_exec {
 # Container: update (resource limits)
 # ═══════════════════════════════════════════════════════════════════════
 
-sub cmd_update {
-    my (%p) = @_;
+sub cmd_update (%p) {
     my $id       = $p{id}        // fatal("container id required");
     my $root     = $p{root}      // $DEFAULT_ROOT;
     my $res_file = $p{resources};
@@ -2663,8 +2649,7 @@ sub cmd_update {
 # Container: events (stats)
 # ═══════════════════════════════════════════════════════════════════════
 
-sub cmd_events {
-    my (%p) = @_;
+sub cmd_events (%p) {
     my $id       = $p{id}       // fatal("container id required");
     my $root     = $p{root}     // $DEFAULT_ROOT;
     # Parse Go-style duration: "100ms", "1s", "5s", or plain number (seconds)
@@ -2785,8 +2770,7 @@ sub cmd_events {
 # Container: ps
 # ═══════════════════════════════════════════════════════════════════════
 
-sub cmd_ps {
-    my (%p) = @_;
+sub cmd_ps (%p) {
     my $id       = $p{id}      // fatal("container id required");
     my $root     = $p{root}    // $DEFAULT_ROOT;
     my $format   = $p{format}  // 'table';
@@ -2821,8 +2805,7 @@ sub cmd_ps {
 # Container: spec (generate default config.json)
 # ═══════════════════════════════════════════════════════════════════════
 
-sub cmd_spec {
-    my (%p) = @_;
+sub cmd_spec (%p) {
     my $bundle = $p{bundle} // '.';
     my $path = "$bundle/config.json";
 
@@ -3158,9 +3141,9 @@ USAGE
 }
 
 # Run
-eval { main() };
-if ($@) {
-    my $msg = $@;
+try { main() }
+catch ($e) {
+    my $msg = "$e";
     chomp $msg;
     # Print error to stderr (fatal() already formatted it)
     print STDERR "$msg\n" unless $msg eq '';

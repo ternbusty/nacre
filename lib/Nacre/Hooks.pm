@@ -1,6 +1,5 @@
 package Nacre::Hooks;
-use strict;
-use warnings;
+use v5.38;
 use Exporter 'import';
 use POSIX qw(WNOHANG _exit);
 use Nacre::Util;
@@ -10,8 +9,7 @@ use Nacre::State;
 # Hooks
 # ═══════════════════════════════════════════════════════════════════════
 
-sub run_hooks {
-    my ($hooks, $state, %opts) = @_;
+sub run_hooks ($hooks, $state, %opts) {
     return unless $hooks;
     my $must_succeed = $opts{must_succeed} // 0;
     my $hook_type    = $opts{type} // '';

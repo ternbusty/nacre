@@ -1,6 +1,5 @@
 package Nacre::Seccomp;
-use strict;
-use warnings;
+use v5.38;
 use Exporter 'import';
 use Nacre::Const;
 use Nacre::Util;
@@ -31,8 +30,7 @@ use constant {
     SCMP_ACT_ERRNO_BASE   => 0x00050000,
 };
 
-sub apply_seccomp_raw {
-    my ($spec) = @_;
+sub apply_seccomp_raw ($spec) {
     my $seccomp = $spec->{linux}{seccomp} // return undef;
 
     # If FFI::Platypus is available, use it
@@ -44,8 +42,7 @@ sub apply_seccomp_raw {
     return _apply_seccomp_minimal($seccomp);
 }
 
-sub _apply_seccomp_ffi {
-    my ($spec) = @_;
+sub _apply_seccomp_ffi ($spec) {
     my $seccomp = $spec->{linux}{seccomp} // return;
 
     require FFI::Platypus;
@@ -54,8 +51,7 @@ sub _apply_seccomp_ffi {
 
     $ffi->attach('seccomp_init'           => ['uint32'] => 'opaque');
     $ffi->attach('seccomp_arch_add'       => ['opaque', 'uint32'] => 'int');
-    $ffi->attach('seccomp_rule_add'       => ['opaque', 'uint32', 'int', 'uint'] => 'int', sub {
-        my ($xsub, @args) = @_;
+    $ffi->attach('seccomp_rule_add'       => ['opaque', 'uint32', 'int', 'uint'] => 'int', sub ($xsub, @args) {
         return $xsub->(@args);
     });
     $ffi->attach('seccomp_syscall_resolve_name' => ['string'] => 'int');
@@ -298,8 +294,7 @@ sub _init_syscall_table {
     }
 }
 
-sub _resolve_seccomp_syscall {
-    my ($name) = @_;
+sub _resolve_seccomp_syscall ($name) {
     _init_syscall_table();
     return $_SYSCALL_NR{$name};
 }
@@ -313,8 +308,7 @@ my %_SECCOMP_RET = (
     SCMP_ACT_ALLOW        => 0x7fff0000,
 );
 
-sub _seccomp_action_val {
-    my ($str, $errno_override) = @_;
+sub _seccomp_action_val ($str, $errno_override = undef) {
     return $_SECCOMP_RET{$str} if exists $_SECCOMP_RET{$str};
     if ($str =~ /^SCMP_ACT_ERRNO\((\d+)\)$/) {
         return 0x00050000 | ($1 & 0xffff);
@@ -345,8 +339,7 @@ use constant {
     _AUDIT_ARCH_AARCH64 => 0xc00000b7,
 };
 
-sub _gen_seccomp_rule_bpf {
-    my ($nr, $ret, $args) = @_;
+sub _gen_seccomp_rule_bpf ($nr, $ret, $args) {
 
     unless (@$args) {
         return (
@@ -433,8 +426,7 @@ sub _gen_seccomp_rule_bpf {
     return @insns;
 }
 
-sub _seccomp_cmp_opcode {
-    my ($op) = @_;
+sub _seccomp_cmp_opcode ($op) {
     return (_BPF_JMP_JEQ_K, 0) if $op eq 'SCMP_CMP_EQ';
     return (_BPF_JMP_JEQ_K, 1) if $op eq 'SCMP_CMP_NE';
     return (_BPF_JMP_JGE_K, 0) if $op eq 'SCMP_CMP_GE';
@@ -444,8 +436,7 @@ sub _seccomp_cmp_opcode {
     return (_BPF_JMP_JEQ_K, 0);
 }
 
-sub _apply_seccomp_minimal {
-    my ($seccomp) = @_;
+sub _apply_seccomp_minimal ($seccomp) {
 
     my $default_str = $seccomp->{defaultAction} // 'SCMP_ACT_ALLOW';
     my $default_errno_ret = $seccomp->{defaultErrnoRet};

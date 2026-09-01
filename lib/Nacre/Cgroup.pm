@@ -1,6 +1,7 @@
 package Nacre::Cgroup;
-use strict;
-use warnings;
+use v5.38;
+use feature 'try';
+no warnings 'experimental::try';
 use Exporter 'import';
 use Nacre::Util;
 use Errno qw(EBUSY);
@@ -11,8 +12,7 @@ use Errno qw(EBUSY);
 
 my $CGROUP_ROOT = '/sys/fs/cgroup';
 
-sub cgroup_path {
-    my ($spec, $id) = @_;
+sub cgroup_path ($spec, $id) {
     my $rel = $spec->{linux}{cgroupsPath};
     if ($rel && $rel =~ m{^/}) {
         return "$CGROUP_ROOT$rel";
@@ -23,8 +23,7 @@ sub cgroup_path {
     }
 }
 
-sub cgroup_setup {
-    my ($cgpath, $spec) = @_;
+sub cgroup_setup ($cgpath, $spec) {
 
     # Check if cgroup already exists and has processes (non-empty cgroup)
     if (-d $cgpath) {
@@ -63,9 +62,8 @@ sub cgroup_setup {
     cgroup_apply_resources($cgpath, $spec);
 }
 
-sub cgroup_apply_resources {
+sub cgroup_apply_resources ($cgpath, $spec, %opts) {
     log_debug("applying cgroup resources");
-    my ($cgpath, $spec, %opts) = @_;
     my $res = $spec->{linux}{resources} // {};
 
     # Memory — order writes carefully: cgroup v2 requires memory.swap.max
@@ -198,13 +196,11 @@ sub cgroup_apply_resources {
     }
 }
 
-sub cgroup_add_process {
-    my ($cgpath, $pid) = @_;
+sub cgroup_add_process ($cgpath, $pid) {
     cg_write($cgpath, 'cgroup.procs', $pid);
 }
 
-sub cgroup_cleanup {
-    my ($cgpath) = @_;
+sub cgroup_cleanup ($cgpath) {
     return unless -d $cgpath;
 
     # Kill all processes in the cgroup
@@ -230,32 +226,30 @@ sub cgroup_cleanup {
     }
 }
 
-sub cgroup_pids {
-    my ($cgpath) = @_;
+sub cgroup_pids ($cgpath) {
     my $data = read_file("$cgpath/cgroup.procs") // '';
     return grep { /^\d+$/ } split /\n/, $data;
 }
 
-sub cg_read {
-    my ($cgpath, $file) = @_;
+sub cg_read ($cgpath, $file) {
     return read_file("$cgpath/$file");
 }
 
-sub cg_write {
-    my ($cgpath, $file, $value, %opts) = @_;
+sub cg_write ($cgpath, $file, $value, %opts) {
     my $path = "$cgpath/$file";
-    eval { write_file($path, "$value\n"); };
-    if ($@ && $opts{fatal}) {
-        my $err = $@;
-        $err =~ s/ at \S+ line \d+.*//s;
-        chomp $err;
-        fatal("unable to write $file: $err");
+    try {
+        write_file($path, "$value\n");
+    } catch ($e) {
+        if ($opts{fatal}) {
+            $e =~ s/ at \S+ line \d+.*//s;
+            chomp $e;
+            fatal("unable to write $file: $e");
+        }
+        # Non-fatal by default: some cgroup files may not exist
     }
-    # Non-fatal by default: some cgroup files may not exist
 }
 
-sub convert_cpu_shares {
-    my ($shares) = @_;
+sub convert_cpu_shares ($shares) {
     return 0 if !$shares || $shares == 0;
     return 1 if $shares <= 2;
     return 10000 if $shares >= 262144;

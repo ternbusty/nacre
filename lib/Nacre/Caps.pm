@@ -1,6 +1,5 @@
 package Nacre::Caps;
-use strict;
-use warnings;
+use v5.38;
 use Exporter 'import';
 use Nacre::Const;
 use Nacre::Util;
@@ -9,11 +8,10 @@ use Nacre::Util;
 # Capabilities
 # ═══════════════════════════════════════════════════════════════════════
 
-sub validate_capabilities {
+sub validate_capabilities ($spec) {
     # runc-compatible: ignore unknown capabilities silently.
     # (The OCI spec says MUST error, but runc doesn't, and bats tests
     # expect runc behavior.)
-    my ($spec) = @_;
     return unless $spec->{process};  # avoid auto-vivifying {process}
     my $caps = $spec->{process}{capabilities} // return;
     for my $set (qw(bounding effective permitted inheritable ambient)) {
@@ -22,11 +20,10 @@ sub validate_capabilities {
     }
 }
 
-sub apply_capabilities_bounding {
+sub apply_capabilities_bounding ($spec) {
     # Phase 1: Drop bounding caps and set KEEPCAPS.
     # Must be called BEFORE setuid/setgid so that KEEPCAPS preserves the
     # permitted set across the UID transition.
-    my ($spec) = @_;
     my $caps = $spec->{process}{capabilities} // return;
 
     # Drop bounding set
@@ -43,11 +40,10 @@ sub apply_capabilities_bounding {
     do_syscall(SYS_prctl, PR_SET_KEEPCAPS, 1, 0, 0, 0);
 }
 
-sub apply_capabilities_final {
+sub apply_capabilities_final ($spec) {
     # Phase 2: Set effective/permitted/inheritable/ambient caps.
     # Must be called AFTER setuid/setgid — the kernel cleared the effective
     # set during setuid but preserved permitted (KEEPCAPS was on).
-    my ($spec) = @_;
     my $caps = $spec->{process}{capabilities} // return;
 
     my ($eff_lo, $eff_hi) = (0, 0);

@@ -1,6 +1,5 @@
 package Nacre::Process;
-use strict;
-use warnings;
+use v5.38;
 use Exporter 'import';
 use POSIX qw(setgid setuid);
 use Nacre::Const;
@@ -12,8 +11,7 @@ use Nacre::Caps;
 # Process Security
 # ═══════════════════════════════════════════════════════════════════════
 
-sub apply_process_security {
-    my ($spec) = @_;
+sub apply_process_security ($spec) {
     my $proc = $spec->{process} // {};
 
     # 1. OOM score adj
@@ -98,10 +96,9 @@ my %RLIMIT_MAP = (
     RLIMIT_STACK      => 3,
 );
 
-sub validate_rlimits {
+sub validate_rlimits ($spec) {
     # OCI spec: "The runtime MUST generate an error for any values
     # which cannot be mapped to a relevant kernel interface."
-    my ($spec) = @_;
     return unless $spec->{process};  # avoid auto-vivifying {process}
     my $rlimits = $spec->{process}{rlimits} // return;
     for my $rl (@$rlimits) {
@@ -110,8 +107,7 @@ sub validate_rlimits {
     }
 }
 
-sub apply_rlimits {
-    my ($spec) = @_;
+sub apply_rlimits ($spec) {
     my $rlimits = $spec->{process}{rlimits} // return;
     for my $rl (@$rlimits) {
         my $type = $RLIMIT_MAP{$rl->{type}} // next;
@@ -135,8 +131,7 @@ my %IOPRIO_CLASS_MAP = (
     IOPRIO_CLASS_IDLE => 3,
 );
 
-sub apply_iopriority {
-    my ($spec) = @_;
+sub apply_iopriority ($spec) {
     my $iop = $spec->{process}{ioPriority} // return;
     my $class = $IOPRIO_CLASS_MAP{$iop->{class} // ''} // return;
     my $prio  = $iop->{priority} // 0;
@@ -173,8 +168,7 @@ my %SCHED_FLAG_MAP = (
     SCHED_FLAG_UTIL_CLAMP_MAX => 0x40,
 );
 
-sub apply_scheduler {
-    my ($spec) = @_;
+sub apply_scheduler ($spec) {
     my $sched = $spec->{process}{scheduler} // return;
 
     # If CPU affinity is set AND scheduler is DEADLINE, conflict
@@ -234,8 +228,7 @@ my %MPOL_FLAG_MAP = (
     MPOL_F_NUMA_BALANCING => (1 << 13),
 );
 
-sub parse_node_list {
-    my ($nodes_str) = @_;
+sub parse_node_list ($nodes_str) {
     my @nodes;
     for my $part (split /,/, $nodes_str) {
         $part =~ s/^\s+|\s+$//g;
@@ -253,8 +246,7 @@ sub parse_node_list {
     return @nodes;
 }
 
-sub validate_memory_policy {
-    my ($spec) = @_;
+sub validate_memory_policy ($spec) {
     my $mp = $spec->{linux}{memoryPolicy} // return;
 
     my $mode_str = $mp->{mode} // '';
@@ -278,8 +270,7 @@ sub validate_memory_policy {
     }
 }
 
-sub apply_memory_policy {
-    my ($spec) = @_;
+sub apply_memory_policy ($spec) {
     my $mp = $spec->{linux}{memoryPolicy} // return;
 
     my $mode_str = $mp->{mode} // '';
@@ -329,8 +320,7 @@ sub apply_memory_policy {
 # Time Namespace Offsets
 # ═══════════════════════════════════════════════════════════════════════
 
-sub apply_timens_offsets {
-    my ($spec) = @_;
+sub apply_timens_offsets ($spec) {
     my $offsets = $spec->{linux}{timeOffsets} // return;
     # Only write if there are actual offsets to set
     return unless ref $offsets eq 'HASH' && %$offsets;
@@ -358,10 +348,9 @@ sub apply_timens_offsets {
 # CPU Affinity
 # ═══════════════════════════════════════════════════════════════════════
 
-sub parse_cpu_list {
+sub parse_cpu_list ($str) {
     # Parse a CPU list string like "0", "0-3", "0,2,4-7" into a list of
     # individual CPU numbers.
-    my ($str) = @_;
     my @cpus;
     for my $part (split /,/, $str) {
         if ($part =~ /^(\d+)-(\d+)$/) {
@@ -373,11 +362,10 @@ sub parse_cpu_list {
     return @cpus;
 }
 
-sub cpu_list_to_mask {
+sub cpu_list_to_mask (@cpus) {
     # Convert a list of CPU numbers to a bitmask for sched_setaffinity.
     # Returns ($mask_bytes, $mask_len).  The mask is a packed byte string
     # suitable for the syscall.
-    my @cpus = @_;
     return ('', 0) unless @cpus;
     my $max = 0;
     for my $c (@cpus) { $max = $c if $c > $max; }
@@ -391,7 +379,7 @@ sub cpu_list_to_mask {
     return (pack('Q*', @mask), $longs * 8);
 }
 
-sub get_available_cpus {
+sub get_available_cpus () {
     # Read the set of online CPUs from /sys/devices/system/cpu/online.
     my $online = '';
     if (open my $fh, '<', '/sys/devices/system/cpu/online') {
@@ -402,10 +390,9 @@ sub get_available_cpus {
     return parse_cpu_list($online);
 }
 
-sub apply_cpu_affinity_reset {
+sub apply_cpu_affinity_reset ($spec) {
     # Reset CPU affinity to the full available set (cgroup cpuset or system).
     # This undoes any taskset/affinity constraint inherited from the parent.
-    my ($spec) = @_;
 
     # Determine cpuset from cgroup config or fall back to system online CPUs
     my $cpus_str = '';
@@ -428,11 +415,10 @@ sub apply_cpu_affinity_reset {
     syscall($nr, $pid, $l, $mask);
 }
 
-sub apply_exec_cpu_affinity {
+sub apply_exec_cpu_affinity ($affinity, $dbg) {
     # Apply execCPUAffinity from config/process for exec.
     # Sets initial affinity before exec and returns final affinity to set
     # right before exec (or undef if no final).
-    my ($affinity, $dbg) = @_;
     return unless $affinity;
 
     # Use 'defined' because Perl treats the string "0" (CPU 0 only) as falsy.
@@ -460,8 +446,7 @@ sub apply_exec_cpu_affinity {
     return;
 }
 
-sub apply_final_cpu_affinity {
-    my ($final_str) = @_;
+sub apply_final_cpu_affinity ($final_str) {
     return unless $final_str;
     my @cpus = parse_cpu_list($final_str);
     return unless @cpus;
@@ -476,12 +461,11 @@ sub apply_final_cpu_affinity {
 # Exec Capabilities (--cap flag)
 # ═══════════════════════════════════════════════════════════════════════
 
-sub apply_exec_caps {
+sub apply_exec_caps ($cap_list, $spec) {
     # Apply capabilities for exec'd processes.
     # Always applies the container's capability config from the spec.
     # If $cap_list has entries (from --cap), those are added to
     # bounding+permitted+effective (runc semantics).
-    my ($cap_list, $spec) = @_;
 
     my $spec_caps = $spec->{process}{capabilities};
     # If no capabilities in spec and no --cap additions, nothing to do
@@ -572,16 +556,14 @@ my %SYSCTL_ALLOWED_PREFIXES = map { $_ => 1 } qw(
     kernel.domainname
 );
 
-sub validate_sysctl {
-    my ($key) = @_;
+sub validate_sysctl ($key) {
     for my $prefix (keys %SYSCTL_ALLOWED_PREFIXES) {
         return 1 if index($key, $prefix) == 0;
     }
     return 0;
 }
 
-sub apply_sysctls {
-    my ($spec) = @_;
+sub apply_sysctls ($spec) {
     my $sysctls = $spec->{linux}{sysctl} // return;
     for my $key (keys %$sysctls) {
         fatal("sysctl '$key' not allowed") unless validate_sysctl($key);

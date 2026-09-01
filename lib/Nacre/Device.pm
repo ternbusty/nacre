@@ -1,6 +1,5 @@
 package Nacre::Device;
-use strict;
-use warnings;
+use v5.38;
 use Exporter 'import';
 use Nacre::Const;
 use Fcntl qw(O_RDONLY O_DIRECTORY);
@@ -10,8 +9,7 @@ use Errno qw(EINTR);
 # eBPF Device Cgroup
 # ═══════════════════════════════════════════════════════════════════════
 
-sub apply_device_cgroup {
-    my ($cgpath, $spec) = @_;
+sub apply_device_cgroup ($cgpath, $spec) {
     my $rules = $spec->{linux}{resources}{devices} // return;
 
     my ($default_allow, $exceptions) = _emulate_device_rules($rules);
@@ -68,8 +66,7 @@ sub apply_device_cgroup {
     POSIX::close($prog_fd);
 }
 
-sub _emulate_device_rules {
-    my ($rules) = @_;
+sub _emulate_device_rules ($rules) {
     my $default_allow = 0;
     my @exceptions;
 
@@ -107,8 +104,7 @@ sub _emulate_device_rules {
     return ($default_allow, \@exceptions);
 }
 
-sub _build_device_bpf {
-    my ($default_allow, $exceptions) = @_;
+sub _build_device_bpf ($default_allow, $exceptions) {
     my @prog;
 
     return \@prog unless @$exceptions;
@@ -165,8 +161,7 @@ sub _build_device_bpf {
 
 # eBPF instruction helpers
 
-sub _pack_bpf_insn {
-    my ($code, $dst_src, $off, $imm) = @_;
+sub _pack_bpf_insn ($code, $dst_src, $off, $imm) {
     return pack('CCsl', $code, $dst_src // 0, $off // 0, $imm // 0);
 }
 
@@ -181,43 +176,35 @@ use constant {
     _BPF_EXIT       => 0x95,
 };
 
-sub _bpf_ld_abs {
-    my ($off) = @_;
+sub _bpf_ld_abs ($off) {
     return [_BPF_LDX_MEM_W, 0x10, $off, 0];
 }
 
-sub _bpf_st {
-    my ($off) = @_;
+sub _bpf_st ($off) {
     return [_BPF_STX_MEM_W, 0xa0, -4 - $off * 4, 0];
 }
 
-sub _bpf_ld_mem {
-    my ($off) = @_;
+sub _bpf_ld_mem ($off) {
     return [_BPF_LDX_MEM_W, 0x0a, -4 - $off * 4, 0];
 }
 
-sub _bpf_alu_and {
-    my ($imm) = @_;
+sub _bpf_alu_and ($imm) {
     return [_BPF_ALU_AND_K, 0x00, 0, $imm];
 }
 
-sub _bpf_alu_rsh {
-    my ($imm) = @_;
+sub _bpf_alu_rsh ($imm) {
     return [_BPF_ALU_RSH_K, 0x00, 0, $imm];
 }
 
-sub _bpf_jne {
-    my ($imm, $jt, $jf) = @_;
+sub _bpf_jne ($imm, $jt, $jf) {
     return [_BPF_JNE_K, 0x00, $jt, $imm];
 }
 
-sub _bpf_jeq {
-    my ($imm, $jt, $jf) = @_;
+sub _bpf_jeq ($imm, $jt, $jf) {
     return [_BPF_JEQ_K, 0x00, $jt, $imm];
 }
 
-sub _bpf_ret {
-    my ($val) = @_;
+sub _bpf_ret ($val) {
     return [_BPF_MOV_K, 0x00, 0, $val], [_BPF_EXIT, 0x00, 0, 0];
 }
 

@@ -1,6 +1,7 @@
 package Nacre::Net;
-use strict;
-use warnings;
+use v5.38;
+use feature 'try';
+no warnings 'experimental::try';
 use Exporter 'import';
 use Nacre::Const;
 use Nacre::Util;
@@ -43,8 +44,7 @@ use constant {
     SOCK_DGRAM          => 2,
 };
 
-sub send_netlink {
-    my ($msg) = @_;
+sub send_netlink ($msg) {
     socket(my $sock, AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE)
         or fatal("netlink socket: $!");
     my $sa = pack('S x2 L L', AF_NETLINK, 0, 0);
@@ -61,8 +61,7 @@ sub send_netlink {
     }
 }
 
-sub get_ifindex {
-    my ($ifname) = @_;
+sub get_ifindex ($ifname) {
     socket(my $sock, AF_INET, SOCK_DGRAM, 0) or fatal("socket: $!");
     my $ifreq = pack('a16 x16', $ifname);
     ioctl($sock, SIOCGIFINDEX, $ifreq) or fatal("ioctl SIOCGIFINDEX $ifname: $!");
@@ -70,16 +69,14 @@ sub get_ifindex {
     return unpack('x16 l', $ifreq);
 }
 
-sub netlink_move_to_ns {
-    my ($ifindex, $ns_pid) = @_;
+sub netlink_move_to_ns ($ifindex, $ns_pid) {
     my $msg = pack('L S S L L', 40, RTM_SETLINK, NLM_F_REQUEST | NLM_F_ACK, 1, 0)
             . pack('C x S l L L', 0, 0, $ifindex, 0, 0)
             . pack('S S L', 8, IFLA_NET_NS_PID, $ns_pid);
     send_netlink($msg);
 }
 
-sub netlink_rename {
-    my ($ifindex, $new_name) = @_;
+sub netlink_rename ($ifindex, $new_name) {
     my $name_data = pack('Z*', $new_name);
     my $attr_len = 4 + length($name_data);
     my $padded_len = ($attr_len + 3) & ~3;
@@ -92,30 +89,26 @@ sub netlink_rename {
     send_netlink($msg);
 }
 
-sub netlink_set_up {
-    my ($ifindex) = @_;
+sub netlink_set_up ($ifindex) {
     my $msg = pack('L S S L L', 32, RTM_SETLINK, NLM_F_REQUEST | NLM_F_ACK, 1, 0)
             . pack('C x S l L L', 0, 0, $ifindex, IFF_UP, IFF_UP);
     send_netlink($msg);
 }
 
-sub netlink_set_down {
-    my ($ifindex) = @_;
+sub netlink_set_down ($ifindex) {
     my $msg = pack('L S S L L', 32, RTM_SETLINK, NLM_F_REQUEST | NLM_F_ACK, 1, 0)
             . pack('C x S l L L', 0, 0, $ifindex, 0, IFF_UP);
     send_netlink($msg);
 }
 
-sub set_mtu {
-    my ($ifname, $mtu) = @_;
+sub set_mtu ($ifname, $mtu) {
     socket(my $sock, AF_INET, SOCK_DGRAM, 0) or fatal("socket: $!");
     my $ifreq = pack('a16 l x12', $ifname, $mtu);
     ioctl($sock, SIOCSIFMTU, $ifreq) or fatal("ioctl SIOCSIFMTU $ifname: $!");
     close $sock;
 }
 
-sub set_mac_address {
-    my ($ifname, $mac_str) = @_;
+sub set_mac_address ($ifname, $mac_str) {
     my @bytes = map { hex } split /:/, $mac_str;
     fatal("invalid MAC: $mac_str") unless @bytes == 6;
     socket(my $sock, AF_INET, SOCK_DGRAM, 0) or fatal("socket: $!");
@@ -125,8 +118,7 @@ sub set_mac_address {
     close $sock;
 }
 
-sub netlink_add_addr {
-    my ($ifindex, $addr_str) = @_;
+sub netlink_add_addr ($ifindex, $addr_str) {
     my ($addr, $prefix) = split m{/}, $addr_str;
     $prefix //= ($addr =~ /:/) ? 128 : 32;
     my $family = ($addr =~ /:/) ? AF_INET6 : AF_INET;
@@ -148,8 +140,7 @@ sub netlink_add_addr {
     send_netlink($msg);
 }
 
-sub netlink_list_addrs {
-    my ($ifindex) = @_;
+sub netlink_list_addrs ($ifindex) {
     socket(my $sock, AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE)
         or fatal("netlink socket: $!");
     my $sa = pack('S x2 L L', AF_NETLINK, 0, 0);
@@ -204,13 +195,13 @@ sub netlink_list_addrs {
     return @addrs;
 }
 
-sub move_net_devices {
-    my ($netdevs, $ns_pid) = @_;
+sub move_net_devices ($netdevs, $ns_pid) {
     for my $host_name (sort keys %$netdevs) {
         my $dev = $netdevs->{$host_name};
         log_debug("netdev: moving $host_name to ns of PID $ns_pid");
-        my $ifindex = eval { get_ifindex($host_name) };
-        fatal("netdev: interface '$host_name' not found: $@") if $@;
+        my $ifindex;
+        try { $ifindex = get_ifindex($host_name) }
+        catch ($e) { fatal("netdev: interface '$host_name' not found: $e") }
         my @saved_addrs = eval { netlink_list_addrs($ifindex) };
         netlink_move_to_ns($ifindex, $ns_pid);
 
@@ -255,8 +246,7 @@ sub move_net_devices {
     }
 }
 
-sub rename_net_devices {
-    my ($netdevs) = @_;
+sub rename_net_devices ($netdevs) {
     for my $host_name (sort keys %$netdevs) {
         my $dev = $netdevs->{$host_name};
         my $new_name = $dev->{name} // next;

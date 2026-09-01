@@ -1,6 +1,5 @@
 package Nacre::Const;
-use strict;
-use warnings;
+use v5.38;
 use Exporter 'import';
 
 # ═══════════════════════════════════════════════════════════════════════

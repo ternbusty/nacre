@@ -1,6 +1,5 @@
 package Nacre::State;
-use strict;
-use warnings;
+use v5.38;
 use Exporter 'import';
 use JSON::PP;
 use File::Path qw(remove_tree);
@@ -10,8 +9,7 @@ use Nacre::Util;
 # OCI Spec loading
 # ═══════════════════════════════════════════════════════════════════════
 
-sub load_spec {
-    my ($bundle) = @_;
+sub load_spec ($bundle) {
     my $config_path = "$bundle/config.json";
     my $raw = read_file_or_die($config_path);
     my $spec = $JSON->decode($raw);
@@ -19,19 +17,17 @@ sub load_spec {
     return $spec;
 }
 
-sub cache_spec {
+sub cache_spec ($root, $id, $spec) {
     # OCI spec: updates to config.json after create MUST NOT affect the
     # container.  Snapshot the spec into the state directory.
-    my ($root, $id, $spec) = @_;
     my $dir = state_dir($root, $id);
     ensure_dir($dir);
     write_file_atomic("$dir/config.json", $JSON->encode($spec));
 }
 
-sub load_cached_spec {
+sub load_cached_spec ($root, $id, $bundle) {
     # Load the spec snapshot from create time, falling back to the
     # bundle's config.json for backwards compatibility.
-    my ($root, $id, $bundle) = @_;
     my $cached = state_dir($root, $id) . '/config.json';
     my $raw = read_file($cached);
     if (defined $raw) {
@@ -109,13 +105,11 @@ sub default_spec {
 # Container State
 # ═══════════════════════════════════════════════════════════════════════
 
-sub state_dir {
-    my ($root, $id) = @_;
+sub state_dir ($root, $id) {
     return "$root/$id";
 }
 
-sub load_state {
-    my ($root, $id) = @_;
+sub load_state ($root, $id) {
     my $path = state_dir($root, $id) . '/state.json';
     my $raw = read_file($path);
     fatal("container '$id' does not exist") unless defined $raw;
@@ -124,21 +118,18 @@ sub load_state {
     return $state;
 }
 
-sub save_state {
-    my ($root, $state) = @_;
+sub save_state ($root, $state) {
     my $dir = state_dir($root, $state->{id});
     ensure_dir($dir);
     write_file_atomic("$dir/state.json", $JSON->encode($state));
 }
 
-sub delete_state {
-    my ($root, $id) = @_;
+sub delete_state ($root, $id) {
     my $dir = state_dir($root, $id);
     remove_tree($dir) if -d $dir;
 }
 
-sub refresh_state {
-    my ($state) = @_;
+sub refresh_state ($state) {
     my $pid = $state->{pid};
     return unless $pid && $pid > 0;
     my $status = $state->{status};
@@ -171,8 +162,7 @@ sub refresh_state {
     }
 }
 
-sub parse_proc_starttime {
-    my ($stat_line) = @_;
+sub parse_proc_starttime ($stat_line) {
     # /proc/pid/stat: pid (comm) state ppid pgrp session tty_nr tpgid flags
     #   minflt cminflt majflt cmajflt utime stime cutime cstime priority nice
     #   num_threads itrealvalue starttime ...
@@ -190,15 +180,13 @@ sub parse_proc_starttime {
     return undef;
 }
 
-sub get_pid_starttime {
-    my ($pid) = @_;
+sub get_pid_starttime ($pid) {
     my $stat = read_file("/proc/$pid/stat");
     return undef unless $stat;
     return parse_proc_starttime($stat);
 }
 
-sub oci_state_json {
-    my ($state) = @_;
+sub oci_state_json ($state) {
     my $out = {
         ociVersion  => $state->{ociVersion} // '1.2.0',
         id          => $state->{id},

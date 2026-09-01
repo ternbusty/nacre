@@ -1,6 +1,7 @@
 package Nacre::Mount;
-use strict;
-use warnings;
+use v5.38;
+use feature 'try';
+no warnings 'experimental::try';
 use Exporter 'import';
 use POSIX qw(_exit);
 use File::Basename qw(dirname);
@@ -72,8 +73,7 @@ my %RECURSIVE_MOUNT_ATTRS = (
     rdiratime      => { set => 0,                     clear => MOUNT_ATTR_NODIRATIME },
 );
 
-sub do_mount_setattr {
-    my ($dirfd, $path, $flags, $attr_set, $attr_clr, $userns_fd) = @_;
+sub do_mount_setattr ($dirfd, $path, $flags, $attr_set, $attr_clr, $userns_fd = undef) {
     # struct mount_attr { __u64 attr_set, attr_clr, propagation, userns_fd; }
     my $attr = pack('QQQQ', $attr_set, $attr_clr, 0, $userns_fd // 0);
     my $nr = SYS_mount_setattr + 0;
@@ -87,8 +87,7 @@ sub do_mount_setattr {
     return $ret == 0;
 }
 
-sub do_open_tree {
-    my ($dirfd, $path, $flags) = @_;
+sub do_open_tree ($dirfd, $path, $flags) {
     my $nr = SYS_open_tree + 0;
     my $df = $dirfd + 0;
     my $fl = $flags + 0;
@@ -98,8 +97,7 @@ sub do_open_tree {
     return $ret;
 }
 
-sub do_move_mount {
-    my ($from_fd, $from_path, $to_fd, $to_path, $flags) = @_;
+sub do_move_mount ($from_fd, $from_path, $to_fd, $to_path, $flags) {
     my $nr = SYS_move_mount + 0;
     my $ffd = $from_fd + 0;
     my $tfd = $to_fd + 0;
@@ -110,8 +108,7 @@ sub do_move_mount {
     return $ret == 0;
 }
 
-sub parse_mount_options {
-    my ($opts_ref) = @_;
+sub parse_mount_options ($opts_ref) {
     my $flags = 0;
     my @data;
     for my $opt (@{$opts_ref // []}) {
@@ -124,8 +121,7 @@ sub parse_mount_options {
     return ($flags, join(',', @data));
 }
 
-sub do_mount {
-    my ($src, $target, $fstype, $flags, $data) = @_;
+sub do_mount ($src, $target, $fstype, $flags, $data) {
     # Perl's syscall() passes strings as pointers, integers as values.
     # The kernel's mount(2) expects NULL pointers for unused args, not
     # pointers to empty strings (which it tries to resolve as paths → ENOENT).
@@ -147,9 +143,7 @@ sub do_mount {
     return $ret == 0;
 }
 
-sub do_umount {
-    my ($target, $flags) = @_;
-    $flags //= 0;
+sub do_umount ($target, $flags = 0) {
     my $nr  = SYS_umount2 + 0;
     my $tgt = $target . "\0";
     my $fl  = $flags + 0;
@@ -158,8 +152,7 @@ sub do_umount {
     return $ret == 0;
 }
 
-sub do_pivot_root {
-    my ($new_root, $put_old) = @_;
+sub do_pivot_root ($new_root, $put_old) {
     my $nr  = SYS_pivot_root + 0;
     my $nrt = $new_root . "\0";
     my $pot = $put_old . "\0";
@@ -198,8 +191,7 @@ my %PROPAGATION_FLAGS = (
     runbindable => MS_UNBINDABLE | MS_REC,
 );
 
-sub _copy_dir_contents {
-    my ($src, $dst) = @_;
+sub _copy_dir_contents ($src, $dst) {
     opendir(my $dh, $src) or return;
     while (my $ent = readdir($dh)) {
         next if $ent eq '.' || $ent eq '..';
@@ -233,8 +225,7 @@ sub _copy_dir_contents {
     closedir $dh;
 }
 
-sub prepare_rootfs {
-    my ($spec, $rootfs, $mount_source_fds, $chan_w, $chan_r) = @_;
+sub prepare_rootfs ($spec, $rootfs, $mount_source_fds, $chan_w, $chan_r) {
 
     # ALWAYS make "/" rslave before any rootfs setup to prevent mount
     # events from propagating back to the parent mount namespace.
@@ -276,16 +267,14 @@ sub prepare_rootfs {
 }
 
 # Build "containerID hostID size\n" mapping string for idmap userns
-sub _build_map_string {
-    my ($maps) = @_;
+sub _build_map_string ($maps) {
     return '' unless ref $maps eq 'ARRAY' && @$maps;
     return join('', map { "$_->{containerID} $_->{hostID} $_->{size}\n" } @$maps);
 }
 
 # Create a user namespace with specific UID/GID mappings for idmap mounts.
 # Returns the userns fd.
-sub _create_userns_for_idmap {
-    my ($uid_maps, $gid_maps, $chan_w, $chan_r) = @_;
+sub _create_userns_for_idmap ($uid_maps, $gid_maps, $chan_w, $chan_r) {
 
     my $uid_str = _build_map_string($uid_maps);
     my $gid_str = _build_map_string($gid_maps);
@@ -350,14 +339,11 @@ sub _create_userns_for_idmap {
     # When called from inside a container userns, writing to the host
     # /proc may fail — let the error propagate so callers can fall back
     # to the parent process.
-    my $write_ok = eval {
+    try {
         write_file("/proc/$proc_pid/setgroups", "deny");
         write_file("/proc/$proc_pid/uid_map", $uid_str);
         write_file("/proc/$proc_pid/gid_map", $gid_str);
-        1;
-    };
-    unless ($write_ok) {
-        my $err = $@;
+    } catch ($err) {
         close $pw;
         close $p_sock;
         kill 'KILL', $child;
@@ -379,8 +365,7 @@ sub _create_userns_for_idmap {
 }
 
 # Create a user namespace from pre-built mapping strings (parent-side).
-sub _create_userns_from_strings {
-    my ($uid_map_str, $gid_map_str) = @_;
+sub _create_userns_from_strings ($uid_map_str, $gid_map_str) {
     socketpair(my $p_sock, my $c_sock, AF_UNIX, SOCK_STREAM, 0) or fatal("socketpair: $!");
     pipe(my $pr, my $cw) or fatal("pipe: $!");
     pipe(my $cr, my $pw) or fatal("pipe: $!");
@@ -415,8 +400,7 @@ sub _create_userns_from_strings {
 ## Follows each symlink component (absolute targets are relative to rootfs).
 ## Returns the fully-resolved host path (under $rootfs).
 ## The final target need not exist (dangling symlink tail is fine).
-sub _resolve_in_rootfs {
-    my ($rootfs, $path) = @_;
+sub _resolve_in_rootfs ($rootfs, $path) {
     my @parts = grep { $_ ne '' } split('/', $path);
     my @resolved;
     my $depth = 0;
@@ -439,8 +423,7 @@ sub _resolve_in_rootfs {
     return $rootfs . '/' . join('/', @resolved);
 }
 
-sub apply_mounts {
-    my ($spec, $rootfs, $mount_source_fds, $chan_w, $chan_r) = @_;
+sub apply_mounts ($spec, $rootfs, $mount_source_fds, $chan_w, $chan_r) {
     $mount_source_fds //= {};
     log_debug("applying mounts, rootfs=$rootfs");
 
@@ -687,16 +670,19 @@ sub apply_mounts {
                 # with those mappings.  This may fail inside a container
                 # userns (writing /proc/$child/setgroups from a non-init
                 # userns is denied) — fall back to parent in that case.
-                eval {
+                my $userns_err;
+                try {
                     $userns_fd = _create_userns_for_idmap(
                         $m->{uidMappings} // [],
                         $m->{gidMappings} // [],
                         $chan_w, $chan_r,
                     );
-                };
-                if ($@ || !defined $userns_fd || $userns_fd < 0) {
+                } catch ($e) {
+                    $userns_err = $e;
+                }
+                if ($userns_err || !defined $userns_fd || $userns_fd < 0) {
                     $delegate_to_parent = 1 if $chan_w;
-                    fatal("create userns for idmap: $@") unless $delegate_to_parent;
+                    fatal("create userns for idmap: $userns_err") unless $delegate_to_parent;
                 }
             } else {
                 # Implied mapping: use the container's own user namespace.
@@ -767,8 +753,7 @@ sub apply_mounts {
     return $dev_needs_ro;
 }
 
-sub create_devices {
-    my ($rootfs, $spec) = @_;
+sub create_devices ($rootfs, $spec) {
 
     my @devices = @DEFAULT_DEVICES;
 
@@ -841,8 +826,7 @@ sub create_devices {
     }
 }
 
-sub create_symlinks {
-    my ($rootfs) = @_;
+sub create_symlinks ($rootfs) {
     for my $s (@DEFAULT_SYMLINKS) {
         my $dest = "$rootfs$s->{path}";
         next if -e $dest || -l $dest;
@@ -850,11 +834,10 @@ sub create_symlinks {
     }
 }
 
-sub _mask_host_procfs_sysfs {
+sub _mask_host_procfs_sysfs ($rootfs) {
     # Unmount or cover all full procfs/sysfs mounts that are outside the
     # container rootfs.  This prevents the container from re-mounting
     # procfs/sysfs after chroot in --no-pivot mode (runc's msMoveRoot).
-    my ($rootfs) = @_;
     my @to_mask;
     if (open my $fh, '<', '/proc/self/mountinfo') {
         while (my $line = <$fh>) {
@@ -884,9 +867,8 @@ sub _mask_host_procfs_sysfs {
     }
 }
 
-sub apply_pivot_root {
+sub apply_pivot_root ($rootfs) {
     log_debug("applying pivot_root");
-    my ($rootfs) = @_;
     chdir($rootfs) or fatal("chdir to rootfs: $!");
 
     # pivot_root(".", ".") — old root ends up mounted atop new root
@@ -898,13 +880,12 @@ sub apply_pivot_root {
     chdir('/') or fatal("chdir /: $!");
 }
 
-sub apply_rootfs_propagation {
+sub apply_rootfs_propagation ($spec) {
     # Apply the spec's rootfsPropagation AFTER pivot_root, so setup
     # operations (bind mounts, device creation) run under safe slave
     # propagation and the final container root gets the requested type.
     # When the spec doesn't set rootfsPropagation, skip this entirely —
     # matching runc, which only applies propagation when explicitly set.
-    my ($spec) = @_;
     my $propagation = $spec->{linux}{rootfsPropagation};
     return unless defined $propagation && $propagation ne '';
 
@@ -933,8 +914,7 @@ sub apply_rootfs_propagation {
     }
 }
 
-sub apply_masked_paths {
-    my ($paths) = @_;
+sub apply_masked_paths ($paths) {
     my %seen;
     # runc shares a single tmpfs across all masked directories so they
     # have the same device number (testable via stat %d).  We mount
@@ -979,8 +959,7 @@ sub apply_masked_paths {
     }
 }
 
-sub apply_readonly_paths {
-    my ($paths) = @_;
+sub apply_readonly_paths ($paths) {
     for my $p (@{$paths // []}) {
         next unless -e $p;
         do_mount($p, $p, '', MS_BIND | MS_REC, '');
@@ -988,8 +967,7 @@ sub apply_readonly_paths {
     }
 }
 
-sub set_rootfs_readonly {
-    my ($rootfs_readonly) = @_;
+sub set_rootfs_readonly ($rootfs_readonly) {
     return unless $rootfs_readonly;
     do_mount('', '/', '', MS_REMOUNT | MS_BIND | MS_RDONLY, '')
         or fatal("remount / readonly: $!");
