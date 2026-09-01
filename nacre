@@ -6352,16 +6352,18 @@ sub cmd_exec {
     } elsif ($container_cgpath) {
         # Default: join the container's cgroup (or init's actual cgroup
         # if the container cgroup has domain controllers active).
-        if (-d $container_cgpath) {
-            $exec_target_cgpath = $container_cgpath;
-        } else {
-            # Fall back to init's actual cgroup
-            my $init_cg = read_file("/proc/$init_pid/cgroup");
-            if (defined $init_cg && $init_cg =~ m{^0::(.+)$}m) {
-                my $rel = $1;
-                my $init_cghost = "/sys/fs/cgroup$rel";
-                $exec_target_cgpath = $init_cghost if -d $init_cghost;
-            }
+        $exec_target_cgpath = $container_cgpath if -d $container_cgpath;
+    }
+
+    # Resolve init's actual cgroup for fallback when the container's
+    # root cgroup becomes an internal node (subtree_control enabled).
+    my $init_actual_cgpath;
+    if ($init_pid) {
+        my $init_cg = read_file("/proc/$init_pid/cgroup");
+        if (defined $init_cg && $init_cg =~ m{^0::(.+)$}m) {
+            my $rel = $1;
+            my $init_cghost = "/sys/fs/cgroup$rel";
+            $init_actual_cgpath = $init_cghost if -d $init_cghost;
         }
     }
 
@@ -6375,8 +6377,22 @@ sub cmd_exec {
     } elsif ($exec_target_cgpath) {
         eval { write_file("$exec_target_cgpath/cgroup.procs", "$child\n") };
         if ($@) {
-            my $err = $@; chomp $err;
-            fatal("adding pid $child to cgroups: $err");
+            # The container's cgroup may be an internal node (domain
+            # controllers enabled via subtree_control).  Fall back to
+            # init's actual cgroup — but ONLY when --cgroup was NOT
+            # explicitly set (explicit --cgroup should fail hard).
+            if (!$exec_cgroup && $init_actual_cgpath
+                && $init_actual_cgpath ne $exec_target_cgpath) {
+                eval { write_file("$init_actual_cgpath/cgroup.procs", "$child\n") };
+                if ($@) {
+                    my $err = $@; chomp $err;
+                    fatal("adding pid $child to cgroups: $err");
+                }
+                $exec_target_cgpath = $init_actual_cgpath;
+            } else {
+                my $err = $@; chomp $err;
+                fatal("adding pid $child to cgroups: $err");
+            }
         }
     }
 
@@ -6403,7 +6419,17 @@ sub cmd_exec {
     if ($deferred_exec_cg_path) {
         my $cg_pid = $final_pid;
         eval { write_file("$deferred_exec_cg_path/cgroup.procs", "$cg_pid\n") };
-        # Silently ignore ESRCH (process already exited)
+        if ($@) {
+            # Fall back to init's actual cgroup if the target is an
+            # internal node (subtree_control enabled).  Only when
+            # --cgroup was not explicitly set.
+            if (!$exec_cgroup && $init_actual_cgpath
+                && $init_actual_cgpath ne $deferred_exec_cg_path) {
+                eval { write_file("$init_actual_cgpath/cgroup.procs", "$cg_pid\n") };
+                # Silently ignore any remaining failure (ESRCH, etc.)
+            }
+            # Otherwise silently ignore (ESRCH for fast-exiting commands)
+        }
     }
 
     # Signal grandchild that deferred cgroup write is done (or not needed).
