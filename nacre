@@ -3995,12 +3995,16 @@ sub run_init_process {
     log_debug("init: closing the pipe to signal completion");
     channel_send($main_chan_w, { type => 'init_ready' });
 
-    # Close all fds > 2 except the notify fd (exec.fifo / start barrier).
-    # This matches runc's behavior: in "created" state the init process
-    # only has stdio + exec.fifo open.
+    # Close all fds > 2 except the notify fd (exec.fifo / start barrier)
+    # and the parent channel fds (needed for seccomp SCMP_ACT_NOTIFY fd
+    # handoff after start, and for startContainer hooks to report errors).
     my $notify_fileno = ref($notify_fd) ? fileno($notify_fd) : $notify_fd;
+    my $chan_w_fd = ref($main_chan_w) ? fileno($main_chan_w) : $main_chan_w;
+    my $chan_r_fd = ref($main_chan_r) ? fileno($main_chan_r) : $main_chan_r;
     for my $fd (3..1023) {
         next if defined $notify_fileno && $fd == $notify_fileno;
+        next if defined $chan_w_fd && $fd == $chan_w_fd;
+        next if defined $chan_r_fd && $fd == $chan_r_fd;
         POSIX::close($fd);
     }
 
@@ -4825,20 +4829,26 @@ sub cmd_kill {
     # running (runc compat: -a is the obsoleted "all processes" flag).
     if ($state->{status} ne 'running' && $state->{status} ne 'created') {
         return if $all;
-        # OCI spec: "Attempting to send a signal to a container that is
-        # neither created nor running MUST generate an error."
-        # For stopped containers, always error — even SIGKILL.
-        if ($state->{status} eq 'stopped') {
-            fatal("container not running");
-        }
-        # For other states (paused, etc.): allow SIGKILL via cgroup.kill
-        # when the init process is dead but children are still alive in
-        # the cgroup (host PID namespace scenario).
+
+        # Parse signal early for cgroup-based kill checks below
         my $signum_check;
         if ($signal =~ /^\d+$/) { $signum_check = $signal; }
         else { my $s = $signal; $s =~ s/^SIG//i; $signum_check = $SIG_NUM{uc($s)}; }
-        unless ($signum_check && $signum_check == 9 && $state->{cgroupPath}) {
-            fatal("container not running");
+
+        if ($state->{status} eq 'stopped') {
+            # In host PID namespace scenarios, the init may be gone but
+            # exec'd processes remain alive in the cgroup.  Allow SIGKILL
+            # to reach them via cgroup.kill.
+            unless ($signum_check && $signum_check == 9 && $state->{cgroupPath}) {
+                fatal("container not running");
+            }
+            my @pids = cgroup_pids($state->{cgroupPath});
+            fatal("container not running") unless @pids;
+        } else {
+            # For other states (paused, etc.): allow SIGKILL via cgroup.kill
+            unless ($signum_check && $signum_check == 9 && $state->{cgroupPath}) {
+                fatal("container not running");
+            }
         }
     }
 
@@ -6035,6 +6045,29 @@ sub cmd_update {
             $mem{reservation} = ($v == -1) ? 'max' : $v;
         }
         $resources->{memory} = \%mem if %mem;
+    }
+
+    # checkBeforeUpdate: reject if the new limit is below current usage
+    if ($resources->{memory} && $resources->{memory}{checkBeforeUpdate}) {
+        my $limit = $resources->{memory}{limit};
+        my $swap  = $resources->{memory}{swap};
+        if (defined $limit && $limit ne 'max') {
+            my $current = eval { cg_read($cgpath, 'memory.current') } // 0;
+            chomp $current;
+            $current += 0;
+            if ($current > 0 && $limit < $current) {
+                fatal("rejecting memory limit $limit (too low; current usage is $current)");
+            }
+        }
+        if (defined $swap && $swap ne 'max') {
+            my $swap_current = eval { cg_read($cgpath, 'memory.swap.current') } // 0;
+            chomp $swap_current;
+            $swap_current += 0;
+            if ($swap_current > 0 && $swap < $swap_current) {
+                fatal("rejecting memory+swap limit $swap (too low; current swap usage is $swap_current)");
+            }
+        }
+        delete $resources->{memory}{checkBeforeUpdate};
     }
 
     # Build a fake spec with just the resources
