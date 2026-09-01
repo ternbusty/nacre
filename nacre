@@ -528,9 +528,9 @@ sub default_spec {
             { destination => '/dev/mqueue', type => 'mqueue', source => 'mqueue',
               options => [qw(nosuid noexec nodev)] },
             { destination => '/sys', type => 'sysfs', source => 'sysfs',
-              options => [qw(nosuid noexec nodev readonly)] },
-            { destination => '/sys/fs/cgroup', type => 'cgroup2', source => 'cgroup',
-              options => [qw(nosuid noexec nodev readonly)] },
+              options => [qw(nosuid noexec nodev ro)] },
+            { destination => '/sys/fs/cgroup', type => 'cgroup', source => 'cgroup',
+              options => [qw(nosuid noexec nodev ro)] },
         ],
         linux => {
             resources => {
@@ -1540,10 +1540,24 @@ sub _create_userns_for_idmap {
     chomp $buf;
     my $proc_pid = ($buf =~ /^(\d+)$/) ? $1 : $child;
 
-    # Write mappings using the host PID (which matches /proc entries)
-    write_file("/proc/$proc_pid/setgroups", "deny");
-    write_file("/proc/$proc_pid/uid_map", $uid_str);
-    write_file("/proc/$proc_pid/gid_map", $gid_str);
+    # Write mappings using the host PID (which matches /proc entries).
+    # When called from inside a container userns, writing to the host
+    # /proc may fail — let the error propagate so callers can fall back
+    # to the parent process.
+    my $write_ok = eval {
+        write_file("/proc/$proc_pid/setgroups", "deny");
+        write_file("/proc/$proc_pid/uid_map", $uid_str);
+        write_file("/proc/$proc_pid/gid_map", $gid_str);
+        1;
+    };
+    unless ($write_ok) {
+        my $err = $@;
+        close $pw;
+        close $p_sock;
+        kill 'KILL', $child;
+        waitpid($child, 0);
+        die $err;
+    }
 
     # Signal child: "mappings written"
     syswrite($pw, "D", 1);
@@ -1639,6 +1653,13 @@ sub apply_mounts {
             : "$rootfs$m->{destination}";
         my $mount_src = $m->{source} // '';
         my $type = $m->{type} // '';
+
+        # Normalize cgroup mount type: runc's default spec uses "cgroup"
+        # for both v1 and v2.  On cgroup v2 systems, the kernel filesystem
+        # type is "cgroup2".
+        if ($type eq 'cgroup' && -f '/sys/fs/cgroup/cgroup.controllers') {
+            $type = 'cgroup2';
+        }
 
         log_debug("apply_mounts: processing $m->{destination} type=$type dest=$dest");
 
@@ -1818,14 +1839,23 @@ sub apply_mounts {
             # Determine the user namespace fd for the mapping
             my $userns_fd;
             my $per_mount_maps = $m->{uidMappings} || $m->{gidMappings};
+            my $delegate_to_parent = 0;
             if ($per_mount_maps) {
                 # Per-mount explicit mappings: create a user namespace
-                # with those mappings.
-                $userns_fd = _create_userns_for_idmap(
-                    $m->{uidMappings} // [],
-                    $m->{gidMappings} // [],
-                    $chan_w, $chan_r,
-                );
+                # with those mappings.  This may fail inside a container
+                # userns (writing /proc/$child/setgroups from a non-init
+                # userns is denied) — fall back to parent in that case.
+                eval {
+                    $userns_fd = _create_userns_for_idmap(
+                        $m->{uidMappings} // [],
+                        $m->{gidMappings} // [],
+                        $chan_w, $chan_r,
+                    );
+                };
+                if ($@ || !defined $userns_fd || $userns_fd < 0) {
+                    $delegate_to_parent = 1 if $chan_w;
+                    fatal("create userns for idmap: $@") unless $delegate_to_parent;
+                }
             } else {
                 # Implied mapping: use the container's own user namespace.
                 # If we're inside a userns, /proc/self/ns/user is our userns.
@@ -1836,27 +1866,43 @@ sub apply_mounts {
                 push @{$mount_source_fds->{_fhs}}, $ns_fh;
             }
 
-            # Apply mount_setattr(MOUNT_ATTR_IDMAP)
-            my $setattr_flags = AT_EMPTY_PATH;
-            $setattr_flags |= AT_RECURSIVE if $has_ridmap;
-            my $ok = do_mount_setattr($tree_fd, "", $setattr_flags,
-                                       MOUNT_ATTR_IDMAP, 0, $userns_fd);
-            if (!$ok) {
-                # If init can't do it (in userns), ask parent
-                if ($chan_w && $! == EPERM) {
-                    channel_send($chan_w, {
-                        type      => 'mount_fd_request',
-                        ridmap    => $has_ridmap ? 1 : 0,
-                        uid_map   => _build_map_string($m->{uidMappings}),
-                        gid_map   => _build_map_string($m->{gidMappings}),
-                        implied   => $per_mount_maps ? 0 : 1,
-                    });
-                    send_fd_over_fd($chan_w, $tree_fd);
-                    my $resp = channel_recv($chan_r);
-                    fatal("mount_setattr idmap failed") unless $resp && $resp->{type} eq 'mount_fd_done';
-                } else {
-                    POSIX::close($tree_fd);
-                    fatal("mount_setattr MOUNT_ATTR_IDMAP $dest: $!");
+            if ($delegate_to_parent) {
+                # Delegate entire idmap operation (userns creation +
+                # mount_setattr) to the parent, which is outside the
+                # container userns and can write /proc mappings.
+                channel_send($chan_w, {
+                    type      => 'mount_fd_request',
+                    ridmap    => $has_ridmap ? 1 : 0,
+                    uid_map   => _build_map_string($m->{uidMappings}),
+                    gid_map   => _build_map_string($m->{gidMappings}),
+                    implied   => 0,
+                });
+                send_fd_over_fd($chan_w, $tree_fd);
+                my $resp = channel_recv($chan_r);
+                fatal("mount_setattr idmap failed") unless $resp && $resp->{type} eq 'mount_fd_done';
+            } else {
+                # Apply mount_setattr(MOUNT_ATTR_IDMAP)
+                my $setattr_flags = AT_EMPTY_PATH;
+                $setattr_flags |= AT_RECURSIVE if $has_ridmap;
+                my $ok = do_mount_setattr($tree_fd, "", $setattr_flags,
+                                           MOUNT_ATTR_IDMAP, 0, $userns_fd);
+                if (!$ok) {
+                    # If init can't do it (in userns), ask parent
+                    if ($chan_w && $! == EPERM) {
+                        channel_send($chan_w, {
+                            type      => 'mount_fd_request',
+                            ridmap    => $has_ridmap ? 1 : 0,
+                            uid_map   => _build_map_string($m->{uidMappings}),
+                            gid_map   => _build_map_string($m->{gidMappings}),
+                            implied   => $per_mount_maps ? 0 : 1,
+                        });
+                        send_fd_over_fd($chan_w, $tree_fd);
+                        my $resp = channel_recv($chan_r);
+                        fatal("mount_setattr idmap failed") unless $resp && $resp->{type} eq 'mount_fd_done';
+                    } else {
+                        POSIX::close($tree_fd);
+                        fatal("mount_setattr MOUNT_ATTR_IDMAP $dest: $!");
+                    }
                 }
             }
 
@@ -3944,7 +3990,7 @@ sub run_hooks {
 # ═══════════════════════════════════════════════════════════════════════
 
 sub run_init_process {
-    my ($spec, $rootfs, $notify_fd, $main_chan_w, $main_chan_r, $cgpath, $id, $bundle, $console_socket_path, $debug_fd, $no_pivot, $foreground, $pty_sock_fd, $mount_source_fds) = @_;
+    my ($spec, $rootfs, $notify_fd, $main_chan_w, $main_chan_r, $cgpath, $id, $bundle, $console_socket_path, $debug_fd, $no_pivot, $foreground, $pty_sock_fd, $mount_source_fds, $console_socket_prefd) = @_;
 
     my $dbg = sub {
         return unless defined $debug_fd && $debug_fd >= 0;
@@ -3995,8 +4041,16 @@ sub run_init_process {
         }
 
         if (defined $console_socket_path) {
-            # Detached mode: send master to console socket
-            send_fd_via_socket($console_socket_path, fileno($ptm));
+            # Detached mode: send master to console socket.
+            # Use the pre-connected fd if available (needed when inside a
+            # userns where the socket path is no longer accessible).
+            if (defined $console_socket_prefd && $console_socket_prefd >= 0) {
+                send_fd_over_fd($console_socket_prefd, fileno($ptm));
+                POSIX::close($console_socket_prefd);
+                undef $console_socket_prefd;
+            } else {
+                send_fd_via_socket($console_socket_path, fileno($ptm));
+            }
             close($ptm);
         } elsif (defined $pty_sock_fd) {
             # Foreground mode: send master to parent via socketpair
@@ -4125,8 +4179,21 @@ sub run_init_process {
         POSIX::close($fd);
     }
 
+    # Install signal handlers before waiting.  As PID 1 in the container's
+    # PID namespace, signals without explicit handlers are silently ignored
+    # by the kernel.  This ensures the container can be killed while in the
+    # "created" state (e.g. via pidfd_send_signal).
+    $SIG{TERM} = sub { _exit(0) };
+    $SIG{INT}  = sub { _exit(0) };
+    $SIG{HUP}  = sub { _exit(0) };
+
     # Wait for start signal
     wait_for_start($notify_fd);
+
+    # Restore default signal disposition after start
+    $SIG{TERM} = 'DEFAULT';
+    $SIG{INT}  = 'DEFAULT';
+    $SIG{HUP}  = 'DEFAULT';
 
     # Set environment — must happen before startContainer hooks, which
     # per OCI spec inherit the process environment.
@@ -4480,6 +4547,23 @@ sub cmd_create {
             }
         }
 
+        # Pre-connect to console socket before entering any user namespace.
+        # After joining or creating a userns, the host filesystem paths may
+        # become inaccessible (EACCES) because the process runs as an
+        # unmapped UID.  The connected socket fd survives the userns switch.
+        my $console_socket_preconnected_fd;
+        if ($has_userns && $p{console_socket} && $spec->{process}{terminal}) {
+            eval {
+                socket(my $sock, AF_UNIX, SOCK_STREAM, 0) or die "socket: $!";
+                connect($sock, pack_sockaddr_un($p{console_socket}))
+                    or die "connect to console socket '$p{console_socket}': $!";
+                $console_socket_preconnected_fd = POSIX::dup(fileno($sock));
+                close $sock;
+            };
+            # Non-fatal — if the socket isn't ready yet, fall back to path-based
+            # connection later (which works when there's no userns).
+        }
+
         # Join specified namespaces
         my $joined_userns = 0;
         for my $ns (@join_ns) {
@@ -4507,6 +4591,25 @@ sub cmd_create {
 
         # Unshare namespaces (except PID — that's handled by fork below)
         my $unshare_flags = $clone_flags & ~CLONE_NEWPID & ~CLONE_NEWCGROUP;
+
+        # When both NEWTIME and NEWUSER are requested, unshare NEWTIME
+        # first and write offsets while still in the initial user namespace.
+        # After entering a new userns, the /proc mount belongs to the
+        # initial userns and writing /proc/self/timens_offsets would fail
+        # with EPERM.  Splitting the unshare so NEWTIME happens before
+        # NEWUSER avoids the permission issue (runc handles this in
+        # nsexec.c where timens setup precedes userns entry).
+        if (($clone_flags & CLONE_NEWTIME) && ($clone_flags & CLONE_NEWUSER)) {
+            my $nr  = SYS_unshare + 0;
+            my $flg = CLONE_NEWTIME + 0;
+            my $r;
+            do { $r = syscall($nr, $flg) } while ($r == -1 && $! == EINTR);
+            $r == 0 or fatal("unshare NEWTIME: $!");
+            $unshare_flags &= ~CLONE_NEWTIME;
+            # Write timens offsets now, before entering the userns
+            apply_timens_offsets($spec);
+        }
+
         if ($clone_flags & CLONE_NEWUSER) {
             # Creating a new user namespace: unshare first, then let
             # parent write UID/GID mappings before proceeding.
@@ -4551,8 +4654,10 @@ sub cmd_create {
 
         # Write time namespace offsets (must happen after unshare that
         # includes CLONE_NEWTIME, before fork that creates children in
-        # the new time namespace).
-        if ($clone_flags & CLONE_NEWTIME) {
+        # the new time namespace).  Skip if already handled above (the
+        # timens+userns early-unshare path).
+        if (($clone_flags & CLONE_NEWTIME) && ($unshare_flags & CLONE_NEWTIME)) {
+            # NEWTIME was just unshared in the remaining-flags block above
             apply_timens_offsets($spec);
         }
 
@@ -4619,7 +4724,7 @@ sub cmd_create {
         # Run the init process (eval captures die from fatal so we can
         # report the actual error to the parent through the channel).
         eval {
-            run_init_process($spec, $rootfs, $notify_srv, $main_w_fd, $init_r_fd, $cgpath, $id, $bundle, $console_socket_path, $init_debug_fd, $no_pivot, $p{foreground}, $pty_sock_fd, \%mount_source_fds);
+            run_init_process($spec, $rootfs, $notify_srv, $main_w_fd, $init_r_fd, $cgpath, $id, $bundle, $console_socket_path, $init_debug_fd, $no_pivot, $p{foreground}, $pty_sock_fd, \%mount_source_fds, $console_socket_preconnected_fd);
         };
         if ($@) {
             my $err = "$@";
@@ -5965,6 +6070,7 @@ sub cmd_exec {
 
     # Move exec process into the container's cgroup (before signalling child)
     my $container_cgpath = $state->{cgroupPath};
+    my $deferred_exec_cg_path;  # set when --cgroup + PID ns (defer to grandchild)
     if ($exec_cgroup) {
         # --cgroup: move to a specific sub-cgroup
         fatal("container has no cgroup path") unless $container_cgpath;
@@ -5994,10 +6100,17 @@ sub cmd_exec {
         # Check the cgroup exists
         fatal("exec cgroup '$sub_path': no such file or directory")
             unless -d $sub_path;
-        # Write exec process PID to the sub-cgroup
-        eval { write_file("$sub_path/cgroup.procs", "$child\n") };
-        if ($@) {
-            fatal("adding pid $child to cgroups: $sub_path/cgroup.procs: $!");
+        if ($has_pid_ns_in_exec) {
+            # Defer cgroup write until after the double-fork so the
+            # grandchild (actual exec'd process) PID is written, not
+            # the intermediate's PID.
+            $deferred_exec_cg_path = $sub_path;
+        } else {
+            # Write exec process PID to the sub-cgroup
+            eval { write_file("$sub_path/cgroup.procs", "$child\n") };
+            if ($@) {
+                fatal("adding pid $child to cgroups: $sub_path/cgroup.procs: $!");
+            }
         }
     } elsif ($container_cgpath) {
         # Default: join the container's cgroup.
@@ -6036,6 +6149,18 @@ sub cmd_exec {
         }
     }
     close $gc_pid_r;
+
+    # Deferred cgroup write: move the grandchild (not intermediate) to
+    # the exec subcgroup so the PID file and cgroup.procs agree.
+    if ($deferred_exec_cg_path && $final_pid != $child) {
+        eval { write_file("$deferred_exec_cg_path/cgroup.procs", "$final_pid\n") };
+        if ($@) {
+            fatal("adding pid $final_pid to cgroups: $deferred_exec_cg_path/cgroup.procs: $!");
+        }
+    } elsif ($deferred_exec_cg_path) {
+        # No PID ns double-fork happened (shouldn't reach here, but safe)
+        eval { write_file("$deferred_exec_cg_path/cgroup.procs", "$child\n") };
+    }
 
     # Write pid file (after sync so we have the grandchild PID)
     if ($pid_file) {
@@ -6142,6 +6267,15 @@ sub cmd_update {
         // fatal("no cgroup path for container");
 
     my $resources;
+    # runc compat: if no --resources flag and no CLI flags, read from stdin
+    # when it is not a terminal (i.e. piped data).
+    if (!$res_file && !-t STDIN) {
+        my $has_cli_flags = grep { defined $p{$_} }
+            qw(pids_limit cpu_period cpu_quota cpu_share cpu_burst
+               memory memory_swap memory_reservation cpuset_cpus
+               cpuset_mems cpu_idle);
+        $res_file = '-' unless $has_cli_flags;
+    }
     if ($res_file) {
         # Load resources from file or stdin
         my $res_json;

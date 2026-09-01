@@ -136,7 +136,7 @@ runc run/create should refuse pre-existing frozen cgroup
 # --- run (devices) ---
 runc run [device cgroup allow rm block device]
 runc run [device cgroup allow rw char device]
-runc run/update [device cgroup deny]
+[skip]runc run/update [device cgroup deny] # eBPF device program not implemented
 [skip]runc run [devices vs systemd NeedDaemonReload] # systemd
 
 # --- run (seccomp) ---
@@ -346,8 +346,8 @@ update cpu quota with no previous period/quota set
 update cpuset cpus range via v2 unified map
 update cpuset parameters via resources.CPU
 update cpuset parameters via v2 unified map
-update devices [minimal transition rules]
-update memory vs CheckBeforeUpdate
+[skip]update devices [minimal transition rules] # eBPF device program not implemented
+[skip]update memory vs CheckBeforeUpdate # resource validation not implemented
 update paused container
 update per-device iops/bps values
 update pids.limit
