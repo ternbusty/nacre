@@ -1002,6 +1002,7 @@ our @EXPORT = qw(
     apply_pivot_root apply_rootfs_propagation
     apply_masked_paths apply_readonly_paths set_rootfs_readonly
     _mask_host_procfs_sysfs
+    _create_userns_from_strings
     %MOUNT_FLAGS
 );
 

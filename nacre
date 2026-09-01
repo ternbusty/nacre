@@ -997,7 +997,7 @@ sub cmd_create {
                                 annotations => $spec->{annotations} // {},
                             },
                         };
-                        my $payload = encode_json($container_state);
+                        my $payload = $JSON_COMPACT->encode($container_state);
                         send_fd_via_socket($listener_path, $notify_fd, $payload);
                     };
                     if ($@) {
@@ -2450,7 +2450,7 @@ sub cmd_exec {
                         annotations => $spec->{annotations} // {},
                     },
                 };
-                my $payload = encode_json($container_state);
+                my $payload = $JSON_COMPACT->encode($container_state);
                 eval { send_fd_via_socket($listener_path, $notify_fd, $payload) };
                 if ($@) {
                     warn "nacre: failed to send seccomp notify fd to $listener_path: $@\n";

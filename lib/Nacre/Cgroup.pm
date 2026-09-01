@@ -236,6 +236,11 @@ sub cgroup_pids {
     return grep { /^\d+$/ } split /\n/, $data;
 }
 
+sub cg_read {
+    my ($cgpath, $file) = @_;
+    return read_file("$cgpath/$file");
+}
+
 sub cg_write {
     my ($cgpath, $file, $value, %opts) = @_;
     my $path = "$cgpath/$file";
@@ -263,6 +268,7 @@ sub convert_cpu_shares {
 our @EXPORT = qw(
     cgroup_path cgroup_setup cgroup_apply_resources
     cgroup_add_process cgroup_cleanup cgroup_pids
+    cg_read cg_write
 );
 
 1;
