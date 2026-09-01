@@ -4141,6 +4141,9 @@ sub run_init_process {
         # Mask host procfs/sysfs full mounts outside the rootfs to prevent
         # the container from remounting them after chroot (runc compat).
         _mask_host_procfs_sysfs($rootfs);
+        # chdir into rootfs BEFORE MS_MOVE so the cwd follows the move
+        # and chroot(".") targets the rootfs, matching runc's msMoveRoot.
+        chdir($rootfs) or fatal("chdir to rootfs: $!");
         # MS_MOVE the rootfs to "/" then chroot, matching runc's msMoveRoot.
         do_mount($rootfs, '/', '', MS_MOVE, '')
             or fatal("MS_MOVE $rootfs to /: $!");
