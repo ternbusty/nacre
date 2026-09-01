@@ -16,6 +16,7 @@ jobs:
         run: |
           sudo mkdir -p /opt/nacre
           sudo cp nacre /opt/nacre/nacre
+          sudo cp -r lib /opt/nacre/lib
           sudo chmod +x /opt/nacre/nacre
           # Create a wrapper that invokes perl
           sudo tee /opt/nacre/bin > /dev/null <<'WRAPPER'
