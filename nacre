@@ -1443,11 +1443,28 @@ sub _copy_dir_contents {
 sub prepare_rootfs {
     my ($spec, $rootfs, $mount_source_fds, $chan_w, $chan_r) = @_;
 
-    # During setup, use slave propagation to prevent mount events from
-    # leaking to the parent mount namespace.  The spec's requested
-    # propagation is applied AFTER pivot_root (see apply_rootfs_propagation).
-    do_mount('', '/', '', MS_SLAVE | MS_REC, '')
+    # During setup, use the spec's rootfsPropagation (or MS_SLAVE|MS_REC
+    # as default) to prevent mount events from leaking to the parent mount
+    # namespace.  The spec's propagation is re-applied AFTER pivot_root
+    # (see apply_rootfs_propagation).
+    my $prep_prop = MS_SLAVE | MS_REC;
+    if (my $rp = $spec->{linux}{rootfsPropagation}) {
+        $prep_prop = $PROPAGATION_FLAGS{$rp} // $prep_prop;
+    }
+    do_mount('', '/', '', $prep_prop, '')
         or fatal("mount propagation (setup) /: $!");
+
+    # Make the rootfs mount point (or its nearest parent mount) private.
+    # This ensures the bind mount below creates a private copy that won't
+    # propagate events back to the host (matching runc's
+    # rootfsParentMountPrivate).
+    {
+        my $p = $rootfs;
+        while (!do_mount('', $p, '', MS_PRIVATE, '')) {
+            last if $p eq '/';
+            $p =~ s{/[^/]*$}{} || ($p = '/');
+        }
+    }
 
     # Bind mount rootfs on itself
     do_mount($rootfs, $rootfs, '', MS_BIND | MS_REC, '')
@@ -1816,8 +1833,24 @@ sub apply_mounts {
             if ($prop_flags && !($mount_flags & ~MS_REC)) {
                 $mount_flags &= ~MS_REC;
             }
-            do_mount($src, $dest, $type, $mount_flags, $data)
-                or do { warn "nacre: mount $type on $dest: $!\n"; next; };
+            unless (do_mount($src, $dest, $type, $mount_flags, $data)) {
+                # cgroup2 mount can fail in userns that doesn't own the
+                # cgroup namespace (EBUSY/EPERM).  Fall back to bind-mounting
+                # the host cgroup2 hierarchy, matching runc behaviour.
+                if ($type eq 'cgroup2' && -d '/sys/fs/cgroup') {
+                    unless (do_mount('/sys/fs/cgroup', $dest, '', MS_BIND, '')) {
+                        warn "nacre: mount $type on $dest: $!\n";
+                        next;
+                    }
+                    # Apply the same mount flags (e.g. ro, nosuid) via remount
+                    if ($mount_flags & ~MS_BIND) {
+                        do_mount('', $dest, '', MS_REMOUNT | MS_BIND | $mount_flags, '');
+                    }
+                } else {
+                    warn "nacre: mount $type on $dest: $!\n";
+                    next;
+                }
+            }
             log_debug("mounted $type on $dest ok, isdir=" . (-d $dest ? "yes" : "no"));
             # Now apply propagation flags if any
             if ($prop_flags & $prop_mask) {
@@ -2080,9 +2113,13 @@ sub apply_rootfs_propagation {
     # Apply the spec's rootfsPropagation AFTER pivot_root, so setup
     # operations (bind mounts, device creation) run under safe slave
     # propagation and the final container root gets the requested type.
+    # When the spec doesn't set rootfsPropagation, skip this entirely —
+    # matching runc, which only applies propagation when explicitly set.
     my ($spec) = @_;
-    my $propagation = $spec->{linux}{rootfsPropagation} // 'rslave';
-    my $prop_flags = $PROPAGATION_FLAGS{$propagation} // (MS_SLAVE | MS_REC);
+    my $propagation = $spec->{linux}{rootfsPropagation};
+    return unless defined $propagation && $propagation ne '';
+
+    my $prop_flags = $PROPAGATION_FLAGS{$propagation} // return;
 
     # MS_PRIVATE: nothing to do — rootfsParentMountPrivate already made
     # the parent private, and pivot_root inherits it.
@@ -2095,11 +2132,16 @@ sub apply_rootfs_propagation {
         do_mount('', '/', '', MS_PRIVATE | MS_REC, '');
     }
 
-    # For MS_SLAVE/MS_RSLAVE: apply directly — a slave mount must retain
-    # its peer group (a private mount has no master, so MS_SLAVE fails
-    # with EINVAL).
-    do_mount('', '/', '', $prop_flags, '')
-        or fatal("mount propagation ($propagation) /: $!");
+    # For MS_SLAVE/MS_RSLAVE: apply directly.  If the mount is already
+    # private (e.g. no-pivot mode after MS_MOVE + chroot, or
+    # rootfsParentMountPrivate), MS_SLAVE fails with EINVAL because a
+    # private mount has no master.  Recover by creating a peer group
+    # (MS_SHARED) first, then applying slave.
+    unless (do_mount('', '/', '', $prop_flags, '')) {
+        do_mount('', '/', '', MS_SHARED | MS_REC, '');
+        do_mount('', '/', '', $prop_flags, '')
+            or fatal("mount propagation ($propagation) /: $!");
+    }
 }
 
 sub apply_masked_paths {
@@ -4498,10 +4540,8 @@ sub cmd_create {
         $has_userns = 1 if $ns->{type} eq 'user';
         $has_pidns  = 1 if $ns->{type} eq 'pid';
     }
-    # User namespace must be joined first — other namespaces (time, pid,
-    # net, etc.) may belong to the target userns, and setns() requires the
-    # caller to already be in that userns.
-    @join_ns = sort { ($a->{type} eq 'user' ? 0 : 1) <=> ($b->{type} eq 'user' ? 0 : 1) } @join_ns;
+    # NOTE: namespace join ordering is handled below in the three-phase
+    # setns loop (non-user first, then user, then retry deferred).
 
     # Ensure a mount namespace exists — pivot_root and rootfs setup
     # modify the mount tree and would corrupt the caller's filesystem
@@ -4599,20 +4639,69 @@ sub cmd_create {
             # connection later (which works when there's no userns).
         }
 
-        # Join specified namespaces
+        # Join specified namespaces — three-phase approach:
+        # Phase 1: non-user namespaces (skip EPERM — may need userns first)
+        # Phase 2: join user namespace
+        # Phase 3: retry deferred EPERM ones (now that we're in the userns)
+        # This handles timens (owned by container userns, EPERM from init
+        # userns) and netns owned by a different userns.
+        #
+        # IMPORTANT: Open ALL namespace fds BEFORE any setns so that we
+        # don't need to re-open /proc/PID/ns/* after joining the userns
+        # (the UID change from joining userns can block /proc access).
         my $joined_userns = 0;
+        my @deferred_ns;
+
+        # Pre-open all namespace fds
+        my (@ns_open, $userns_entry);
         for my $ns (@join_ns) {
             my $ns_fd;
             sysopen($ns_fd, $ns->{path}, O_RDONLY) or fatal("open ns $ns->{path}: $!");
+            my $entry = { %$ns, fd => $ns_fd, fileno => fileno($ns_fd) };
+            if ($ns->{type} eq 'user') {
+                $userns_entry = $entry;
+            } else {
+                push @ns_open, $entry;
+            }
+        }
+
+        # Phase 1: try non-user namespaces
+        for my $e (@ns_open) {
             my $nr  = SYS_setns + 0;
-            my $fd  = fileno($ns_fd) + 0;
-            my $flg = $ns->{info}{flag} + 0;
+            my $fd  = $e->{fileno} + 0;
+            my $flg = $e->{info}{flag} + 0;
             my $r;
             do { $r = syscall($nr, $fd, $flg) } while ($r == -1 && $! == EINTR);
-            $r == 0 or fatal("setns $ns->{type}: $!");
-            close $ns_fd;
-            $joined_userns = 1 if $ns->{type} eq 'user';
+            if ($r != 0) {
+                if ($! == EPERM) {
+                    push @deferred_ns, $e;
+                } else {
+                    fatal("setns $e->{type}: $!");
+                }
+            }
         }
+        # Phase 2: join user namespace
+        if ($userns_entry) {
+            my $nr  = SYS_setns + 0;
+            my $fd  = $userns_entry->{fileno} + 0;
+            my $flg = $userns_entry->{info}{flag} + 0;
+            my $r;
+            do { $r = syscall($nr, $fd, $flg) } while ($r == -1 && $! == EINTR);
+            $r == 0 or fatal("setns $userns_entry->{type}: $!");
+            close $userns_entry->{fd};
+            $joined_userns = 1;
+        }
+        # Phase 3: retry deferred (fd already open from Phase 1)
+        for my $e (@deferred_ns) {
+            my $nr  = SYS_setns + 0;
+            my $fd  = $e->{fileno} + 0;
+            my $flg = $e->{info}{flag} + 0;
+            my $r;
+            do { $r = syscall($nr, $fd, $flg) } while ($r == -1 && $! == EINTR);
+            $r == 0 or fatal("setns $e->{type} (deferred): $!");
+        }
+        # Close all namespace fds
+        for my $e (@ns_open) { close $e->{fd}; }
         # After joining an existing user namespace, become root inside it.
         # The host UID 0 is typically not in the target userns mapping, so
         # the process appears as overflow UID 65534.  setuid(0)/setgid(0)
@@ -5858,10 +5947,33 @@ sub cmd_exec {
     pipe(my $gc_pid_r, my $gc_pid_w) or fatal("pipe: $!");
     my $has_pid_ns_in_exec = grep { $_->{name} eq 'pid' } @ns_fds;
 
+    # Deferred cgroup sync pipe: when the cgroup write is deferred (PID
+    # namespace case), the grandchild waits on this pipe before exec so
+    # the parent can write the grandchild's PID to the cgroup first.
+    pipe(my $cg_sync_r, my $cg_sync_w) or fatal("pipe: $!");
+
+    # Seccomp NOTIFY socketpair: when exec uses SCMP_ACT_NOTIFY, the
+    # grandchild sends the notify fd to the parent (which is in the host
+    # mount namespace and can connect to the seccomp agent socket).
+    my $exec_has_seccomp_notify = 0;
+    if ($spec->{linux}{seccomp}) {
+        for my $rule (@{$spec->{linux}{seccomp}{syscalls} // []}) {
+            if (($rule->{action} // '') eq 'SCMP_ACT_NOTIFY') {
+                $exec_has_seccomp_notify = 1;
+                last;
+            }
+        }
+    }
+    my ($seccomp_parent_fh, $seccomp_child_fh);
+    if ($exec_has_seccomp_notify) {
+        socketpair($seccomp_parent_fh, $seccomp_child_fh, AF_UNIX, SOCK_STREAM, 0)
+            or fatal("socketpair for seccomp: $!");
+    }
+
     # Move internal fds above the preserve-fds range so they don't
     # clobber user-inherited fds 3..2+preserve_fds.
     my $min_fd = 3 + $preserve_fds;
-    for my $fh ($err_r, $err_w, $sync_r, $sync_w, $gc_pid_r, $gc_pid_w, ($pty_parent_fh ? $pty_parent_fh : ()), ($pty_child_fh ? $pty_child_fh : ())) {
+    for my $fh ($err_r, $err_w, $sync_r, $sync_w, $gc_pid_r, $gc_pid_w, $cg_sync_r, $cg_sync_w, ($pty_parent_fh ? $pty_parent_fh : ()), ($pty_child_fh ? $pty_child_fh : ()), ($seccomp_parent_fh ? $seccomp_parent_fh : ()), ($seccomp_child_fh ? $seccomp_child_fh : ())) {
         my $cur = fileno($fh);
         if (defined $cur && $cur >= 3 && $cur < $min_fd) {
             my $new = POSIX::dup($cur);
@@ -5893,7 +6005,9 @@ sub cmd_exec {
         close $err_r;
         close $sync_w;
         close $gc_pid_r;
+        close $cg_sync_w;
         close $pty_parent_fh if $pty_parent_fh;
+        close $seccomp_parent_fh if $seccomp_parent_fh;
 
         log_debug("nsexec container setup");
         log_debug("child process in init()");
@@ -5973,7 +6087,9 @@ sub cmd_exec {
                 close $gc_pid_w;
                 # Wait for grandchild, propagate exit status
                 close $err_w;
+                close $cg_sync_r;
                 close $pty_child_fh if $pty_child_fh;
+                close $seccomp_child_fh if $seccomp_child_fh;
                 waitpid($pid2, 0);
                 my $rc = $? >> 8;
                 $rc = 128 + ($? & 127) if ($? & 127);
@@ -6076,35 +6192,18 @@ sub cmd_exec {
         # Non-NOTIFY seccomp also works here because we still have root
         # privileges (either via CAP_SYS_ADMIN or host root UID).
         my $exec_seccomp_notify_fd = apply_seccomp_raw($spec);
-        if (defined $exec_seccomp_notify_fd && $exec_seccomp_notify_fd >= 0) {
-            # Send notify fd to the seccomp listener socket
-            my $listener_path = $spec->{linux}{seccomp}{listenerPath} // '';
-            my $listener_meta = $spec->{linux}{seccomp}{listenerMetadata} // '';
-            if ($listener_path ne '') {
-                eval {
-                    my $container_state = {
-                        ociVersion => $spec->{ociVersion} // '1.2.0',
-                        fds        => ['seccompFd'],
-                        pid        => $$ + 0,
-                        metadata   => $listener_meta,
-                        state      => {
-                            ociVersion  => $spec->{ociVersion} // '1.2.0',
-                            id          => $id // '',
-                            status      => 'running',
-                            pid         => $init_pid + 0,
-                            bundle      => $state->{bundle} // '',
-                            annotations => $spec->{annotations} // {},
-                        },
-                    };
-                    my $payload = encode_json($container_state);
-                    send_fd_via_socket($listener_path, $exec_seccomp_notify_fd, $payload);
-                };
-                if ($@) {
-                    syswrite($err_w, "seccomp notify: $@");
-                    _exit(255);
-                }
-            }
+        if (defined $exec_seccomp_notify_fd && $exec_seccomp_notify_fd >= 0
+            && $seccomp_child_fh) {
+            # Send the seccomp notify fd to the PARENT process via
+            # the seccomp socketpair.  The exec child is in the container's
+            # mount namespace, so it can't access the seccomp agent socket
+            # (host path).  The parent is in the host mount namespace and
+            # forwards it to the agent.
+            send_fd_over_fd(fileno($seccomp_child_fh), $exec_seccomp_notify_fd);
+            close $seccomp_child_fh;
             POSIX::close($exec_seccomp_notify_fd);
+        } elsif ($seccomp_child_fh) {
+            close $seccomp_child_fh;
         }
 
         # Set supplementary groups
@@ -6173,6 +6272,13 @@ sub cmd_exec {
 
         log_debug("setns_init: about to exec");
 
+        # Wait for parent to complete deferred cgroup write (PID ns case).
+        # The parent writes our PID to the cgroup after reading it from
+        # the gc_pid pipe.  We must wait here so the cgroup is correct
+        # before exec.  For non-PID-ns case, the pipe is closed immediately.
+        sysread($cg_sync_r, my $cg_sync_buf, 1);
+        close $cg_sync_r;
+
         # Close fds above preserve range
         # Keep: 0,1,2 + preserve_fds extra (i.e., fds 3..2+preserve_fds)
         # Close everything else except err_w
@@ -6191,6 +6297,7 @@ sub cmd_exec {
             }
             closedir $dh;
         }
+
         # Apply final CPU affinity right before exec
         apply_final_cpu_affinity($final_affinity) if $final_affinity;
 
@@ -6205,6 +6312,8 @@ sub cmd_exec {
     close $pty_child_fh if $pty_child_fh;
     close $sync_r;
     close $gc_pid_w;
+    close $cg_sync_r;
+    close $seccomp_child_fh if $seccomp_child_fh;
 
     # Move exec process into the container's cgroup (before signalling child)
     my $container_cgpath = $state->{cgroupPath};
@@ -6295,6 +6404,46 @@ sub cmd_exec {
         my $cg_pid = $final_pid;
         eval { write_file("$deferred_exec_cg_path/cgroup.procs", "$cg_pid\n") };
         # Silently ignore ESRCH (process already exited)
+    }
+
+    # Signal grandchild that deferred cgroup write is done (or not needed).
+    # The grandchild waits on cg_sync_r before exec to ensure the cgroup
+    # is set correctly.
+    syswrite($cg_sync_w, "x", 1);
+    close $cg_sync_w;
+
+    # Receive seccomp notify fd from grandchild and forward to agent.
+    # The grandchild is in the container's mount namespace and can't
+    # reach the host-side seccomp agent socket.
+    if ($seccomp_parent_fh) {
+        my $notify_fd = recv_fd_over_fd(fileno($seccomp_parent_fh));
+        close $seccomp_parent_fh;
+        if ($notify_fd >= 0) {
+            my $listener_path = $spec->{linux}{seccomp}{listenerPath} // '';
+            my $listener_meta = $spec->{linux}{seccomp}{listenerMetadata} // '';
+            if ($listener_path ne '') {
+                my $container_state = {
+                    ociVersion => $spec->{ociVersion} // '1.2.0',
+                    fds        => ['seccompFd'],
+                    pid        => $final_pid + 0,
+                    metadata   => $listener_meta,
+                    state      => {
+                        ociVersion  => $spec->{ociVersion} // '1.2.0',
+                        id          => $id // '',
+                        status      => 'running',
+                        pid         => $init_pid + 0,
+                        bundle      => $state->{bundle} // '',
+                        annotations => $spec->{annotations} // {},
+                    },
+                };
+                my $payload = encode_json($container_state);
+                eval { send_fd_via_socket($listener_path, $notify_fd, $payload) };
+                if ($@) {
+                    warn "nacre: failed to send seccomp notify fd to $listener_path: $@\n";
+                }
+            }
+            POSIX::close($notify_fd);
+        }
     }
 
     # Write pid file (after sync so we have the grandchild PID)
