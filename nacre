@@ -1709,6 +1709,11 @@ sub apply_mounts {
                 push @real_opts, $o;
             }
         }
+        # OCI spec: idmap mounts are also identified by per-mount
+        # uidMappings/gidMappings (not just the "idmap" option string).
+        if (!$has_idmap && !$has_ridmap && ($m->{uidMappings} || $m->{gidMappings})) {
+            $has_idmap = 1;
+        }
         my ($flags, $data) = parse_mount_options(\@real_opts);
         my $src  = $m->{source} // $type;
 
@@ -5040,12 +5045,20 @@ sub cmd_run {
     # Create (foreground: keep stdio so user sees container output)
     my $state = cmd_create(%p, foreground => 1);
 
+    # Set PTY to raw mode BEFORE sending the start signal.  The slave's
+    # default ONLCR converts \n→\r\n; clearing OPOST before start ensures
+    # no output goes through the PTY with cooked settings (race between
+    # start and pty_set_raw was causing \r to corrupt captured output).
+    my $pty_master_fd = $state->{_pty_master_fd};
+    if (defined $pty_master_fd) {
+        pty_set_raw($pty_master_fd);
+    }
+
     # Start
     cmd_start(id => $id, root => $root);
 
     # Forward signals to init
     my $init_pid = $state->{pid};
-    my $pty_master_fd = $state->{_pty_master_fd};
     for my $sig (qw(TERM INT HUP QUIT USR1 USR2)) {
         $SIG{$sig} = sub { kill $SIG_NUM{$sig}, $init_pid; };
     }
@@ -5065,10 +5078,6 @@ sub cmd_run {
                 }
             }
         };
-
-        # Set PTY to raw mode (disable OPOST/ONLCR — prevents \n→\r\n
-        # conversion that corrupts captured output).
-        pty_set_raw($pty_master_fd);
 
         # Put master in non-blocking mode
         my $fl = fcntl_getfl($pty_master_fd);
