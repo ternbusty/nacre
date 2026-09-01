@@ -1505,8 +1505,14 @@ sub _create_userns_for_idmap {
         my $nr = SYS_unshare + 0;
         my $fl = CLONE_NEWUSER + 0;
         syscall($nr, $fl) == 0 or _exit(1);
-        # Signal parent: "ready for mappings"
-        syswrite($cw, "R", 1);
+        # Send host PID to parent.  /proc/self resolves to the PID in the
+        # procfs's PID namespace (the host one), even when we are inside a
+        # new PID namespace.  fork() returns the child PID in the caller's
+        # (new) PID namespace, which does NOT match /proc entries when the
+        # host /proc is still mounted.
+        my $host_pid = readlink('/proc/self') // '';
+        # Signal parent: "ready for mappings" — send host PID
+        syswrite($cw, "$host_pid\n", length("$host_pid\n"));
         close $cw;
         # Wait for parent to write mappings
         my $buf;
@@ -1523,15 +1529,21 @@ sub _create_userns_for_idmap {
     close $c_sock;
     close $cw;
     close $cr;
-    # Wait for child to unshare
+    # Wait for child to unshare and send its host PID.
+    # When this function is called from the init process (which is in a
+    # new PID namespace), fork() returns the child's PID in the new PID
+    # namespace, but /proc still shows the host PID namespace.  The child
+    # reads /proc/self to get its host PID and sends it to us.
     my $buf;
-    sysread($pr, $buf, 1);
+    sysread($pr, $buf, 64);
     close $pr;
+    chomp $buf;
+    my $proc_pid = ($buf =~ /^(\d+)$/) ? $1 : $child;
 
-    # Write mappings
-    write_file("/proc/$child/setgroups", "deny");
-    write_file("/proc/$child/uid_map", $uid_str);
-    write_file("/proc/$child/gid_map", $gid_str);
+    # Write mappings using the host PID (which matches /proc entries)
+    write_file("/proc/$proc_pid/setgroups", "deny");
+    write_file("/proc/$proc_pid/uid_map", $uid_str);
+    write_file("/proc/$proc_pid/gid_map", $gid_str);
 
     # Signal child: "mappings written"
     syswrite($pw, "D", 1);
@@ -1707,6 +1719,16 @@ sub apply_mounts {
             do_mount($src, $dest, $type, $mount_flags, $data)
                 or do { warn "nacre: mount $type on $dest: $!\n"; next; };
             log_debug("mounted $type on $dest ok, isdir=" . (-d $dest ? "yes" : "no"));
+            # Debug: after /dev tmpfs mount, verify the mount is visible
+            if ($m->{destination} eq '/dev' && $type eq 'tmpfs') {
+                my @st = stat($dest);
+                if (@st) {
+                    warn sprintf("nacre: DEBUG /dev tmpfs mounted: uid=%d gid=%d mode=%04o isdir=%s\n",
+                        $st[4], $st[5], $st[2] & 07777, (-d $dest ? "yes" : "no"));
+                } else {
+                    warn "nacre: DEBUG /dev tmpfs stat FAILED: $!\n";
+                }
+            }
             # Now apply propagation flags if any
             if ($prop_flags & $prop_mask) {
                 do_mount('', $dest, '', $prop_flags, '')
@@ -4344,6 +4366,7 @@ sub cmd_create {
         }
 
         # Join specified namespaces
+        my $joined_userns = 0;
         for my $ns (@join_ns) {
             my $ns_fd;
             sysopen($ns_fd, $ns->{path}, O_RDONLY) or fatal("open ns $ns->{path}: $!");
@@ -4354,6 +4377,17 @@ sub cmd_create {
             do { $r = syscall($nr, $fd, $flg) } while ($r == -1 && $! == EINTR);
             $r == 0 or fatal("setns $ns->{type}: $!");
             close $ns_fd;
+            $joined_userns = 1 if $ns->{type} eq 'user';
+        }
+        # After joining an existing user namespace, become root inside it.
+        # The host UID 0 is typically not in the target userns mapping, so
+        # the process appears as overflow UID 65534.  setuid(0)/setgid(0)
+        # transitions to container UID 0 (which may map to a different
+        # host UID).  Silently ignore failure: some userns configs may not
+        # map UID 0, and the process will continue at whatever UID it has.
+        if ($joined_userns) {
+            POSIX::setgid(0);
+            POSIX::setuid(0);
         }
 
         # Unshare namespaces (except PID — that's handled by fork below)
@@ -4374,6 +4408,14 @@ sub cmd_create {
             # Wait for mapping done
             my $resp = channel_recv($init_r_fd);
             fatal("mapping failed") unless $resp && $resp->{type} eq 'mapping_done';
+
+            # Become root (UID 0 / GID 0) inside the new user namespace.
+            # After unshare(CLONE_NEWUSER), the process UID/GID is the
+            # overflow value (65534) because the host UID 0 is typically
+            # not in the container's UID mapping.  The init process needs
+            # UID 0 to mount tmpfs, create devices, etc.
+            POSIX::setgid(0);
+            POSIX::setuid(0);
         }
         # Note: when joining an existing userns via path (setns above),
         # we do NOT unshare NEWUSER — the setns already placed us in the
