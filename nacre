@@ -6289,13 +6289,12 @@ sub cmd_exec {
 
     # Deferred cgroup write: move the grandchild (not intermediate) to
     # the target cgroup so only the exec'd process is in the cgroup.
+    # Non-fatal: for fast-exiting commands (e.g. cat, ls), the grandchild
+    # may have already exited by the time we write, producing ESRCH.
     if ($deferred_exec_cg_path) {
         my $cg_pid = $final_pid;
         eval { write_file("$deferred_exec_cg_path/cgroup.procs", "$cg_pid\n") };
-        if ($@) {
-            my $err = $@; chomp $err;
-            fatal("adding pid $cg_pid to cgroups: $err");
-        }
+        # Silently ignore ESRCH (process already exited)
     }
 
     # Write pid file (after sync so we have the grandchild PID)
