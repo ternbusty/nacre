@@ -424,7 +424,7 @@ sub ensure_dir {
         unless (mkdir $d, $mode) {
             # Retry only if the directory now exists (race or mount appeared)
             next if -d $d;
-            log_debug("ensure_dir: mkdir $d failed: $!");
+            warn "nacre: ensure_dir: mkdir $d failed: $!\n";
         }
     }
 }
@@ -1595,6 +1595,8 @@ sub apply_mounts {
         my $mount_src = $m->{source} // '';
         my $type = $m->{type} // '';
 
+        log_debug("apply_mounts: processing $m->{destination} type=$type dest=$dest");
+
         # Security: /proc and /sys must not be symlinks (CVE-2023-27561 / CVE-2019-19921)
         if ($type eq 'proc' || $type eq 'sysfs') {
             if (-l $dest) {
@@ -1615,6 +1617,9 @@ sub apply_mounts {
             # We only inherit tmpfs mode from pre-existing directories.
             my $dest_preexisted = -d $dest;
             ensure_dir($dest);
+            if (!-d $dest) {
+                warn "nacre: ensure_dir: $dest still not a dir after ensure_dir (exists=" . (-e $dest ? "yes" : "no") . " uid=$< euid=$>)\n";
+            }
             $dest_preexisted{$dest} = $dest_preexisted;
         }
 
@@ -1701,6 +1706,7 @@ sub apply_mounts {
             }
             do_mount($src, $dest, $type, $mount_flags, $data)
                 or do { warn "nacre: mount $type on $dest: $!\n"; next; };
+            log_debug("mounted $type on $dest ok, isdir=" . (-d $dest ? "yes" : "no"));
             # Now apply propagation flags if any
             if ($prop_flags & $prop_mask) {
                 do_mount('', $dest, '', $prop_flags, '')
@@ -4781,7 +4787,7 @@ sub cmd_kill {
         # neither created nor running MUST generate an error."
         # For stopped containers, always error — even SIGKILL.
         if ($state->{status} eq 'stopped') {
-            fatal("container '$id' is not running");
+            fatal("container not running");
         }
         # For other states (paused, etc.): allow SIGKILL via cgroup.kill
         # when the init process is dead but children are still alive in
@@ -4790,7 +4796,7 @@ sub cmd_kill {
         if ($signal =~ /^\d+$/) { $signum_check = $signal; }
         else { my $s = $signal; $s =~ s/^SIG//i; $signum_check = $SIG_NUM{uc($s)}; }
         unless ($signum_check && $signum_check == 9 && $state->{cgroupPath}) {
-            fatal("container '$id' is not running");
+            fatal("container not running");
         }
     }
 
@@ -5188,7 +5194,7 @@ sub cmd_pause {
     my $root = $p{root} // $DEFAULT_ROOT;
 
     my $state = load_state($root, $id);
-    fatal("container '$id' is not running") unless $state->{status} eq 'running';
+    fatal("container not running") unless $state->{status} eq 'running';
 
     cg_write($state->{cgroupPath}, 'cgroup.freeze', '1');
     $state->{status} = 'paused';
@@ -5415,7 +5421,7 @@ sub cmd_exec {
                 my $s2 = eval { load_state($root, $id) };
                 last unless $s2;
                 if ($s2->{status} ne 'paused' && $s2->{status} ne 'running') {
-                    exec_fatal("container '$id' is not running");
+                    exec_fatal("container not running");
                 }
                 last if $s2->{status} eq 'running';
                 select(undef, undef, undef, 0.1);
@@ -5424,7 +5430,7 @@ sub cmd_exec {
             exec_fatal("cannot exec in a paused container, use --ignore-paused to wait");
         }
     } elsif ($state->{status} ne 'running' && $state->{status} ne 'created') {
-        exec_fatal("container '$id' is not running");
+        exec_fatal("container not running");
     }
 
     my $init_pid = $state->{pid};
