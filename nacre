@@ -1025,6 +1025,13 @@ sub netlink_set_up {
     send_netlink($msg);
 }
 
+sub netlink_set_down {
+    my ($ifindex) = @_;
+    my $msg = pack('L S S L L', 32, RTM_SETLINK, NLM_F_REQUEST | NLM_F_ACK, 1, 0)
+            . pack('C x S l L L', 0, 0, $ifindex, 0, IFF_UP);
+    send_netlink($msg);
+}
+
 # Set MTU via ioctl
 sub set_mtu {
     my ($ifname, $mtu) = @_;
@@ -1146,49 +1153,56 @@ sub move_net_devices {
         # Save permanent global addresses before moving
         my @saved_addrs = eval { netlink_list_addrs($ifindex) };
         netlink_move_to_ns($ifindex, $ns_pid);
-        # After moving, re-add addresses and bring up the interface
-        # inside the container's network namespace via setns.
-        if (@saved_addrs || $dev->{addresses}) {
-            # Open our own netns for later restore
-            sysopen(my $host_ns, '/proc/self/ns/net', O_RDONLY)
-                or fatal("open host netns: $!");
-            # Enter container netns
-            sysopen(my $ctr_ns, "/proc/$ns_pid/ns/net", O_RDONLY)
-                or fatal("open container netns: $!");
-            my $nr = SYS_setns + 0;
-            my $fd = fileno($ctr_ns) + 0;
-            my $fl = CLONE_NEWNET + 0;
-            syscall($nr, $fd, $fl) == 0 or fatal("setns container netns: $!");
-            close $ctr_ns;
-            # Look up new interface index (might differ after move)
-            my $ctr_name = $dev->{name} // $host_name;
-            my $new_idx = eval { get_ifindex($host_name) };  # still has old name
-            if (defined $new_idx) {
-                # Re-add saved addresses
-                for my $a (@saved_addrs) {
-                    my $addr_str;
-                    if ($a->{family} == AF_INET) {
-                        $addr_str = inet_ntoa($a->{addr_data});
-                    } elsif ($a->{family} == AF_INET6) {
-                        $addr_str = inet_ntop(AF_INET6, $a->{addr_data});
-                    }
-                    if ($addr_str) {
-                        eval { netlink_add_addr($new_idx, "$addr_str/$a->{prefix}") };
-                    }
-                }
-                # Bring link up
-                eval { netlink_set_up($new_idx) };
+
+        # After moving, enter the container's netns to apply all
+        # post-move config: rename, addresses, link up.  We always
+        # enter the netns (not just for addresses) because the init
+        # process may try rename_net_devices before we finish here.
+        my $want_rename = $dev->{name} && $dev->{name} ne $host_name;
+        next unless @saved_addrs || $dev->{addresses} || $want_rename;
+
+        # Open our own netns for later restore
+        sysopen(my $host_ns, '/proc/self/ns/net', O_RDONLY)
+            or fatal("open host netns: $!");
+        # Enter container netns
+        sysopen(my $ctr_ns, "/proc/$ns_pid/ns/net", O_RDONLY)
+            or fatal("open container netns: $!");
+        my $nr = SYS_setns + 0;
+        my $fd = fileno($ctr_ns) + 0;
+        my $fl = CLONE_NEWNET + 0;
+        syscall($nr, $fd, $fl) == 0 or fatal("setns container netns: $!");
+        close $ctr_ns;
+
+        # Look up new interface index (might differ after move)
+        my $new_idx = eval { get_ifindex($host_name) };  # still has old name
+        if (defined $new_idx) {
+            # Rename if needed (link must be down for rename)
+            if ($want_rename) {
+                eval { netlink_set_down($new_idx) };
+                netlink_rename($new_idx, $dev->{name});
             }
-            # Return to host netns
-            $nr = SYS_setns + 0;
-            $fd = fileno($host_ns) + 0;
-            $fl = CLONE_NEWNET + 0;
-            syscall($nr, $fd, $fl) == 0 or fatal("setns host netns: $!");
-            close $host_ns;
+            # Re-add saved addresses
+            for my $a (@saved_addrs) {
+                my $addr_str;
+                if ($a->{family} == AF_INET) {
+                    $addr_str = inet_ntoa($a->{addr_data});
+                } elsif ($a->{family} == AF_INET6) {
+                    $addr_str = inet_ntop(AF_INET6, $a->{addr_data});
+                }
+                if ($addr_str) {
+                    eval { netlink_add_addr($new_idx, "$addr_str/$a->{prefix}") };
+                }
+            }
+            # Bring link up
+            eval { netlink_set_up($new_idx) };
         }
-        # Apply additional config from spec (mtu, macAddress, addresses)
-        # These are applied inside the container netns by the init process
-        # after rename.
+
+        # Return to host netns
+        $nr = SYS_setns + 0;
+        $fd = fileno($host_ns) + 0;
+        $fl = CLONE_NEWNET + 0;
+        syscall($nr, $fd, $fl) == 0 or fatal("setns host netns: $!");
+        close $host_ns;
     }
 }
 
@@ -1841,6 +1855,8 @@ sub create_devices {
                 while ($ret == -1 && $! == EINTR);
         }
         if ($ret == 0) {
+            # chmod to ensure correct permissions (mknod is subject to umask)
+            chmod $file_mode, $dest;
             chown($dev->{uid} // 0, $dev->{gid} // 0, $dest);
             next;
         }
@@ -2624,7 +2640,7 @@ sub apply_seccomp_minimal {
     # Check if any rule uses SCMP_ACT_NOTIFY
     my $has_notify = 0;
     for my $r (@rules) {
-        $has_notify = 1 if $r->[1] == 0x7fc00000;  # SECCOMP_RET_USER_NOTIF
+        $has_notify = 1 if $r->{ret} == 0x7fc00000;  # SECCOMP_RET_USER_NOTIF
     }
     # Also check default action
     $has_notify = 1 if $default_ret == 0x7fc00000;
@@ -4724,8 +4740,9 @@ sub cmd_start {
             run_hooks($spec->{hooks}{poststart}, $state, must_succeed => 1, type => 'poststart');
         };
         if ($@) {
+            my $err = $@;
             eval { kill 9, $state->{pid} if $state->{pid}; };
-            die $@;
+            die $err;
         }
     }
 }
@@ -4940,6 +4957,7 @@ sub cmd_run {
         my $done = 0;
         $exit_code = 0;
         local $SIG{CHLD} = sub {
+            local $?;  # Prevent clobbering caller's $?
             while ((my $w = waitpid(-1, WNOHANG)) > 0) {
                 if ($w == $init_pid) {
                     if (WIFEXITED($?)) {
@@ -5208,6 +5226,7 @@ sub exec_tty_relay {
     my $child_exited = 0;
     my $exit_status = 0;
     local $SIG{CHLD} = sub {
+        local $?;  # Prevent clobbering caller's $?
         my $ret = waitpid($child_pid, WNOHANG);
         if ($ret > 0) {
             if (WIFEXITED($?)) {
