@@ -4777,13 +4777,20 @@ sub cmd_kill {
     # running (runc compat: -a is the obsoleted "all processes" flag).
     if ($state->{status} ne 'running' && $state->{status} ne 'created') {
         return if $all;
-        # In host PID namespace, the init process might be dead but children
-        # are still alive in the cgroup.  Allow SIGKILL via cgroup.kill.
+        # OCI spec: "Attempting to send a signal to a container that is
+        # neither created nor running MUST generate an error."
+        # For stopped containers, always error — even SIGKILL.
+        if ($state->{status} eq 'stopped') {
+            fatal("container '$id' is not running");
+        }
+        # For other states (paused, etc.): allow SIGKILL via cgroup.kill
+        # when the init process is dead but children are still alive in
+        # the cgroup (host PID namespace scenario).
         my $signum_check;
         if ($signal =~ /^\d+$/) { $signum_check = $signal; }
         else { my $s = $signal; $s =~ s/^SIG//i; $signum_check = $SIG_NUM{uc($s)}; }
         unless ($signum_check && $signum_check == 9 && $state->{cgroupPath}) {
-            fatal("container not running");
+            fatal("container '$id' is not running");
         }
     }
 

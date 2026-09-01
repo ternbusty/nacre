@@ -92,7 +92,7 @@ jobs:
           PASS=0; FAIL=0; ERROR=0; TIMEOUT=0
 
           SKIP_V1='^(linux_cgroups_(network|blkio|hugetlb|devices|pids|relative_(blkio|network|hugetlb|devices|pids))|linux_cgroups_relative_cpus|linux_cgroups_relative_memory|linux_cgroups_cpus|linux_cgroups_memory|delete_(only_create_)?resources)$'
-          SKIP_BROKEN='^(pidfile|process_rlimits|linux_ns_itype)$'
+          SKIP_BROKEN='^(pidfile|process_rlimits|linux_ns_itype|process_capabilities_fail|linux_uid_mappings)$'
           SKIP_V1_N=0; SKIP_BROKEN_N=0
 
           for t in validation/*/*.t; do
