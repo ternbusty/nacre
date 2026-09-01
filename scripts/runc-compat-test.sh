@@ -57,6 +57,7 @@ fi
 NACRE_SCRIPT_DIR="$(cd "$(dirname "$NACRE_BIN")" && pwd)"
 cp "$NACRE_BIN" "$RUNC_REPO_DIR/runc"
 cp "$NACRE_SCRIPT_DIR/nacre" "$RUNC_REPO_DIR/nacre"
+cp -r "$NACRE_SCRIPT_DIR/lib" "$RUNC_REPO_DIR/lib"
 chmod +x "$RUNC_REPO_DIR/runc" "$RUNC_REPO_DIR/nacre"
 
 # Fetch rootfs images
