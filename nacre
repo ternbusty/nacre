@@ -1962,6 +1962,40 @@ sub create_symlinks {
     }
 }
 
+sub _mask_host_procfs_sysfs {
+    # Unmount or cover all full procfs/sysfs mounts that are outside the
+    # container rootfs.  This prevents the container from re-mounting
+    # procfs/sysfs after chroot in --no-pivot mode (runc's msMoveRoot).
+    my ($rootfs) = @_;
+    my @to_mask;
+    if (open my $fh, '<', '/proc/self/mountinfo') {
+        while (my $line = <$fh>) {
+            chomp $line;
+            # mountinfo format: id parent_id major:minor root mountpoint ...
+            # fields after " - " are: fstype source super_options
+            my ($before, $after) = split / - /, $line, 2;
+            next unless defined $after;
+            my @b = split ' ', $before;
+            my $root = $b[3] // '';
+            my $mp   = $b[4] // '';
+            my ($fstype) = split ' ', $after;
+            next unless $root eq '/';  # only full mounts
+            next unless $fstype eq 'proc' || $fstype eq 'sysfs';
+            next if $mp =~ /^\Q$rootfs\E(?:\/|$)/;  # skip container's own mounts
+            push @to_mask, $mp;
+        }
+        close $fh;
+    }
+    for my $p (@to_mask) {
+        # Make slave so umount doesn't propagate to host
+        do_mount('', $p, '', MS_SLAVE | MS_REC, '');
+        unless (do_umount($p, MNT_DETACH)) {
+            # If unmount fails (e.g. rootless EPERM), cover with tmpfs
+            do_mount('tmpfs', $p, 'tmpfs', 0, '');
+        }
+    }
+}
+
 sub apply_pivot_root {
     log_debug("applying pivot_root");
     my ($rootfs) = @_;
@@ -2722,9 +2756,11 @@ sub apply_seccomp_minimal {
     # Also check default action
     $has_notify = 1 if $default_ret == 0x7fc00000;
 
-    # Map OCI seccomp.flags to kernel SECCOMP_FILTER_FLAG_* values
+    # Map OCI seccomp.flags to kernel SECCOMP_FILTER_FLAG_* values.
+    # TSYNC is mapped to 0: runc accepts but ignores it (thread sync
+    # is handled internally), so the kernel never sees the flag.
     my %flag_map = (
-        SECCOMP_FILTER_FLAG_TSYNC     => SECCOMP_FILTER_FLAG_TSYNC,
+        SECCOMP_FILTER_FLAG_TSYNC     => 0,
         SECCOMP_FILTER_FLAG_LOG       => SECCOMP_FILTER_FLAG_LOG,
         SECCOMP_FILTER_FLAG_SPEC_ALLOW => (1 << 2),
         SECCOMP_FILTER_FLAG_NEW_LISTENER => SECCOMP_FILTER_FLAG_NEW_LISTENER,
@@ -3978,8 +4014,14 @@ sub run_init_process {
 
     # pivot_root or chroot
     if ($no_pivot) {
-        $dbg->("no-pivot: using chroot instead of pivot_root");
-        chroot($rootfs) or fatal("chroot($rootfs): $!");
+        $dbg->("no-pivot: using MS_MOVE + chroot (masking host procfs/sysfs)");
+        # Mask host procfs/sysfs full mounts outside the rootfs to prevent
+        # the container from remounting them after chroot (runc compat).
+        _mask_host_procfs_sysfs($rootfs);
+        # MS_MOVE the rootfs to "/" then chroot, matching runc's msMoveRoot.
+        do_mount($rootfs, '/', '', MS_MOVE, '')
+            or fatal("MS_MOVE $rootfs to /: $!");
+        chroot('.') or fatal("chroot(.): $!");
         chdir('/') or fatal("chdir /: $!");
     } else {
         apply_pivot_root($rootfs);
@@ -5833,11 +5875,47 @@ sub cmd_exec {
         # config to exec'd processes, merging in any --cap additions.
         apply_exec_caps($cap_add, $spec);
 
-        # Apply no_new_privs from container spec (exec inherits this setting).
-        # Must come after capabilities — PR_SET_NO_NEW_PRIVS is irreversible
-        # and prevents capability gain during exec (root-magic disabled).
-        if ($spec->{process}{noNewPrivileges}) {
+        # Apply no_new_privs: check both process.json and container spec.
+        # The exec process inherits the container's NNP setting; process.json
+        # can also set it independently.
+        my $nnp = ($exec_proc && $exec_proc->{noNewPrivileges})
+               || $spec->{process}{noNewPrivileges};
+        if ($nnp) {
             do_syscall(SYS_prctl, PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+        }
+
+        # Apply seccomp from container spec (exec must load the same filter).
+        # Must be AFTER NNP and capabilities setup.
+        my $exec_seccomp_notify_fd = apply_seccomp_raw($spec);
+        if (defined $exec_seccomp_notify_fd && $exec_seccomp_notify_fd >= 0) {
+            # Send notify fd to the seccomp listener socket
+            my $listener_path = $spec->{linux}{seccomp}{listenerPath} // '';
+            my $listener_meta = $spec->{linux}{seccomp}{listenerMetadata} // '';
+            if ($listener_path ne '') {
+                eval {
+                    my $container_state = {
+                        ociVersion => $spec->{ociVersion} // '1.2.0',
+                        fds        => ['seccompFd'],
+                        pid        => $$ + 0,
+                        metadata   => $listener_meta,
+                        state      => {
+                            ociVersion  => $spec->{ociVersion} // '1.2.0',
+                            id          => $id // '',
+                            status      => 'running',
+                            pid         => $init_pid + 0,
+                            bundle      => $state->{bundle} // '',
+                            annotations => $spec->{annotations} // {},
+                        },
+                    };
+                    my $payload = encode_json($container_state);
+                    send_fd_via_socket($listener_path, $exec_seccomp_notify_fd, $payload);
+                };
+                if ($@) {
+                    syswrite($err_w, "seccomp notify: $@");
+                    _exit(255);
+                }
+            }
+            POSIX::close($exec_seccomp_notify_fd);
         }
 
         # Apply CPU affinity for exec
