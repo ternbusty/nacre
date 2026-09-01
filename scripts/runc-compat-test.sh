@@ -181,21 +181,29 @@ for file in $(printf '%s\n' "${!FILE_FILTER[@]}" | sort); do
 
   TMPOUT=$(mktemp)
 
+  # Write filter regex to a file and source it inside the script command.
+  # This avoids quoting/escaping issues when the regex (containing |, [],
+  # etc.) passes through sudo → timeout → script → shell expansion.
+  FILTER_FILE=$(mktemp /tmp/bats-filter.XXXXXX)
+  printf 'BATS_FILTER=%q\n' "$filter" > "$FILTER_FILE"
+  chmod 644 "$FILTER_FILE"
+
   rc=0
-  sudo -E PATH="$PATH" RUNC="$PWD/runc" _BATS_FILTER="$filter" \
+  sudo -E PATH="$PATH" RUNC="$PWD/runc" _BATS_FF="$FILTER_FILE" \
       timeout "$timeout_secs" script -q -e -c \
-      'exec bats -f "$_BATS_FILTER" -t '"$file" /dev/null > "$TMPOUT" 2>&1 \
+      '. "$_BATS_FF" && exec bats -f "$BATS_FILTER" -t '"$file" /dev/null > "$TMPOUT" 2>&1 \
     || rc=$?
 
   if [[ $rc -eq 124 ]]; then
     echo "  TIMEOUT ($fname), retrying..."
     cleanup_stale_state
     rc=0
-    sudo -E PATH="$PATH" RUNC="$PWD/runc" _BATS_FILTER="$filter" \
+    sudo -E PATH="$PATH" RUNC="$PWD/runc" _BATS_FF="$FILTER_FILE" \
         timeout "$timeout_secs" script -q -e -c \
-        'exec bats -f "$_BATS_FILTER" -t '"$file" /dev/null > "$TMPOUT" 2>&1 \
+        '. "$_BATS_FF" && exec bats -f "$BATS_FILTER" -t '"$file" /dev/null > "$TMPOUT" 2>&1 \
       || rc=$?
   fi
+  rm -f "$FILTER_FILE"
 
   cat "$TMPOUT" >> "$TAP_OUTPUT"
 
