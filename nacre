@@ -3561,18 +3561,26 @@ sub apply_memory_policy {
 sub apply_timens_offsets {
     my ($spec) = @_;
     my $offsets = $spec->{linux}{timeOffsets} // return;
+    # Only write if there are actual offsets to set
+    return unless ref $offsets eq 'HASH' && %$offsets;
 
-    my $path = '/proc/self/timens_offsets';
-    open(my $fh, '>', $path)
-        or fatal("open $path: $!");
-
+    # Collect the lines first so we don't open the file needlessly
+    my @lines;
     for my $clock (qw(monotonic boottime)) {
         my $entry = $offsets->{$clock} // next;
         my $secs  = $entry->{secs}     // 0;
         my $nsecs = $entry->{nanosecs} // 0;
-        print $fh "$clock $secs $nsecs\n";
+        push @lines, "$clock $secs $nsecs\n";
     }
-    close $fh;
+    return unless @lines;
+
+    my $path = '/proc/self/timens_offsets';
+    if (open(my $fh, '>', $path)) {
+        print $fh @lines;
+        close $fh;
+    } else {
+        warn "nacre: open $path: $! (ignoring)\n";
+    }
 }
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -4035,28 +4043,10 @@ sub run_init_process {
         $dbg->("TIOCSCTTY=" . ($tio // 'undef') . " err=$!");
     }
 
-    # Signal main process: init ready
-    log_debug("init: closing the pipe to signal completion");
-    channel_send($main_chan_w, { type => 'init_ready' });
-
-    # Close all fds > 2 except the notify fd (exec.fifo / start barrier)
-    # and the parent channel fds (needed for seccomp SCMP_ACT_NOTIFY fd
-    # handoff after start, and for startContainer hooks to report errors).
-    my $notify_fileno = ref($notify_fd) ? fileno($notify_fd) : $notify_fd;
-    my $chan_w_fd = ref($main_chan_w) ? fileno($main_chan_w) : $main_chan_w;
-    my $chan_r_fd = ref($main_chan_r) ? fileno($main_chan_r) : $main_chan_r;
-    for my $fd (3..1023) {
-        next if defined $notify_fileno && $fd == $notify_fileno;
-        next if defined $chan_w_fd && $fd == $chan_w_fd;
-        next if defined $chan_r_fd && $fd == $chan_r_fd;
-        POSIX::close($fd);
-    }
-
-    # Wait for start signal
-    wait_for_start($notify_fd);
-
-    # Apply process security (NNP, seccomp, caps, setuid/setgid)
-    # Must happen BEFORE startContainer hooks so hooks run with seccomp applied
+    # Apply process security (NNP, seccomp, caps, setuid/setgid) BEFORE
+    # signalling init_ready.  This matches runc: all security is applied
+    # during create, not start.  The seccomp notify fd handoff must happen
+    # before init_ready because the parent exits the message loop on that.
     $dbg->("apply_process_security");
     my $seccomp_notify_fd = apply_process_security($spec);
 
@@ -4064,7 +4054,6 @@ sub run_init_process {
     # The parent will forward it to the listener socket (listenerPath).
     if (defined $seccomp_notify_fd && $seccomp_notify_fd >= 0) {
         $dbg->("seccomp: sending notify fd=$seccomp_notify_fd to parent");
-        # Send JSON message first, then the fd in a separate message
         channel_send($main_chan_w, { type => 'seccomp_notify_fd' });
         send_fd_over_fd($main_chan_w, $seccomp_notify_fd);
         POSIX::close($seccomp_notify_fd);
@@ -4075,6 +4064,22 @@ sub run_init_process {
             fatal("failed to connect with seccomp agent: $err");
         }
     }
+
+    # Signal main process: init ready (after security is applied)
+    log_debug("init: closing the pipe to signal completion");
+    channel_send($main_chan_w, { type => 'init_ready' });
+
+    # Close all fds > 2 except the notify fd (exec.fifo / start barrier).
+    # Channel fds are no longer needed — seccomp handoff is complete and
+    # init_ready has been sent.
+    my $notify_fileno = ref($notify_fd) ? fileno($notify_fd) : $notify_fd;
+    for my $fd (3..1023) {
+        next if defined $notify_fileno && $fd == $notify_fileno;
+        POSIX::close($fd);
+    }
+
+    # Wait for start signal
+    wait_for_start($notify_fd);
 
     # Set environment — must happen before startContainer hooks, which
     # per OCI spec inherit the process environment.
