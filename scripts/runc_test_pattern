@@ -78,8 +78,8 @@ runc run [ambient caps not set in inheritable result in a warning]
 
 # --- run (mounts) ---
 runc run [bind mount]
-[skip]runc run [bind mount through a dangling symlink component] # symlink mount dest resolution
-[skip]runc run [bind mount through a trailing dangling symlink] # symlink mount dest resolution
+runc run [bind mount through a dangling symlink component]
+runc run [bind mount through a trailing dangling symlink]
 [skip]runc run [bind mount {no,rel,strict}atime semantics] # sshfs
 runc run [tmpcopyup]
 runc run with tmpfs
@@ -105,7 +105,7 @@ runc run [mount order, container idmap source] (userns)
 runc run [/proc is a symlink]
 runc run [rootfsPropagation shared]
 # removed in runc v1.5.1: runc run [rootfsPropagation slave]
-[skip]runc run --no-pivot must not expose bare /proc # CI env: unshare permission denied
+runc run --no-pivot must not expose bare /proc
 runc run [ro /sys/fs/cgroup mounts]
 runc run [ro /sys/fs/cgroup mounts + cgroupns]
 runc run [setgid / + mkdirall]
@@ -277,7 +277,7 @@ runc exec with RLIMIT_NOFILE(Bigger than system's hard value)
 runc exec with RLIMIT_NOFILE(Smaller than system's hard value)
 runc exec with RLIMIT_NOFILE(The same as system's hard value)
 [skip]runc exec (cgroup v1+hybrid joins correct cgroup) # cgroups_v1
-[skip]runc exec (cgroup v2 + init process in non-root cgroup) succeeds # writable cgroupfs
+runc exec (cgroup v2 + init process in non-root cgroup) succeeds
 runc exec (cgroup v2, ro cgroupfs, new cgroupns) does not chown cgroup
 runc exec (cgroup v2, rw cgroupfs, inherit cgroupns) does not chown cgroup
 runc exec (cgroup v2, rw cgroupfs, new cgroupns) does chown cgroup
@@ -291,14 +291,14 @@ runc exec [tty consolesize]
 runc exec [tty owner]
 runc exec [tty owner] ({u,g}id != 0)
 runc exec [tty ptsname]
-[skip]runc exec [init changes cgroup] # init cgroup migration
+runc exec [init changes cgroup]
 runc exec [CPU affinity, initial and final set from config.json]
 runc exec [CPU affinity, initial and final set from process.json]
 runc exec [CPU affinity, only initial set from process.json]
 runc exec [default CPU affinity should reset to cgroup cpuset]
 runc exec [default CPU affinity should reset]
 [skip]runc exec --cgroup sub-cgroups [v1] # cgroups_v1
-[skip]runc exec --cgroup subcgroup [v2] # cgroup subcgroup exec
+runc exec --cgroup subcgroup [v2]
 [skip]runc exec [ --pidfd-socket ] [cgroups_v1]  # cgroups_v1
 runc exec [ --pidfd-socket ] [cgroups_v2]
 [skip]runc exec vs systemctl daemon-reload # systemd
@@ -423,7 +423,6 @@ write to an idmap mount [userns]
 Check mount source fds are cleaned up with idmapped mounts [userns]
 
 # --- userns ---
-[skip]runc run [joining existing container namespaces] # ns joining devpts
 userns join external namespaces [wrong userns owner]
 userns join other container userns
 userns join other container userns [bind-mounted nsfd]

@@ -1591,6 +1591,34 @@ sub _create_userns_from_strings {
     return $userns_fd;
 }
 
+## Resolve symlinks in a container path, staying within the rootfs.
+## Follows each symlink component (absolute targets are relative to rootfs).
+## Returns the fully-resolved host path (under $rootfs).
+## The final target need not exist (dangling symlink tail is fine).
+sub _resolve_in_rootfs {
+    my ($rootfs, $path) = @_;
+    my @parts = grep { $_ ne '' } split('/', $path);
+    my @resolved;
+    my $depth = 0;
+    while (@parts) {
+        return undef if ++$depth > 255;   # symlink loop guard
+        my $c = shift @parts;
+        next if $c eq '.';
+        if ($c eq '..') { pop @resolved if @resolved; next; }
+        push @resolved, $c;
+        my $cur = $rootfs . '/' . join('/', @resolved);
+        if (-l $cur) {
+            my $target = readlink($cur) // last;
+            pop @resolved;                # remove the symlink itself
+            if ($target =~ m{^/}) {
+                @resolved = ();           # absolute → restart from rootfs
+            }
+            unshift @parts, grep { $_ ne '' } split('/', $target);
+        }
+    }
+    return $rootfs . '/' . join('/', @resolved);
+}
+
 sub apply_mounts {
     my ($spec, $rootfs, $mount_source_fds, $chan_w, $chan_r) = @_;
     $mount_source_fds //= {};
@@ -1621,6 +1649,22 @@ sub apply_mounts {
             }
         }
 
+        # Resolve symlinks in the destination path (within the rootfs).
+        # Mount destinations that go through symlinks (e.g. /etc/hosts →
+        # /tmp/hosts) must be resolved so the mount lands at the real path.
+        # The resolved target may not exist yet — that's fine, we create it.
+        {
+            my $container_dest = $m->{destination};
+            if (index($container_dest, $rootfs) == 0) {
+                $container_dest = substr($container_dest, length($rootfs));
+            }
+            my $resolved = _resolve_in_rootfs($rootfs, $container_dest);
+            if (defined $resolved && $resolved ne $dest) {
+                log_debug("  symlink resolved: $dest -> $resolved");
+                $dest = $resolved;
+            }
+        }
+
         # For bind mounts of files, create a file mount point instead of dir
         if ($mount_src ne '' && -f $mount_src && grep { $_ eq 'bind' || $_ eq 'rbind' } @{$m->{options} // []}) {
             my $parent = dirname($dest);
@@ -1629,6 +1673,11 @@ sub apply_mounts {
                 open my $fh, '>', $dest;
                 close $fh if $fh;
             }
+        } elsif ($mount_src ne '' && -d $mount_src && grep { $_ eq 'bind' || $_ eq 'rbind' } @{$m->{options} // []}) {
+            # Bind mount of a directory onto a symlink-resolved target:
+            # create the target as a directory.
+            ensure_dir($dest);
+            $dest_preexisted{$dest} = -d $dest;
         } else {
             # Track whether the directory existed before ensure_dir creates it.
             # We only inherit tmpfs mode from pre-existing directories.
@@ -1724,16 +1773,6 @@ sub apply_mounts {
             do_mount($src, $dest, $type, $mount_flags, $data)
                 or do { warn "nacre: mount $type on $dest: $!\n"; next; };
             log_debug("mounted $type on $dest ok, isdir=" . (-d $dest ? "yes" : "no"));
-            # Debug: after /dev tmpfs mount, verify the mount is visible
-            if ($m->{destination} eq '/dev' && $type eq 'tmpfs') {
-                my @st = stat($dest);
-                if (@st) {
-                    warn sprintf("nacre: DEBUG /dev tmpfs mounted: uid=%d gid=%d mode=%04o isdir=%s\n",
-                        $st[4], $st[5], $st[2] & 07777, (-d $dest ? "yes" : "no"));
-                } else {
-                    warn "nacre: DEBUG /dev tmpfs stat FAILED: $!\n";
-                }
-            }
             # Now apply propagation flags if any
             if ($prop_flags & $prop_mask) {
                 do_mount('', $dest, '', $prop_flags, '')
@@ -4335,6 +4374,21 @@ sub cmd_create {
     ensure_dir($notify_dir);
     my $notify_path = "$notify_dir/notify.sock";
 
+    # Create the notify listener and init debug log BEFORE forking.
+    # After entering a user namespace the child process runs as a mapped
+    # UID (e.g. host UID 100000) and can no longer create files in the
+    # root-owned state directory.  Creating them here (as root on the
+    # host) and passing the fds to the child avoids "Permission denied".
+    my $notify_srv = create_notify_listener($notify_path);
+
+    my $init_debug_fd_pre;
+    eval {
+        sysopen(my $dfh, "$notify_dir/init.log",
+                O_WRONLY | O_CREAT | O_TRUNC, 0644) or die "open: $!";
+        $init_debug_fd_pre = POSIX::dup(fileno($dfh));
+        close $dfh;
+    };
+
     # Fork: child will become the init process
     my $child_pid = fork();
     fatal("fork: $!") unless defined $child_pid;
@@ -4484,16 +4538,9 @@ sub cmd_create {
         # send the master fd back to the parent for I/O relay.
         my $pty_sock_fd = (defined $pty_child_sock) ? fileno($pty_child_sock) : undef;
 
-        # Open a debug log in the state directory (host filesystem, before
-        # pivot_root).  The fd survives pivot_root and close_range(CLOEXEC),
-        # so we can write to it right up until exec.
-        my $init_debug_fd;
-        eval {
-            sysopen(my $dfh, "$notify_dir/init.log",
-                    O_WRONLY | O_CREAT | O_TRUNC, 0644) or die "open: $!";
-            $init_debug_fd = POSIX::dup(fileno($dfh));
-            close $dfh;
-        };
+        # Use the pre-opened init debug log fd (created before fork so
+        # it works even when a user namespace remaps our UID).
+        my $init_debug_fd = $init_debug_fd_pre;
 
         # For detached containers, /dev/null redirect is handled inside
         # run_init_process after pivot_root, so the fd path resolves to
@@ -4513,8 +4560,9 @@ sub cmd_create {
                 if $r != 0;
         }
 
-        # Create notify listener
-        my $notify_srv = create_notify_listener($notify_path);
+        # Notify listener was already created before fork (so it works
+        # even when a user namespace remaps our UID on the host FS).
+        # $notify_srv is inherited from the parent scope.
 
         # Run the init process (eval captures die from fatal so we can
         # report the actual error to the parent through the channel).
@@ -4545,6 +4593,8 @@ sub cmd_create {
     close $main_w_fh;  # Close child's write end
     close $init_r_fh;  # Close child's read end
     close $pty_child_sock if defined $pty_child_sock;  # Close child's PTY sock end
+    close $notify_srv;  # Parent doesn't listen; cmd_start connects to the path
+    POSIX::close($init_debug_fd_pre) if defined $init_debug_fd_pre;
 
     # Handle messages from child
     my $init_pid;
