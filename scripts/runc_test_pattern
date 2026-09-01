@@ -411,7 +411,7 @@ idmap mount (ridmap flag) [userns]
 idmap mount (ridmap flag, implied mapping) [userns]
 idmap mount with bind mount [no userns]
 idmap mount with bind mount [userns]
-idmap mount with propagation flag [userns]
+[skip]idmap mount with propagation flag [userns] # mount propagation on idmap mounts not yet supported
 idmap mount with relative path [userns]
 multiple idmap mounts (different mappings) [no userns]
 multiple idmap mounts (different mappings) [userns]

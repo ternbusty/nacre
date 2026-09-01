@@ -1775,6 +1775,26 @@ sub apply_mounts {
                 my $fd = $mount_source_fds->{$mount_src};
                 $mounted = do_mount("/proc/self/fd/$fd", $dest, '', $flags, '');
             }
+            # If still not mounted and we have a parent channel, ask the
+            # parent to open the source fd inside our mount namespace
+            # (parent stays in init userns and has root access to
+            # inaccessible source directories).
+            if (!$mounted && $chan_w) {
+                eval {
+                    channel_send($chan_w, {
+                        type   => 'bind_source_request',
+                        source => $mount_src,
+                    });
+                    my $resp = channel_recv($chan_r);
+                    if ($resp && $resp->{type} eq 'bind_source_done' && $resp->{ok}) {
+                        my $parent_fd = recv_fd_over_fd($chan_r);
+                        if ($parent_fd >= 0) {
+                            $mounted = do_mount("/proc/self/fd/$parent_fd", $dest, '', $flags, '');
+                            POSIX::close($parent_fd);
+                        }
+                    }
+                };
+            }
             unless ($mounted) {
                 warn "nacre: mount bind $dest: $!\n";
                 next;
@@ -2063,10 +2083,21 @@ sub apply_rootfs_propagation {
     my ($spec) = @_;
     my $propagation = $spec->{linux}{rootfsPropagation} // 'rslave';
     my $prop_flags = $PROPAGATION_FLAGS{$propagation} // (MS_SLAVE | MS_REC);
-    # First clear all inherited propagation (especially slave/shared)
-    # by making the mount private.  Without this, applying MS_SHARED
-    # on a slave mount results in "shared,slave" instead of just "shared".
-    do_mount('', '/', '', MS_PRIVATE | MS_REC, '');
+
+    # MS_PRIVATE: nothing to do — rootfsParentMountPrivate already made
+    # the parent private, and pivot_root inherits it.
+    return if ($prop_flags & MS_PRIVATE);
+
+    # For MS_SHARED/MS_RSHARED: clear inherited slave/shared first by
+    # making private, then apply shared.  Without this a slave mount
+    # becomes "shared,slave" instead of pure "shared".
+    if ($prop_flags & MS_SHARED) {
+        do_mount('', '/', '', MS_PRIVATE | MS_REC, '');
+    }
+
+    # For MS_SLAVE/MS_RSLAVE: apply directly — a slave mount must retain
+    # its peer group (a private mount has no master, so MS_SLAVE fails
+    # with EINVAL).
     do_mount('', '/', '', $prop_flags, '')
         or fatal("mount propagation ($propagation) /: $!");
 }
@@ -4467,6 +4498,10 @@ sub cmd_create {
         $has_userns = 1 if $ns->{type} eq 'user';
         $has_pidns  = 1 if $ns->{type} eq 'pid';
     }
+    # User namespace must be joined first — other namespaces (time, pid,
+    # net, etc.) may belong to the target userns, and setns() requires the
+    # caller to already be in that userns.
+    @join_ns = sort { ($a->{type} eq 'user' ? 0 : 1) <=> ($b->{type} eq 'user' ? 0 : 1) } @join_ns;
 
     # Ensure a mount namespace exists — pivot_root and rootfs setup
     # modify the mount tree and would corrupt the caller's filesystem
@@ -4810,6 +4845,67 @@ sub cmd_create {
                 POSIX::close($tree_fd);
             }
             channel_send($init_w_fd, { type => 'mount_fd_done' });
+        }
+        elsif ($msg->{type} eq 'bind_source_request') {
+            # Init process can't access a bind mount source (inaccessible
+            # directory after entering user namespace).  We (the parent)
+            # still have root privileges in the init userns.  Join the
+            # child's mount namespace, open the source O_PATH fd, and
+            # send it back.  The fd will reference a mount owned by the
+            # child's mount namespace, so the bind mount succeeds.
+            my $source = $msg->{source} // '';
+            my $ok = 0;
+            eval {
+                # Save our mount namespace
+                sysopen(my $orig_mnt, "/proc/self/ns/mnt", O_RDONLY)
+                    or die "open own mntns: $!";
+                # Join init process's mount namespace
+                sysopen(my $child_mnt, "/proc/$init_pid/ns/mnt", O_RDONLY)
+                    or die "open child mntns: $!";
+                {
+                    my $nr  = SYS_setns + 0;
+                    my $fd  = fileno($child_mnt) + 0;
+                    my $flg = CLONE_NEWNS + 0;
+                    my $r;
+                    do { $r = syscall($nr, $fd, $flg) } while ($r == -1 && $! == EINTR);
+                    $r == 0 or die "setns mntns: $!";
+                }
+                close $child_mnt;
+
+                # Resolve relative source path against bundle
+                my $abs_src = $source;
+                if ($abs_src !~ m{^/}) {
+                    $abs_src = "$bundle/$abs_src" if defined $bundle;
+                }
+
+                # Open O_PATH fd (works even for directories)
+                my $oflags = O_RDONLY | O_CLOEXEC;
+                $oflags = O_RDONLY | O_CLOEXEC | O_PATH if -d $abs_src;
+                sysopen(my $src_fh, $abs_src, $oflags)
+                    or die "open source '$abs_src': $!";
+                my $src_fd = fileno($src_fh);
+
+                # Switch back to our original mount namespace
+                {
+                    my $nr  = SYS_setns + 0;
+                    my $fd  = fileno($orig_mnt) + 0;
+                    my $flg = CLONE_NEWNS + 0;
+                    my $r;
+                    do { $r = syscall($nr, $fd, $flg) } while ($r == -1 && $! == EINTR);
+                    # Ignore failure — channel loop doesn't need mntns
+                }
+                close $orig_mnt;
+
+                # Send response + fd
+                channel_send($init_w_fd, { type => 'bind_source_done', ok => 1 });
+                send_fd_over_fd($init_w_fd, $src_fd);
+                close $src_fh;
+                $ok = 1;
+            };
+            unless ($ok) {
+                log_debug("bind_source_request failed: $@");
+                channel_send($init_w_fd, { type => 'bind_source_done', ok => 0 });
+            }
         }
         elsif ($msg->{type} eq 'seccomp_notify_fd') {
             # Receive the seccomp notify fd from init
@@ -5802,8 +5898,47 @@ sub cmd_exec {
         log_debug("nsexec container setup");
         log_debug("child process in init()");
 
-        # Join namespaces
+        # Join namespaces — three-phase approach (matching runc's nsexec):
+        # 1. Try non-user namespaces first (while still in init userns, we
+        #    have CAP_SYS_ADMIN for namespaces not owned by the container's
+        #    userns). Skip EPERM failures — they'll be retried after joining
+        #    the user namespace.
+        # 2. Join the user namespace.
+        # 3. Retry any namespaces that failed with EPERM in phase 1.
+        my @deferred;
         for my $ns (@ns_fds) {
+            next if $ns->{name} eq 'user';
+            my $nr  = SYS_setns + 0;
+            my $fd  = $ns->{fileno} + 0;
+            my $flg = 0;
+            my $r;
+            do { $r = syscall($nr, $fd, $flg) } while ($r == -1 && $! == EINTR);
+            if ($r != 0) {
+                if ($! == EPERM) {
+                    push @deferred, $ns;
+                } else {
+                    my $msg = "setns $ns->{name}: $!";
+                    syswrite($err_w, $msg);
+                    _exit(255);
+                }
+            }
+        }
+        # Phase 2: join user namespace
+        for my $ns (@ns_fds) {
+            next unless $ns->{name} eq 'user';
+            my $nr  = SYS_setns + 0;
+            my $fd  = $ns->{fileno} + 0;
+            my $flg = 0;
+            my $r;
+            do { $r = syscall($nr, $fd, $flg) } while ($r == -1 && $! == EINTR);
+            if ($r != 0) {
+                my $msg = "setns $ns->{name}: $!";
+                syswrite($err_w, $msg);
+                _exit(255);
+            }
+        }
+        # Phase 3: retry deferred namespaces (now that we're in the userns)
+        for my $ns (@deferred) {
             my $nr  = SYS_setns + 0;
             my $fd  = $ns->{fileno} + 0;
             my $flg = 0;
@@ -5935,6 +6070,43 @@ sub cmd_exec {
             umask($spec->{process}{user}{umask});
         }
 
+        # Apply seccomp from container spec BEFORE dropping privileges.
+        # SECCOMP_FILTER_FLAG_NEW_LISTENER (SCMP_ACT_NOTIFY) requires
+        # CAP_SYS_ADMIN, which is lost after setuid/capabilities drop.
+        # Non-NOTIFY seccomp also works here because we still have root
+        # privileges (either via CAP_SYS_ADMIN or host root UID).
+        my $exec_seccomp_notify_fd = apply_seccomp_raw($spec);
+        if (defined $exec_seccomp_notify_fd && $exec_seccomp_notify_fd >= 0) {
+            # Send notify fd to the seccomp listener socket
+            my $listener_path = $spec->{linux}{seccomp}{listenerPath} // '';
+            my $listener_meta = $spec->{linux}{seccomp}{listenerMetadata} // '';
+            if ($listener_path ne '') {
+                eval {
+                    my $container_state = {
+                        ociVersion => $spec->{ociVersion} // '1.2.0',
+                        fds        => ['seccompFd'],
+                        pid        => $$ + 0,
+                        metadata   => $listener_meta,
+                        state      => {
+                            ociVersion  => $spec->{ociVersion} // '1.2.0',
+                            id          => $id // '',
+                            status      => 'running',
+                            pid         => $init_pid + 0,
+                            bundle      => $state->{bundle} // '',
+                            annotations => $spec->{annotations} // {},
+                        },
+                    };
+                    my $payload = encode_json($container_state);
+                    send_fd_via_socket($listener_path, $exec_seccomp_notify_fd, $payload);
+                };
+                if ($@) {
+                    syswrite($err_w, "seccomp notify: $@");
+                    _exit(255);
+                }
+            }
+            POSIX::close($exec_seccomp_notify_fd);
+        }
+
         # Set supplementary groups
         if ($additional_gids && @$additional_gids) {
             my $packed = pack("i*", map { $_ + 0 } @$additional_gids);
@@ -5989,40 +6161,6 @@ sub cmd_exec {
             do_syscall(SYS_prctl, PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
         }
 
-        # Apply seccomp from container spec (exec must load the same filter).
-        # Must be AFTER NNP and capabilities setup.
-        my $exec_seccomp_notify_fd = apply_seccomp_raw($spec);
-        if (defined $exec_seccomp_notify_fd && $exec_seccomp_notify_fd >= 0) {
-            # Send notify fd to the seccomp listener socket
-            my $listener_path = $spec->{linux}{seccomp}{listenerPath} // '';
-            my $listener_meta = $spec->{linux}{seccomp}{listenerMetadata} // '';
-            if ($listener_path ne '') {
-                eval {
-                    my $container_state = {
-                        ociVersion => $spec->{ociVersion} // '1.2.0',
-                        fds        => ['seccompFd'],
-                        pid        => $$ + 0,
-                        metadata   => $listener_meta,
-                        state      => {
-                            ociVersion  => $spec->{ociVersion} // '1.2.0',
-                            id          => $id // '',
-                            status      => 'running',
-                            pid         => $init_pid + 0,
-                            bundle      => $state->{bundle} // '',
-                            annotations => $spec->{annotations} // {},
-                        },
-                    };
-                    my $payload = encode_json($container_state);
-                    send_fd_via_socket($listener_path, $exec_seccomp_notify_fd, $payload);
-                };
-                if ($@) {
-                    syswrite($err_w, "seccomp notify: $@");
-                    _exit(255);
-                }
-            }
-            POSIX::close($exec_seccomp_notify_fd);
-        }
-
         # Apply CPU affinity for exec
         my $exec_affinity = ($exec_proc && $exec_proc->{execCPUAffinity})
                          // $spec->{process}{execCPUAffinity};
@@ -6070,15 +6208,17 @@ sub cmd_exec {
 
     # Move exec process into the container's cgroup (before signalling child)
     my $container_cgpath = $state->{cgroupPath};
-    my $deferred_exec_cg_path;  # set when --cgroup + PID ns (defer to grandchild)
+    # Resolve the target cgroup path for the exec process
+    my $deferred_exec_cg_path;  # set when PID ns (defer to grandchild)
+    my $exec_target_cgpath;     # resolved cgroup target
+
     if ($exec_cgroup) {
         # --cgroup: move to a specific sub-cgroup
         fatal("container has no cgroup path") unless $container_cgpath;
 
         # Resolve the sub-cgroup path
-        my $sub_path;
         if ($exec_cgroup eq '/' || $exec_cgroup eq '') {
-            $sub_path = $container_cgpath;
+            $exec_target_cgpath = $container_cgpath;
         } else {
             # Validate: no ".." components (path traversal)
             my $cleaned = $exec_cgroup;
@@ -6089,48 +6229,45 @@ sub cmd_exec {
             }
             # Also reject paths that escape the container's cgroup
             # (e.g. "../sibling" even after cleaning)
-            $sub_path = "$container_cgpath/$cleaned";
+            my $sub_path = "$container_cgpath/$cleaned";
             # Canonicalize and check it's still under the container cgroup
             my $real = Cwd::abs_path($sub_path);
             if (!$real || index($real, $container_cgpath) != 0) {
                 fatal("bad sub cgroup path: '$exec_cgroup'");
             }
-            $sub_path = $real;
+            $exec_target_cgpath = $real;
         }
         # Check the cgroup exists
-        fatal("exec cgroup '$sub_path': no such file or directory")
-            unless -d $sub_path;
-        if ($has_pid_ns_in_exec) {
-            # Defer cgroup write until after the double-fork so the
-            # grandchild (actual exec'd process) PID is written, not
-            # the intermediate's PID.
-            $deferred_exec_cg_path = $sub_path;
-        } else {
-            # Write exec process PID to the sub-cgroup
-            eval { write_file("$sub_path/cgroup.procs", "$child\n") };
-            if ($@) {
-                fatal("adding pid $child to cgroups: $sub_path/cgroup.procs: $!");
-            }
-        }
+        fatal("exec cgroup '$exec_target_cgpath': no such file or directory")
+            unless -d $exec_target_cgpath;
     } elsif ($container_cgpath) {
-        # Default: join the container's cgroup.
-        # Try the state's cgroup first; if that fails (e.g. init moved
-        # to a sub-cgroup, domain controllers are active, or the original
-        # cgroup was deleted), fall back to init's actual cgroup.
-        my $joined = 0;
+        # Default: join the container's cgroup (or init's actual cgroup
+        # if the container cgroup has domain controllers active).
         if (-d $container_cgpath) {
-            $joined = eval { write_file("$container_cgpath/cgroup.procs", "$child\n"); 1 } // 0;
-        }
-        if (!$joined) {
+            $exec_target_cgpath = $container_cgpath;
+        } else {
             # Fall back to init's actual cgroup
             my $init_cg = read_file("/proc/$init_pid/cgroup");
             if (defined $init_cg && $init_cg =~ m{^0::(.+)$}m) {
                 my $rel = $1;
                 my $init_cghost = "/sys/fs/cgroup$rel";
-                if (-d $init_cghost) {
-                    eval { write_file("$init_cghost/cgroup.procs", "$child\n") };
-                }
+                $exec_target_cgpath = $init_cghost if -d $init_cghost;
             }
+        }
+    }
+
+    # When exec joins a PID namespace, defer the cgroup write until
+    # after the double-fork so only the grandchild (actual exec'd
+    # process) is placed in the cgroup, not the intermediate fork.
+    # The intermediate process would linger in the cgroup doing waitpid,
+    # preventing operations like subtree_control writes.
+    if ($exec_target_cgpath && $has_pid_ns_in_exec) {
+        $deferred_exec_cg_path = $exec_target_cgpath;
+    } elsif ($exec_target_cgpath) {
+        eval { write_file("$exec_target_cgpath/cgroup.procs", "$child\n") };
+        if ($@) {
+            my $err = $@; chomp $err;
+            fatal("adding pid $child to cgroups: $err");
         }
     }
 
@@ -6151,15 +6288,14 @@ sub cmd_exec {
     close $gc_pid_r;
 
     # Deferred cgroup write: move the grandchild (not intermediate) to
-    # the exec subcgroup so the PID file and cgroup.procs agree.
-    if ($deferred_exec_cg_path && $final_pid != $child) {
-        eval { write_file("$deferred_exec_cg_path/cgroup.procs", "$final_pid\n") };
+    # the target cgroup so only the exec'd process is in the cgroup.
+    if ($deferred_exec_cg_path) {
+        my $cg_pid = $final_pid;
+        eval { write_file("$deferred_exec_cg_path/cgroup.procs", "$cg_pid\n") };
         if ($@) {
-            fatal("adding pid $final_pid to cgroups: $deferred_exec_cg_path/cgroup.procs: $!");
+            my $err = $@; chomp $err;
+            fatal("adding pid $cg_pid to cgroups: $err");
         }
-    } elsif ($deferred_exec_cg_path) {
-        # No PID ns double-fork happened (shouldn't reach here, but safe)
-        eval { write_file("$deferred_exec_cg_path/cgroup.procs", "$child\n") };
     }
 
     # Write pid file (after sync so we have the grandchild PID)
