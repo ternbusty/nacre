@@ -20,14 +20,16 @@ sub create_channel {
 sub channel_send ($fd, $msg) {
     my $data = $JSON_COMPACT->encode($msg);
     my $ret = POSIX::write($fd, $data, length($data));
-    fatal("channel_send: $!") unless defined $ret && $ret > 0;
+    if (!defined $ret || $ret <= 0) {
+        fatal("channel_send: $!");
+    }
     return;
 }
 
 sub channel_recv ($fd) {
     my $buf;
     my $ret = POSIX::read($fd, $buf, 65536);
-    return unless defined $ret && $ret > 0;
+    return if !defined $ret || $ret <= 0;
     return $JSON_COMPACT->decode($buf);
 }
 
@@ -191,7 +193,9 @@ sub setup_pty_console ($console_socket_path) {
     # POSIX::dup returns a raw fd number not tied to any Perl handle, so it
     # won't be auto-closed when this sub returns.
     my $dup_fd = POSIX::dup(fileno($pts));
-    fatal("dup PTY slave: $!") unless defined $dup_fd && $dup_fd >= 0;
+    if (!defined $dup_fd || $dup_fd < 0) {
+        fatal("dup PTY slave: $!");
+    }
     close($pts);
 
     return $dup_fd;

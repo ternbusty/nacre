@@ -1,4 +1,4 @@
-severity = 4
+severity = 3
 verbose = %f:%l:%c: [%s] %m (%e)\n
 
 # -- v5.38 provides strict and warnings --
@@ -19,3 +19,17 @@ equivalent_modules = v5.38
 
 # -- Expression eval used for syscall probing --
 [-BuiltinFunctions::ProhibitStringyEval]
+
+# -- Severity 3 policies unsuitable for this codebase --
+[-RegularExpressions::RequireExtendedFormatting]
+[-ErrorHandling::RequireCheckingReturnValueOfEval]
+[-Subroutines::ProhibitExcessComplexity]
+[-ControlStructures::ProhibitDeepNests]
+[-ControlStructures::ProhibitCascadingIfElse]
+[-Variables::ProhibitPackageVars]
+[-ValuesAndExpressions::ProhibitImplicitNewlines]
+[-RegularExpressions::ProhibitComplexRegexes]
+[-Subroutines::ProhibitUnusedPrivateSubroutines]
+[-Modules::ProhibitConditionalUseStatements]
+[-RegularExpressions::ProhibitCaptureWithoutTest]
+[-NamingConventions::ProhibitAmbiguousNames]

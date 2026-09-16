@@ -101,7 +101,7 @@ sub write_file ($path, $content) {
 
 sub read_file ($path) {
     open my $fh, '<', $path or return;
-    local $/;
+    local $/ = undef;
     my $data = <$fh>;
     close $fh;
     return $data;

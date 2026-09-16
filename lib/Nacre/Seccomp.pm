@@ -133,7 +133,7 @@ sub _apply_seccomp_ffi ($spec) {
     close $wr;
 
     if ($ret == 0) {
-        local $/;
+        local $/ = undef;
         my $bpf_prog = <$rd>;
         close $rd;
 

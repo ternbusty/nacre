@@ -163,7 +163,7 @@ sub delete_state ($root, $id) {
 
 sub refresh_state ($state) {
     my $pid = $state->{pid};
-    return unless $pid && $pid > 0;
+    return if !$pid || $pid <= 0;
     my $status = $state->{status};
     return if $status eq 'stopped';
 

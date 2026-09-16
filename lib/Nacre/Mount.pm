@@ -515,8 +515,9 @@ sub apply_mounts ($spec, $rootfs, $mount_source_fds, $chan_w, $chan_r) {
             my $parent = dirname($dest);
             ensure_dir($parent);
             if (!-e $dest) {
-                open my $fh, '>', $dest;
-                close $fh if $fh;
+                if (open my $fh, '>', $dest) {
+                    close $fh;
+                }
             }
         } elsif ($mount_src ne '' && -d $mount_src && grep {$_ eq 'bind' || $_ eq 'rbind'} @{$m->{options} // []}) {
 
@@ -881,8 +882,9 @@ sub create_devices ($rootfs, $spec) {
 
             # Create empty file as mount point
             if (!-e $dest) {
-                open my $fh, '>', $dest;
-                close $fh if $fh;
+                if (open my $fh, '>', $dest) {
+                    close $fh;
+                }
             }
             if (do_mount($host_dev, $dest, '', MS_BIND, '')) {
                 next;    # success
@@ -963,7 +965,7 @@ sub apply_rootfs_propagation ($spec) {
     # When the spec doesn't set rootfsPropagation, skip this entirely —
     # matching runc, which only applies propagation when explicitly set.
     my $propagation = $spec->{linux}{rootfsPropagation};
-    return unless defined $propagation && $propagation ne '';
+    return if !defined $propagation || $propagation eq '';
 
     my $prop_flags = $PROPAGATION_FLAGS{$propagation} // return;
 

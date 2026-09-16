@@ -83,7 +83,7 @@ sub run_init_process (    ## no critic (RequireFinalReturn)
 ) {
 
     my $dbg = sub {
-        return unless defined $debug_fd && $debug_fd >= 0;
+        return if !defined $debug_fd || $debug_fd < 0;
         my $msg = join('', @_) . "\n";
         POSIX::write($debug_fd, $msg, length($msg));
     };
@@ -153,7 +153,9 @@ sub run_init_process (    ## no critic (RequireFinalReturn)
 
         # Dup the slave fd so it survives filehandle scope
         $pts_fd = POSIX::dup(fileno($pts));
-        fatal("dup PTY slave: $!") unless defined $pts_fd && $pts_fd >= 0;
+        if (!defined $pts_fd || $pts_fd < 0) {
+            fatal("dup PTY slave: $!");
+        }
         close($pts);
         $dbg->("PTY allocated from container devpts: slave fd=$pts_fd, pts=$ptn");
     }
@@ -216,9 +218,9 @@ sub run_init_process (    ## no critic (RequireFinalReturn)
     # For detached non-terminal containers, point to the container's
     # /dev/null.  For terminal containers, the PTY dup2 below overrides.
     if (!$foreground && !defined $pts_fd) {
-        open STDIN, '<', '/dev/null';
-        open STDOUT, '>', '/dev/null';
-        open STDERR, '>', '/dev/null';
+        open STDIN, '<', '/dev/null' or fatal("open /dev/null for STDIN: $!");
+        open STDOUT, '>', '/dev/null' or fatal("open /dev/null for STDOUT: $!");
+        open STDERR, '>', '/dev/null' or fatal("open /dev/null for STDERR: $!");
     }
 
     # Set up container stdio from PTY slave BEFORE signaling init_ready.
@@ -1486,7 +1488,7 @@ sub cmd_run (%p) {
         my $done = 0;
         $exit_code = 0;
         local $SIG{CHLD} = sub {
-            local $?;    # Prevent clobbering caller's $?
+            local $? = undef;
             while ((my $w = waitpid(-1, WNOHANG)) > 0) {
                 if ($w == $init_pid) {
                     if (WIFEXITED($?)) {
@@ -1547,7 +1549,7 @@ sub cmd_run (%p) {
         while (1) {
             my $buf;
             my $n = POSIX::read($pty_master_fd, $buf, 8192);
-            last unless defined $n && $n > 0;
+            last if !defined $n || $n <= 0;
             syswrite(STDOUT, $buf, $n);
         }
 
@@ -1758,7 +1760,7 @@ sub exec_tty_relay ($child_pid, $master_fd, $err_r_fd) {
     my $child_exited = 0;
     my $exit_status = 0;
     local $SIG{CHLD} = sub {
-        local $?;    # Prevent clobbering caller's $?
+        local $? = undef;
         my $ret = waitpid($child_pid, WNOHANG);
         if ($ret > 0) {
             if (WIFEXITED($?)) {
@@ -1820,7 +1822,7 @@ sub exec_tty_relay ($child_pid, $master_fd, $err_r_fd) {
     while (1) {
         my $buf;
         my $n = POSIX::read($master_fd, $buf, 8192);
-        last unless defined $n && $n > 0;
+        last if !defined $n || $n <= 0;
         syswrite(STDOUT, $buf, $n);
     }
 
@@ -2725,7 +2727,7 @@ sub cmd_update (%p) {
         if ($res_file ne '-') {
             $res_json = read_file_or_die($res_file);
         } else {
-            local $/;
+            local $/ = undef;
             $res_json = <>;
         }
         $resources = $JSON->decode($res_json);

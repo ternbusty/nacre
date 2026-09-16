@@ -196,7 +196,7 @@ sub cgroup_apply_resources ($cgpath, $spec, %opts) {
             for my $line (split /\n/, $val) {
                 $line =~ s/^\s+//;
                 $line =~ s/\s+$//;
-                next unless $line ne '';
+                next if $line eq '';
                 cg_write($cgpath, $key, $line);
             }
         }
