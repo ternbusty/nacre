@@ -34,6 +34,7 @@ use Nacre::Util qw(
     $JSON $JSON_COMPACT $LOG_FH
     setup_logging log_debug fatal parse_size
     write_file read_file read_file_or_die ensure_dir iso8601_now do_syscall
+    do_setns do_unshare wait_exit_code
 );
 use Nacre::Seccomp qw(apply_seccomp_raw);
 use Nacre::Device qw(apply_device_cgroup);
@@ -698,12 +699,7 @@ sub cmd_create (%p) {
 
         # Phase 1: try non-user namespaces
         for my $e (@ns_open) {
-            my $nr = SYS_setns + 0;
-            my $fd = $e->{fileno} + 0;
-            my $flg = $e->{info}{flag} + 0;
-            my $r;
-            do {$r = syscall($nr, $fd, $flg)} while ($r == -1 && $! == EINTR);
-            if ($r != 0) {
+            if (!do_setns($e->{fileno}, $e->{info}{flag})) {
                 if ($! == EPERM) {
                     push @deferred_ns, $e;
                 } else {
@@ -714,24 +710,16 @@ sub cmd_create (%p) {
 
         # Phase 2: join user namespace
         if ($userns_entry) {
-            my $nr = SYS_setns + 0;
-            my $fd = $userns_entry->{fileno} + 0;
-            my $flg = $userns_entry->{info}{flag} + 0;
-            my $r;
-            do {$r = syscall($nr, $fd, $flg)} while ($r == -1 && $! == EINTR);
-            $r == 0 or fatal("setns $userns_entry->{type}: $!");
+            do_setns($userns_entry->{fileno}, $userns_entry->{info}{flag})
+                or fatal("setns $userns_entry->{type}: $!");
             close $userns_entry->{fd};
             $joined_userns = 1;
         }
 
         # Phase 3: retry deferred (fd already open from Phase 1)
         for my $e (@deferred_ns) {
-            my $nr = SYS_setns + 0;
-            my $fd = $e->{fileno} + 0;
-            my $flg = $e->{info}{flag} + 0;
-            my $r;
-            do {$r = syscall($nr, $fd, $flg)} while ($r == -1 && $! == EINTR);
-            $r == 0 or fatal("setns $e->{type} (deferred): $!");
+            do_setns($e->{fileno}, $e->{info}{flag})
+                or fatal("setns $e->{type} (deferred): $!");
         }
 
         # Close all namespace fds
@@ -759,11 +747,7 @@ sub cmd_create (%p) {
         # NEWUSER avoids the permission issue (runc handles this in
         # nsexec.c where timens setup precedes userns entry).
         if (($clone_flags & CLONE_NEWTIME) && ($clone_flags & CLONE_NEWUSER)) {
-            my $nr = SYS_unshare + 0;
-            my $flg = CLONE_NEWTIME + 0;
-            my $r;
-            do {$r = syscall($nr, $flg)} while ($r == -1 && $! == EINTR);
-            $r == 0 or fatal("unshare NEWTIME: $!");
+            do_unshare(CLONE_NEWTIME) or fatal("unshare NEWTIME: $!");
             $unshare_flags &= ~CLONE_NEWTIME;
 
             # Write timens offsets now, before entering the userns
@@ -774,11 +758,7 @@ sub cmd_create (%p) {
 
             # Creating a new user namespace: unshare first, then let
             # parent write UID/GID mappings before proceeding.
-            my $nr = SYS_unshare + 0;
-            my $flg = CLONE_NEWUSER + 0;
-            my $r;
-            do {$r = syscall($nr, $flg)} while ($r == -1 && $! == EINTR);
-            $r == 0 or fatal("unshare NEWUSER: $!");
+            do_unshare(CLONE_NEWUSER) or fatal("unshare NEWUSER: $!");
             $unshare_flags &= ~CLONE_NEWUSER;
 
             # Signal parent to write UID/GID mappings
@@ -807,11 +787,7 @@ sub cmd_create (%p) {
         # stale POK flags that cause the kernel arg to be misinterpreted.
         # Fresh lexical scalars (with $x + 0 coercion) ensure clean IOK SVs.
         if ($unshare_flags) {
-            my $nr = SYS_unshare + 0;
-            my $flg = $unshare_flags + 0;
-            my $ret;
-            do {$ret = syscall($nr, $flg)} while ($ret == -1 && $! == EINTR);
-            $ret == 0 or fatal(sprintf("unshare(0x%x): $!", $unshare_flags));
+            do_unshare($unshare_flags) or fatal(sprintf("unshare(0x%x): $!", $unshare_flags));
         }
 
         # Write time namespace offsets (must happen after unshare that
@@ -830,11 +806,7 @@ sub cmd_create (%p) {
         # path, setns() already handled it above — calling unshare here
         # would fail with EINVAL.
         if ($clone_flags & CLONE_NEWPID) {
-            my $nr = SYS_unshare + 0;
-            my $flg = CLONE_NEWPID + 0;
-            my $ret;
-            do {$ret = syscall($nr, $flg)} while ($ret == -1 && $! == EINTR);
-            $ret == 0 or fatal("unshare NEWPID: $!");
+            do_unshare(CLONE_NEWPID) or fatal("unshare NEWPID: $!");
         }
 
         my $init_pid = fork();
@@ -874,12 +846,8 @@ sub cmd_create (%p) {
             my $msg = channel_recv($init_r_fd);
 
             # Then unshare
-            my $nr = SYS_unshare + 0;
-            my $flg = CLONE_NEWCGROUP + 0;
-            my $r;
-            do {$r = syscall($nr, $flg)} while ($r == -1 && $! == EINTR);
-            log_debug("unshare cgroup: " . ($r == 0 ? "ok" : "failed: $!"))
-                if $r != 0;
+            do_unshare(CLONE_NEWCGROUP)
+                or log_debug("unshare cgroup: failed: $!");
         }
 
         # Notify listener was already created before fork (so it works
@@ -1004,14 +972,8 @@ sub cmd_create (%p) {
                 # Join init process's mount namespace
                 sysopen(my $child_mnt, "/proc/$init_pid/ns/mnt", O_RDONLY)
                     or die "open child mntns: $!";    ## no critic (ErrorHandling::RequireCarping)
-                {
-                    my $nr = SYS_setns + 0;
-                    my $fd = fileno($child_mnt) + 0;
-                    my $flg = CLONE_NEWNS + 0;
-                    my $r;
-                    do {$r = syscall($nr, $fd, $flg)} while ($r == -1 && $! == EINTR);
-                    $r == 0 or die "setns mntns: $!";    ## no critic (ErrorHandling::RequireCarping)
-                }
+                do_setns(fileno($child_mnt), CLONE_NEWNS)
+                    or die "setns mntns: $!";    ## no critic (ErrorHandling::RequireCarping)
                 close $child_mnt;
 
                 # Resolve relative source path against bundle
@@ -1028,15 +990,8 @@ sub cmd_create (%p) {
                 my $src_fd = fileno($src_fh);
 
                 # Switch back to our original mount namespace
-                {
-                    my $nr = SYS_setns + 0;
-                    my $fd = fileno($orig_mnt) + 0;
-                    my $flg = CLONE_NEWNS + 0;
-                    my $r;
-                    do {$r = syscall($nr, $fd, $flg)} while ($r == -1 && $! == EINTR);
-
-                    # Ignore failure — channel loop doesn't need mntns
-                }
+                # Ignore failure — channel loop doesn't need mntns
+                do_setns(fileno($orig_mnt), CLONE_NEWNS);
                 close $orig_mnt;
 
                 # Send response + fd
@@ -1491,11 +1446,7 @@ sub cmd_run (%p) {
             local $? = undef;
             while ((my $w = waitpid(-1, WNOHANG)) > 0) {
                 if ($w == $init_pid) {
-                    if (WIFEXITED($?)) {
-                        $exit_code = WEXITSTATUS($?);
-                    } elsif (WIFSIGNALED($?)) {
-                        $exit_code = 128 + WTERMSIG($?);
-                    }
+                    $exit_code = wait_exit_code();
                     $done = 1;
                 }
             }
@@ -1505,11 +1456,7 @@ sub cmd_run (%p) {
         {
             my $w = waitpid($init_pid, WNOHANG);
             if ($w > 0) {
-                if (WIFEXITED($?)) {
-                    $exit_code = WEXITSTATUS($?);
-                } elsif (WIFSIGNALED($?)) {
-                    $exit_code = 128 + WTERMSIG($?);
-                }
+                $exit_code = wait_exit_code();
                 $done = 1;
             }
         }
@@ -1565,11 +1512,7 @@ sub cmd_run (%p) {
                 $w = waitpid($init_pid, 0);
             }
             if ($w == $init_pid) {
-                if (WIFEXITED($?)) {
-                    $exit_code = WEXITSTATUS($?);
-                } elsif (WIFSIGNALED($?)) {
-                    $exit_code = 128 + WTERMSIG($?);
-                }
+                $exit_code = wait_exit_code();
             }
         }
 
@@ -1608,11 +1551,7 @@ sub cmd_run (%p) {
             while (1) {
                 my $w = waitpid(-1, 0);
                 if ($w == $init_pid) {
-                    if (WIFEXITED($?)) {
-                        $exit_code = WEXITSTATUS($?);
-                    } elsif (WIFSIGNALED($?)) {
-                        $exit_code = 128 + WTERMSIG($?);
-                    }
+                    $exit_code = wait_exit_code();
                     $got_init = 1;
                     last;
                 }
@@ -1624,11 +1563,7 @@ sub cmd_run (%p) {
             while (kill(0, $init_pid)) {
                 while ((my $z = waitpid(-1, WNOHANG)) > 0) {
                     if ($z == $init_pid) {
-                        if (WIFEXITED($?)) {
-                            $exit_code = WEXITSTATUS($?);
-                        } elsif (WIFSIGNALED($?)) {
-                            $exit_code = 128 + WTERMSIG($?);
-                        }
+                        $exit_code = wait_exit_code();
                         $got_init = 1;
                         last;
                     }
@@ -1763,11 +1698,7 @@ sub exec_tty_relay ($child_pid, $master_fd, $err_r_fd) {
         local $? = undef;
         my $ret = waitpid($child_pid, WNOHANG);
         if ($ret > 0) {
-            if (WIFEXITED($?)) {
-                $exit_status = WEXITSTATUS($?);
-            } elsif (WIFSIGNALED($?)) {
-                $exit_status = 128 + WTERMSIG($?);
-            }
+            $exit_status = wait_exit_code();
             $child_exited = 1;
         }
     };
@@ -1777,11 +1708,7 @@ sub exec_tty_relay ($child_pid, $master_fd, $err_r_fd) {
     {
         my $ret = waitpid($child_pid, WNOHANG);
         if ($ret > 0) {
-            if (WIFEXITED($?)) {
-                $exit_status = WEXITSTATUS($?);
-            } elsif (WIFSIGNALED($?)) {
-                $exit_status = 128 + WTERMSIG($?);
-            }
+            $exit_status = wait_exit_code();
             $child_exited = 1;
         }
     }
@@ -1847,11 +1774,7 @@ sub exec_tty_relay ($child_pid, $master_fd, $err_r_fd) {
     # Reap if not yet done
     unless ($child_exited) {
         waitpid($child_pid, 0);
-        if (WIFEXITED($?)) {
-            $exit_status = WEXITSTATUS($?);
-        } elsif (WIFSIGNALED($?)) {
-            $exit_status = 128 + WTERMSIG($?);
-        }
+        $exit_status = wait_exit_code();
     }
 
     exit($exit_status);
@@ -2114,12 +2037,7 @@ sub cmd_exec (%p) {
         my @deferred;
         for my $ns (@ns_fds) {
             next if $ns->{name} eq 'user';
-            my $nr = SYS_setns + 0;
-            my $fd = $ns->{fileno} + 0;
-            my $flg = 0;
-            my $r;
-            do {$r = syscall($nr, $fd, $flg)} while ($r == -1 && $! == EINTR);
-            if ($r != 0) {
+            if (!do_setns($ns->{fileno})) {
                 if ($! == EPERM) {
                     push @deferred, $ns;
                 } else {
@@ -2133,12 +2051,7 @@ sub cmd_exec (%p) {
         # Phase 2: join user namespace
         for my $ns (@ns_fds) {
             next unless $ns->{name} eq 'user';
-            my $nr = SYS_setns + 0;
-            my $fd = $ns->{fileno} + 0;
-            my $flg = 0;
-            my $r;
-            do {$r = syscall($nr, $fd, $flg)} while ($r == -1 && $! == EINTR);
-            if ($r != 0) {
+            unless (do_setns($ns->{fileno})) {
                 my $msg = "setns $ns->{name}: $!";
                 syswrite($err_w, $msg);
                 _exit(255);
@@ -2147,12 +2060,7 @@ sub cmd_exec (%p) {
 
         # Phase 3: retry deferred namespaces (now that we're in the userns)
         for my $ns (@deferred) {
-            my $nr = SYS_setns + 0;
-            my $fd = $ns->{fileno} + 0;
-            my $flg = 0;
-            my $r;
-            do {$r = syscall($nr, $fd, $flg)} while ($r == -1 && $! == EINTR);
-            if ($r != 0) {
+            unless (do_setns($ns->{fileno})) {
                 my $msg = "setns $ns->{name}: $!";
                 syswrite($err_w, $msg);
                 _exit(255);
@@ -2686,12 +2594,7 @@ sub cmd_exec (%p) {
         warn "$err_msg\n";
     }
 
-    if (WIFEXITED($?)) {
-        exit(WEXITSTATUS($?));
-    } elsif (WIFSIGNALED($?)) {
-        exit(128 + WTERMSIG($?));
-    }
-    exit(1);
+    exit(wait_exit_code());
 }
 
 # ═══════════════════════════════════════════════════════════════════════

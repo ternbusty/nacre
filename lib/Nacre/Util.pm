@@ -3,8 +3,10 @@ use v5.38;
 use Exporter 'import';
 use JSON::PP;
 use File::Basename qw(dirname);
+use POSIX qw(WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG);
 use Fcntl qw(:mode);
 use Errno qw(EINTR);
+use Nacre::Const qw(SYS_setns SYS_unshare);
 
 # ═══════════════════════════════════════════════════════════════════════
 # JSON encoders (shared across the runtime)
@@ -148,6 +150,36 @@ sub iso8601_now {
     return sprintf('%04d-%02d-%02dT%02d:%02d:%02dZ', $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1], $t[0]);
 }
 
+sub wait_exit_code ($status = $?) {
+    return WEXITSTATUS($status) if WIFEXITED($status);
+    return 128 + WTERMSIG($status) if WIFSIGNALED($status);
+    return 1;
+}
+
+sub do_setns ($fd, $flag = 0) {
+    return do_syscall(SYS_setns, $fd, $flag) == 0;
+}
+
+sub do_unshare ($flag) {
+    return do_syscall(SYS_unshare, $flag) == 0;
+}
+
+sub lookup_home_from_passwd ($uid) {
+    my $home = '/';
+    if (open my $pw, '<', '/etc/passwd') {
+        while (my $line = <$pw>) {
+            chomp $line;
+            my @f = split /:/, $line;
+            if (@f >= 6 && $f[2] == $uid) {
+                $home = $f[5] if $f[5] ne '';
+                last;
+            }
+        }
+        close $pw;
+    }
+    return $home;
+}
+
 sub do_syscall (@args) {
     my ($a0, $a1, $a2, $a3, $a4, $a5) = map {$_ + 0} @args;
     my $n = scalar @args;
@@ -174,6 +206,7 @@ our @EXPORT_OK = qw(
     fatal parse_size
     write_file read_file read_file_or_die write_file_atomic
     ensure_dir iso8601_now do_syscall
+    wait_exit_code do_setns do_unshare lookup_home_from_passwd
 );
 
 1;

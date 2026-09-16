@@ -68,26 +68,10 @@ sub _apply_seccomp_ffi ($spec) {
     $ffi->attach('seccomp_export_bpf' => ['opaque', 'int'] => 'int');
     $ffi->attach('seccomp_attr_set' => ['opaque', 'uint32', 'uint32'] => 'int');
 
-    my %action_map = (
-        SCMP_ACT_KILL => SCMP_ACT_KILL,
-        SCMP_ACT_KILL_PROCESS => SCMP_ACT_KILL_PROCESS,
-        SCMP_ACT_TRAP => SCMP_ACT_TRAP,
-        SCMP_ACT_NOTIFY => SCMP_ACT_NOTIFY,
-        SCMP_ACT_LOG => SCMP_ACT_LOG,
-        SCMP_ACT_ALLOW => SCMP_ACT_ALLOW,
-    );
-
     my $default_action_str = $seccomp->{defaultAction} // 'SCMP_ACT_ALLOW';
-    my $default_errno_ret_ffi = $seccomp->{defaultErrnoRet};
-    my $default_action;
-    if ($default_action_str =~ /^SCMP_ACT_ERRNO\((\d+)\)$/) {
-        $default_action = SCMP_ACT_ERRNO_BASE | ($1 & 0xffff);
-    } elsif ($default_action_str eq 'SCMP_ACT_ERRNO') {
-        my $ev = $default_errno_ret_ffi // 1;
-        $default_action = SCMP_ACT_ERRNO_BASE | ($ev & 0xffff);
-    } else {
-        $default_action = $action_map{$default_action_str} // fatal("unknown seccomp action: $default_action_str");
-    }
+    my $default_errno_ret = $seccomp->{defaultErrnoRet};
+    my $default_action = _seccomp_action_val($default_action_str, $default_errno_ret)
+        // fatal("unknown seccomp action: $default_action_str");
 
     my $ctx = seccomp_init($default_action)
         or fatal("seccomp_init failed");
@@ -106,19 +90,10 @@ sub _apply_seccomp_ffi ($spec) {
         seccomp_arch_add($ctx, $arch_val);
     }
 
-    my $ffi_default_errno_ret = $seccomp->{defaultErrnoRet};
-
     for my $rule (@{$seccomp->{syscalls} // []}) {
         my $action_str = $rule->{action} // $default_action_str;
-        my $action;
-        if ($action_str eq 'SCMP_ACT_ERRNO') {
-            my $ev = $rule->{errnoRet} // $ffi_default_errno_ret // 1;
-            $action = SCMP_ACT_ERRNO_BASE | ($ev & 0xffff);
-        } elsif ($action_str =~ /^SCMP_ACT_ERRNO\((\d+)\)$/) {
-            $action = SCMP_ACT_ERRNO_BASE | ($1 & 0xffff);
-        } else {
-            $action = $action_map{$action_str} // next;
-        }
+        my $errno_val = $rule->{errnoRet} // $default_errno_ret;
+        my $action = _seccomp_action_val($action_str, $errno_val) // next;
 
         for my $name (@{$rule->{names} // []}) {
             my $nr = seccomp_syscall_resolve_name($name);
@@ -143,23 +118,7 @@ sub _apply_seccomp_ffi ($spec) {
 
             my $nr_sec = SYS_seccomp + 0;
             my $op = SECCOMP_SET_MODE_FILTER + 0;
-            my %ffi_flag_map = (
-                SECCOMP_FILTER_FLAG_TSYNC => SECCOMP_FILTER_FLAG_TSYNC,
-                SECCOMP_FILTER_FLAG_LOG => SECCOMP_FILTER_FLAG_LOG,
-                SECCOMP_FILTER_FLAG_SPEC_ALLOW => (1 << 2),
-                SECCOMP_FILTER_FLAG_NEW_LISTENER => SECCOMP_FILTER_FLAG_NEW_LISTENER,
-                SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV => SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV,
-            );
-            my $fl = 0;
-            my $ffi_has_flags_field = exists $seccomp->{flags};
-            for my $fn (@{$seccomp->{flags} // []}) {
-                $fl |= ($ffi_flag_map{$fn} // 0);
-            }
-            if (!$ffi_has_flags_field) {
-                $fl |= (1 << 2);    # SECCOMP_FILTER_FLAG_SPEC_ALLOW
-            }
-            log_debug("seccomp filter flags: $fl");
-            $fl += 0;
+            my $fl = _resolve_seccomp_flags($seccomp, 0);
             my $sec_ret = syscall($nr_sec, $op, $fl, $sock_fprog);
             if ($sec_ret != 0) {
                 seccomp_release($ctx);
@@ -615,6 +574,38 @@ sub _seccomp_action_val ($str, $errno_override = undef) {
     return;
 }
 
+sub _resolve_seccomp_flags ($seccomp, $has_notify, $enable_tsync = 1) {
+    my %flag_map = (
+        SECCOMP_FILTER_FLAG_TSYNC => $enable_tsync ? SECCOMP_FILTER_FLAG_TSYNC : 0,
+        SECCOMP_FILTER_FLAG_LOG => SECCOMP_FILTER_FLAG_LOG,
+        SECCOMP_FILTER_FLAG_SPEC_ALLOW => (1 << 2),
+        SECCOMP_FILTER_FLAG_NEW_LISTENER => SECCOMP_FILTER_FLAG_NEW_LISTENER,
+        SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV => SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV,
+    );
+
+    my $fl = 0;
+    my $has_flags_field = exists $seccomp->{flags};
+    for my $flag_name (@{$seccomp->{flags} // []}) {
+        my $fv = $flag_map{$flag_name};
+        if (defined $fv) {
+            $fl |= $fv;
+        } else {
+            warn "nacre: seccomp: unknown flag '$flag_name'\n";
+        }
+    }
+
+    if ($has_notify) {
+        $fl |= SECCOMP_FILTER_FLAG_NEW_LISTENER;
+    }
+
+    if (!$has_flags_field) {
+        $fl |= (1 << 2);    # SECCOMP_FILTER_FLAG_SPEC_ALLOW
+    }
+
+    log_debug("seccomp filter flags: $fl");
+    return $fl + 0;
+}
+
 # BPF opcodes (classic BPF for seccomp)
 use constant {
     _BPF_LD_W_ABS => 0x20,
@@ -681,7 +672,6 @@ sub _gen_seccomp_rule_bpf ($nr, $ret, $args) {
                 }
                 push @body, {code => $opcode, k => $val, jt => $jt_sym, jf => $jf_sym};
             }
-            return;
         }
     }
 
@@ -796,37 +786,10 @@ sub _apply_seccomp_minimal ($seccomp) {
     }
     $has_notify = 1 if $default_ret == 0x7fc00000;
 
-    my %flag_map = (
-        SECCOMP_FILTER_FLAG_TSYNC => 0,
-        SECCOMP_FILTER_FLAG_LOG => SECCOMP_FILTER_FLAG_LOG,
-        SECCOMP_FILTER_FLAG_SPEC_ALLOW => (1 << 2),
-        SECCOMP_FILTER_FLAG_NEW_LISTENER => SECCOMP_FILTER_FLAG_NEW_LISTENER,
-        SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV => SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV,
-    );
-    my $fl = 0;
-    my $has_flags_field = exists $seccomp->{flags};
-    for my $flag_name (@{$seccomp->{flags} // []}) {
-        my $fv = $flag_map{$flag_name};
-        if (defined $fv) {
-            $fl |= $fv;
-        } else {
-            warn "nacre: seccomp: unknown flag '$flag_name'\n";
-        }
-    }
-
-    if ($has_notify) {
-        $fl |= SECCOMP_FILTER_FLAG_NEW_LISTENER;
-    }
-
-    if (!$has_flags_field) {
-        $fl |= (1 << 2);
-    }
-
-    log_debug("seccomp filter flags: $fl");
+    my $fl = _resolve_seccomp_flags($seccomp, $has_notify, 0);
 
     my $nr = SYS_seccomp + 0;
     my $op = SECCOMP_SET_MODE_FILTER + 0;
-    $fl += 0;
     my $ret = syscall($nr, $op, $fl, $fprog);
 
     if ($has_notify || ($fl & SECCOMP_FILTER_FLAG_NEW_LISTENER)) {

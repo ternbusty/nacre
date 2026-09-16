@@ -58,7 +58,6 @@ sub cgroup_setup ($cgpath, $spec) {
                 eval {write_file($sc_file, "+$ctrl\n");};
             }
         }
-        return;
     }
 
     # Apply resources

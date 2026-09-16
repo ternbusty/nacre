@@ -10,7 +10,7 @@ use Errno qw(EINTR EPERM);
 use Socket qw(AF_UNIX SOCK_STREAM);
 use Cwd qw(abs_path);
 use Nacre::Const qw(
-    SYS_mount SYS_umount2 SYS_pivot_root SYS_unshare SYS_mknod SYS_mknodat
+    SYS_mount SYS_umount2 SYS_pivot_root SYS_mknod SYS_mknodat
     SYS_open_tree SYS_move_mount SYS_mount_setattr
     CLONE_NEWUSER
     MS_RDONLY MS_NOSUID MS_NODEV MS_NOEXEC MS_REMOUNT
@@ -23,7 +23,7 @@ use Nacre::Const qw(
     MOUNT_ATTR__ATIME MOUNT_ATTR_IDMAP
     OPEN_TREE_CLONE OPEN_TREE_CLOEXEC MOVE_MOUNT_F_EMPTY_PATH
 );
-use Nacre::Util qw(log_debug fatal write_file ensure_dir do_syscall);
+use Nacre::Util qw(log_debug fatal write_file ensure_dir do_syscall do_unshare);
 use Nacre::IPC qw(channel_send channel_recv send_fd_over_fd recv_fd_over_fd);
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -314,9 +314,7 @@ sub _create_userns_for_idmap ($uid_maps, $gid_maps, $chan_w, $chan_r) {
         close $pw;
 
         # Unshare user namespace
-        my $nr = SYS_unshare + 0;
-        my $fl = CLONE_NEWUSER + 0;
-        syscall($nr, $fl) == 0 or _exit(1);
+        do_unshare(CLONE_NEWUSER) or _exit(1);
 
         # Send host PID to parent.  /proc/self resolves to the PID in the
         # procfs's PID namespace (the host one), even when we are inside a
@@ -397,9 +395,7 @@ sub _create_userns_from_strings ($uid_map_str, $gid_map_str) {
         close $p_sock;
         close $pr;
         close $pw;
-        my $nr = SYS_unshare + 0;
-        my $fl = CLONE_NEWUSER + 0;
-        syscall($nr, $fl) == 0 or _exit(1);
+        do_unshare(CLONE_NEWUSER) or _exit(1);
         syswrite($cw, "R", 1);
         close $cw;
         my $b;

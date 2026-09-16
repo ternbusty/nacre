@@ -3,8 +3,8 @@ use v5.38;
 use feature 'try';
 no warnings 'experimental::try';
 use Exporter 'import';
-use Nacre::Const qw(SYS_setns CLONE_NEWNET);
-use Nacre::Util qw(log_debug fatal);
+use Nacre::Const qw(CLONE_NEWNET);
+use Nacre::Util qw(log_debug fatal do_setns);
 use Socket qw(AF_INET inet_aton inet_ntoa inet_pton inet_ntop);
 use Fcntl qw(O_RDONLY);
 
@@ -226,10 +226,7 @@ sub move_net_devices ($netdevs, $ns_pid) {
             or fatal("open host netns: $!");
         sysopen(my $ctr_ns, "/proc/$ns_pid/ns/net", O_RDONLY)
             or fatal("open container netns: $!");
-        my $nr = SYS_setns + 0;
-        my $fd = fileno($ctr_ns) + 0;
-        my $fl = CLONE_NEWNET + 0;
-        syscall($nr, $fd, $fl) == 0 or fatal("setns container netns: $!");
+        do_setns(fileno($ctr_ns), CLONE_NEWNET) or fatal("setns container netns: $!");
         close $ctr_ns;
 
         my $new_idx = eval {get_ifindex($host_name)};
@@ -252,10 +249,7 @@ sub move_net_devices ($netdevs, $ns_pid) {
             eval {netlink_set_up($new_idx)};
         }
 
-        $nr = SYS_setns + 0;
-        $fd = fileno($host_ns) + 0;
-        $fl = CLONE_NEWNET + 0;
-        syscall($nr, $fd, $fl) == 0 or fatal("setns host netns: $!");
+        do_setns(fileno($host_ns), CLONE_NEWNET) or fatal("setns host netns: $!");
         close $host_ns;
     }
     return;
