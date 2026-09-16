@@ -154,6 +154,29 @@ sub netlink_add_addr ($ifindex, $addr_str) {
     return;
 }
 
+sub _parse_newaddr_msg ($buf, $offset, $len, $ifindex) {
+    my ($ifa_family, $ifa_prefixlen, $ifa_flags, $ifa_scope, $ifa_index)
+        = unpack('C C C C l', substr($buf, $offset + 16, 8));
+    return if $ifa_index != $ifindex || $ifa_scope != RT_SCOPE_UNIVERSE;
+
+    my $attr_off = $offset + 24;
+    my ($addr_data, $ext_flags);
+    while ($attr_off + 4 <= $offset + $len) {
+        my ($rta_len, $rta_type) = unpack('S S', substr($buf, $attr_off, 4));
+        last if $rta_len < 4;
+        my $data = substr($buf, $attr_off + 4, $rta_len - 4);
+        if ($rta_type == IFA_LOCAL || ($rta_type == IFA_ADDRESS_ATTR && !defined $addr_data)) {
+            $addr_data = $data;
+        } elsif ($rta_type == IFA_FLAGS) {
+            $ext_flags = unpack('L', $data) if length($data) >= 4;
+        }
+        $attr_off += ($rta_len + 3) & ~3;
+    }
+    my $final_flags = defined $ext_flags ? $ext_flags : $ifa_flags;
+    return if !defined $addr_data || !($final_flags & IFA_F_PERMANENT);
+    return {family => $ifa_family, prefix => $ifa_prefixlen, addr_data => $addr_data};
+}
+
 sub netlink_list_addrs ($ifindex) {
     socket(my $sock, AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE)
         or fatal("netlink socket: $!");
@@ -174,32 +197,8 @@ sub netlink_list_addrs ($ifindex) {
             last if $len < 16 || $offset + $len > length($buf);
             last if $type == NLMSG_DONE;
             if ($type == RTM_NEWADDR && $len >= 24) {
-                my ($ifa_family, $ifa_prefixlen, $ifa_flags, $ifa_scope, $ifa_index)
-                    = unpack('C C C C l', substr($buf, $offset + 16, 8));
-                if ($ifa_index == $ifindex && $ifa_scope == RT_SCOPE_UNIVERSE) {
-                    my $attr_off = $offset + 24;
-                    my ($addr_data, $ext_flags);
-                    while ($attr_off + 4 <= $offset + $len) {
-                        my ($rta_len, $rta_type) = unpack('S S', substr($buf, $attr_off, 4));
-                        last if $rta_len < 4;
-                        my $data = substr($buf, $attr_off + 4, $rta_len - 4);
-                        if ($rta_type == IFA_LOCAL || ($rta_type == IFA_ADDRESS_ATTR && !defined $addr_data)) {
-                            $addr_data = $data;
-                        } elsif ($rta_type == IFA_FLAGS) {
-                            $ext_flags = unpack('L', $data) if length($data) >= 4;
-                        }
-                        $attr_off += ($rta_len + 3) & ~3;
-                    }
-                    my $final_flags = defined $ext_flags ? $ext_flags : $ifa_flags;
-                    if (defined $addr_data && ($final_flags & IFA_F_PERMANENT)) {
-                        push @addrs,
-                            {
-                            family => $ifa_family,
-                            prefix => $ifa_prefixlen,
-                            addr_data => $addr_data,
-                            };
-                    }
-                }
+                my $addr = _parse_newaddr_msg($buf, $offset, $len, $ifindex);
+                push @addrs, $addr if $addr;
             }
             $offset += ($len + 3) & ~3;
         }

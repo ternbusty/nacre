@@ -65,125 +65,131 @@ sub cgroup_setup ($cgpath, $spec) {
     return;
 }
 
+# ── Private helpers for cgroup_apply_resources ────────────────────────
+
+sub _apply_memory ($cgpath, $mem) {
+    my $new_limit = $mem->{limit};
+    my $new_swap = $mem->{swap};
+    my $cur_limit = read_file("$cgpath/memory.max");
+    chomp($cur_limit //= 'max');
+    my $cur_val = ($cur_limit eq 'max') ? ~0 : int($cur_limit);
+    my $new_val = (defined $new_limit && $new_limit ne 'max') ? int($new_limit) : ~0;
+
+    # cgroup v2: memory.swap.max = swap-only, but OCI spec's "swap"
+    # field is memory+swap total.  Convert: swap_only = swap - limit.
+    if (defined $new_swap && $new_swap ne 'max') {
+        my $mem_for_sub = (defined $new_limit && $new_limit ne 'max') ? int($new_limit) : $cur_val;
+        if ($mem_for_sub != ~0) {
+            $new_swap = int($new_swap) - int($mem_for_sub);
+            $new_swap = 0 if $new_swap < 0;
+        }
+    }
+
+    if ($new_val > $cur_val) {
+
+        # Increasing memory.max — write limit first so swap stays valid
+        cg_write($cgpath, 'memory.max', $new_limit) if defined $new_limit;
+        cg_write($cgpath, 'memory.swap.max', $new_swap) if defined $new_swap;
+    } else {
+
+        # Decreasing or unchanged — write swap first, then limit
+        cg_write($cgpath, 'memory.swap.max', $new_swap) if defined $new_swap;
+        cg_write($cgpath, 'memory.max', $new_limit) if defined $new_limit;
+    }
+    cg_write($cgpath, 'memory.low', $mem->{reservation}) if defined $mem->{reservation};
+    return;
+}
+
+sub _apply_cpu ($cgpath, $cpu) {
+    if (defined $cpu->{shares}) {
+        my $weight = convert_cpu_shares($cpu->{shares});
+        cg_write($cgpath, 'cpu.weight', $weight);
+    }
+    if (defined $cpu->{quota} || defined $cpu->{period}) {
+
+        # When only one of quota/period is being updated, read the
+        # current value of the other from cpu.max.
+        my ($cur_quota, $cur_period) = ('max', 100000);
+        my $cur = read_file("$cgpath/cpu.max");
+        if (defined $cur && $cur =~ /^(\S+)\s+(\d+)/) {
+            ($cur_quota, $cur_period) = ($1, int($2));
+        }
+        my $quota = $cpu->{quota} // $cur_quota;
+        my $period = $cpu->{period} // $cur_period;
+        cg_write($cgpath, 'cpu.max', "$quota $period", fatal => 1);
+    }
+    if (defined $cpu->{burst}) {
+        cg_write($cgpath, 'cpu.max.burst', $cpu->{burst});
+    }
+    if (defined $cpu->{idle}) {
+        cg_write($cgpath, 'cpu.idle', $cpu->{idle});
+    }
+    cg_write($cgpath, 'cpuset.cpus', $cpu->{cpus}) if defined $cpu->{cpus};
+    cg_write($cgpath, 'cpuset.mems', $cpu->{mems}) if defined $cpu->{mems};
+    return;
+}
+
+sub _apply_pids ($cgpath, $pids) {
+    my $max = $pids->{limit} // 'max';
+    if ($max eq 'max' || $max < 0) {
+        $max = 'max';
+    } elsif ($max == 0) {
+
+        # pids.limit=0 means 1 (minimum useful value)
+        $max = 1;
+    }
+    cg_write($cgpath, 'pids.max', $max);
+    return;
+}
+
+sub _apply_io ($cgpath, $io) {
+    if (defined $io->{weight}) {
+        my $weight = $io->{weight};
+        cg_write($cgpath, 'io.weight', "default $weight");
+    }
+    if (my $tbd = $io->{throttleReadBpsDevice}) {
+        for my $d (@$tbd) {
+            cg_write($cgpath, 'io.max', "$d->{major}:$d->{minor} rbps=$d->{rate}");
+        }
+    }
+    if (my $tbd = $io->{throttleWriteBpsDevice}) {
+        for my $d (@$tbd) {
+            cg_write($cgpath, 'io.max', "$d->{major}:$d->{minor} wbps=$d->{rate}");
+        }
+    }
+    if (my $tbd = $io->{throttleReadIOPSDevice}) {
+        for my $d (@$tbd) {
+            cg_write($cgpath, 'io.max', "$d->{major}:$d->{minor} riops=$d->{rate}");
+        }
+    }
+    if (my $tbd = $io->{throttleWriteIOPSDevice}) {
+        for my $d (@$tbd) {
+            cg_write($cgpath, 'io.max', "$d->{major}:$d->{minor} wiops=$d->{rate}");
+        }
+    }
+    return;
+}
+
+sub _apply_hugetlb ($cgpath, $hugetlb) {
+    for my $entry (@$hugetlb) {
+        my $size = $entry->{pageSize} // next;
+        my $limit = $entry->{limit} // next;
+        cg_write($cgpath, "hugetlb.${size}.max", $limit);
+    }
+    return;
+}
+
+# ── Main resource dispatcher ─────────────────────────────────────────
+
 sub cgroup_apply_resources ($cgpath, $spec, %opts) {
     log_debug("applying cgroup resources");
     my $res = $spec->{linux}{resources} // {};
 
-    # Memory — order writes carefully: cgroup v2 requires memory.swap.max
-    # >= memory.max at all times.  When increasing memory.max, write it
-    # first; when decreasing, write swap first.
-    if (my $mem = $res->{memory}) {
-        my $new_limit = $mem->{limit};
-        my $new_swap = $mem->{swap};
-        my $cur_limit = read_file("$cgpath/memory.max");
-        chomp($cur_limit //= 'max');
-        my $cur_val = ($cur_limit eq 'max') ? ~0 : int($cur_limit);
-        my $new_val = (defined $new_limit && $new_limit ne 'max') ? int($new_limit) : ~0;
-
-        # cgroup v2: memory.swap.max = swap-only, but OCI spec's "swap"
-        # field is memory+swap total.  Convert: swap_only = swap - limit.
-        if (defined $new_swap && $new_swap ne 'max') {
-            my $mem_for_sub = (defined $new_limit && $new_limit ne 'max') ? int($new_limit) : $cur_val;
-            if ($mem_for_sub != ~0) {
-                $new_swap = int($new_swap) - int($mem_for_sub);
-                $new_swap = 0 if $new_swap < 0;
-            }
-        }
-
-        if ($new_val > $cur_val) {
-
-            # Increasing memory.max — write limit first so swap stays valid
-            cg_write($cgpath, 'memory.max', $new_limit) if defined $new_limit;
-            cg_write($cgpath, 'memory.swap.max', $new_swap) if defined $new_swap;
-        } else {
-
-            # Decreasing or unchanged — write swap first, then limit
-            cg_write($cgpath, 'memory.swap.max', $new_swap) if defined $new_swap;
-            cg_write($cgpath, 'memory.max', $new_limit) if defined $new_limit;
-        }
-        cg_write($cgpath, 'memory.low', $mem->{reservation}) if defined $mem->{reservation};
-    }
-
-    # CPU
-    if (my $cpu = $res->{cpu}) {
-        if (defined $cpu->{shares}) {
-            my $weight = convert_cpu_shares($cpu->{shares});
-            cg_write($cgpath, 'cpu.weight', $weight);
-        }
-        if (defined $cpu->{quota} || defined $cpu->{period}) {
-
-            # When only one of quota/period is being updated, read the
-            # current value of the other from cpu.max.
-            my ($cur_quota, $cur_period) = ('max', 100000);
-            my $cur = read_file("$cgpath/cpu.max");
-            if (defined $cur && $cur =~ /^(\S+)\s+(\d+)/) {
-                ($cur_quota, $cur_period) = ($1, int($2));
-            }
-            my $quota = $cpu->{quota} // $cur_quota;
-            my $period = $cpu->{period} // $cur_period;
-            cg_write($cgpath, 'cpu.max', "$quota $period", fatal => 1);
-        }
-        if (defined $cpu->{burst}) {
-            cg_write($cgpath, 'cpu.max.burst', $cpu->{burst});
-        }
-        if (defined $cpu->{idle}) {
-            cg_write($cgpath, 'cpu.idle', $cpu->{idle});
-        }
-        cg_write($cgpath, 'cpuset.cpus', $cpu->{cpus}) if defined $cpu->{cpus};
-        cg_write($cgpath, 'cpuset.mems', $cpu->{mems}) if defined $cpu->{mems};
-    }
-
-    # PIDs
-    if (my $pids = $res->{pids}) {
-        unless ($opts{defer_pids}) {
-            my $max = $pids->{limit} // 'max';
-            if ($max eq 'max' || $max < 0) {
-                $max = 'max';
-            } elsif ($max == 0) {
-
-                # pids.limit=0 means 1 (minimum useful value)
-                $max = 1;
-            }
-            cg_write($cgpath, 'pids.max', $max);
-        }
-    }
-
-    # Hugepages
-    if (my $hp = $res->{hugepageLimits}) {
-        for my $entry (@$hp) {
-            my $size = $entry->{pageSize} // next;
-            my $limit = $entry->{limit} // next;
-            cg_write($cgpath, "hugetlb.${size}.max", $limit);
-        }
-    }
-
-    # Block IO
-    if (my $bio = $res->{blockIO}) {
-        if (defined $bio->{weight}) {
-            my $weight = $bio->{weight};
-            cg_write($cgpath, 'io.weight', "default $weight");
-        }
-        if (my $tbd = $bio->{throttleReadBpsDevice}) {
-            for my $d (@$tbd) {
-                cg_write($cgpath, 'io.max', "$d->{major}:$d->{minor} rbps=$d->{rate}");
-            }
-        }
-        if (my $tbd = $bio->{throttleWriteBpsDevice}) {
-            for my $d (@$tbd) {
-                cg_write($cgpath, 'io.max', "$d->{major}:$d->{minor} wbps=$d->{rate}");
-            }
-        }
-        if (my $tbd = $bio->{throttleReadIOPSDevice}) {
-            for my $d (@$tbd) {
-                cg_write($cgpath, 'io.max', "$d->{major}:$d->{minor} riops=$d->{rate}");
-            }
-        }
-        if (my $tbd = $bio->{throttleWriteIOPSDevice}) {
-            for my $d (@$tbd) {
-                cg_write($cgpath, 'io.max', "$d->{major}:$d->{minor} wiops=$d->{rate}");
-            }
-        }
-    }
+    _apply_memory($cgpath, $res->{memory}) if $res->{memory};
+    _apply_cpu($cgpath, $res->{cpu}) if $res->{cpu};
+    _apply_pids($cgpath, $res->{pids}) if $res->{pids} && !$opts{defer_pids};
+    _apply_hugetlb($cgpath, $res->{hugepageLimits}) if $res->{hugepageLimits};
+    _apply_io($cgpath, $res->{blockIO}) if $res->{blockIO};
 
     # Unified (raw cgroup file writes)
     if (my $u = $res->{unified}) {

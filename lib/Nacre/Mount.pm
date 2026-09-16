@@ -452,6 +452,423 @@ sub _resolve_in_rootfs ($rootfs, $path) {
     return $rootfs . '/' . join('/', @resolved);
 }
 
+## Resolve the destination path for a mount entry.
+## Normalises the cgroup type and checks for forbidden proc/sysfs symlinks.
+## Returns ($dest, $type); $type may differ from $m->{type}.
+sub _resolve_mount_dest ($m, $rootfs) {
+
+    # If the destination already starts with the rootfs path (e.g.
+    # container-relative bind mount sources use full paths), use it
+    # as-is to avoid doubling the prefix.
+    my $dest
+        = (index($m->{destination}, $rootfs) == 0)
+        ? $m->{destination}
+        : "$rootfs$m->{destination}";
+    my $type = $m->{type} // '';
+
+    # Normalize cgroup mount type: runc's default spec uses "cgroup"
+    # for both v1 and v2.  On cgroup v2 systems, the kernel filesystem
+    # type is "cgroup2".
+    if ($type eq 'cgroup' && -f '/sys/fs/cgroup/cgroup.controllers') {
+        $type = 'cgroup2';
+    }
+
+    # Security: /proc and /sys must not be symlinks (CVE-2023-27561 / CVE-2019-19921)
+    if ($type eq 'proc' || $type eq 'sysfs') {
+        if (-l $dest) {
+            fatal("$m->{destination} must be mounted on ordinary directory");
+        }
+    }
+
+    # Resolve symlinks in the destination path (within the rootfs).
+    # Mount destinations that go through symlinks (e.g. /etc/hosts ->
+    # /tmp/hosts) must be resolved so the mount lands at the real path.
+    # The resolved target may not exist yet -- that's fine, we create it.
+    my $container_dest = $m->{destination};
+    if (index($container_dest, $rootfs) == 0) {
+        $container_dest = substr($container_dest, length($rootfs));
+    }
+    my $resolved = _resolve_in_rootfs($rootfs, $container_dest);
+    if (defined $resolved && $resolved ne $dest) {
+        log_debug("  symlink resolved: $dest -> $resolved");
+        $dest = $resolved;
+    }
+
+    return ($dest, $type);
+}
+
+## Create a mount point at $dest (file for bind-mounted files, dir otherwise).
+## Updates %$dest_preexisted_ref to record whether the directory existed
+## before ensure_dir.
+sub _create_mountpoint ($dest, $m, $dest_preexisted_ref) {
+    my $mount_src = $m->{source} // '';
+
+    # For bind mounts of files, create a file mount point instead of dir
+    if ($mount_src ne '' && -f $mount_src && grep {$_ eq 'bind' || $_ eq 'rbind'} @{$m->{options} // []}) {
+        my $parent = dirname($dest);
+        ensure_dir($parent);
+        if (!-e $dest) {
+            if (open my $fh, '>', $dest) {
+                close $fh;
+            }
+        }
+    } elsif ($mount_src ne '' && -d $mount_src && grep {$_ eq 'bind' || $_ eq 'rbind'} @{$m->{options} // []}) {
+
+        # Bind mount of a directory onto a symlink-resolved target:
+        # create the target as a directory.
+        ensure_dir($dest);
+        $dest_preexisted_ref->{$dest} = -d $dest;
+    } else {
+
+        # Track whether the directory existed before ensure_dir creates it.
+        # We only inherit tmpfs mode from pre-existing directories.
+        my $existed = -d $dest;
+        ensure_dir($dest);
+        if (!-d $dest) {
+            warn "nacre: ensure_dir: $dest still not a dir after ensure_dir (exists="
+                . (-e $dest ? "yes" : "no")
+                . " uid=$< euid=$>)\n";
+        }
+        $dest_preexisted_ref->{$dest} = $existed;
+    }
+    return;
+}
+
+## Parse the options for a single mount entry.
+## Filters OCI pseudo-options (tmpcopyup, idmap, ridmap) and recursive mount
+## attributes from the real mount options.  Also handles /dev ro deferral and
+## tmpfs mode= inheritance.
+## Returns ($flags, $data, $src, $tmpcopyup, $has_idmap, $has_ridmap,
+##          \@recursive_attrs, $dev_ro_deferred).
+sub _determine_mount_flags ($m, $type, $dest, $dest_preexisted_ref) {
+    my @raw_opts = @{$m->{options} // []};
+    my $tmpcopyup = 0;
+    my $has_idmap = 0;
+    my $has_ridmap = 0;
+    my @real_opts;
+    my @recursive_attrs;
+
+    for my $o (@raw_opts) {
+        if ($o eq 'tmpcopyup' || $o eq 'copy') {
+            $tmpcopyup = 1;
+        } elsif ($o eq 'idmap') {
+            $has_idmap = 1;
+        } elsif ($o eq 'ridmap') {
+            $has_ridmap = 1;
+        } elsif (exists $RECURSIVE_MOUNT_ATTRS{$o}) {
+            push @recursive_attrs, $o;
+        } else {
+            push @real_opts, $o;
+        }
+    }
+
+    # OCI spec: idmap mounts are also identified by per-mount
+    # uidMappings/gidMappings (not just the "idmap" option string).
+    if (!$has_idmap && !$has_ridmap && ($m->{uidMappings} || $m->{gidMappings})) {
+        $has_idmap = 1;
+    }
+
+    my ($flags, $data) = parse_mount_options(\@real_opts);
+    my $src = $m->{source} // $type;
+
+    # For /dev tmpfs mount, defer ro flag until after device creation
+    my $dev_ro_deferred = 0;
+    if ($m->{destination} eq '/dev' && $type eq 'tmpfs' && ($flags & MS_RDONLY)) {
+        $flags &= ~MS_RDONLY;
+        $dev_ro_deferred = 1;
+    }
+
+    # tmpfs mode= inherit: if mounting tmpfs without explicit mode=
+    # in the options, inherit the existing directory's permissions.
+    # Only inherit from pre-existing directories -- directories freshly
+    # created by ensure_dir have mode 0755 which is just the mkdir default,
+    # not a user intent.  Let the kernel use its tmpfs default (1777).
+    if ($type eq 'tmpfs' && $dest_preexisted_ref->{$dest} && $data !~ /\bmode=/) {
+        my @st = stat($dest);
+        if (@st) {
+            my $mode = sprintf('%o', $st[2] & 07777);
+            $data = $data ? "$data,mode=$mode" : "mode=$mode";
+        }
+    }
+
+    return ($flags, $data, $src, $tmpcopyup, $has_idmap, $has_ridmap, \@recursive_attrs, $dev_ro_deferred);
+}
+
+## Perform a bind mount with fallbacks (pre-opened fds, parent channel).
+## Returns 1 on success, 0 on failure (caller should skip this mount).
+sub _apply_bind_mount ($src, $dest, $flags, $mount_src, $mount_source_fds, $chan_w, $chan_r) {
+
+    # Bind mount -- if the source is inaccessible (e.g. after
+    # entering a user namespace), fall back to /proc/self/fd/N
+    # using a pre-opened fd.
+    my $mounted = do_mount($src, $dest, '', $flags, '');
+    if (!$mounted && defined $mount_source_fds->{$mount_src}) {
+        my $fd = $mount_source_fds->{$mount_src};
+        $mounted = do_mount("/proc/self/fd/$fd", $dest, '', $flags, '');
+    }
+
+    # If still not mounted and we have a parent channel, ask the
+    # parent to open the source fd inside our mount namespace
+    # (parent stays in init userns and has root access to
+    # inaccessible source directories).
+    if (!$mounted && $chan_w) {
+        eval {
+            channel_send(
+                $chan_w,
+                {
+                    type => 'bind_source_request',
+                    source => $mount_src,
+                }
+            );
+            my $resp = channel_recv($chan_r);
+            if ($resp && $resp->{type} eq 'bind_source_done' && $resp->{ok}) {
+                my $parent_fd = recv_fd_over_fd($chan_r);
+                if ($parent_fd >= 0) {
+                    $mounted = do_mount("/proc/self/fd/$parent_fd", $dest, '', $flags, '');
+                    POSIX::close($parent_fd);
+                }
+            }
+        };
+    }
+    unless ($mounted) {
+        warn "nacre: mount bind $dest: $!\n";
+        return 0;
+    }
+
+    # Apply remaining flags via remount
+    if ($flags & ~(MS_BIND | MS_REC)) {
+        do_mount('', $dest, '', MS_REMOUNT | MS_BIND | ($flags & ~MS_REC), '')
+            or warn "nacre: remount $dest: $!\n";
+    }
+
+    return 1;
+}
+
+## Perform a non-bind filesystem mount with propagation handling.
+## Returns 1 on success, 0 on failure (caller should skip this mount).
+sub _apply_fs_mount ($src, $dest, $type, $flags, $data) {
+
+    # Propagation flags (MS_PRIVATE, MS_SHARED, MS_SLAVE, MS_UNBINDABLE)
+    # cannot be combined with a filesystem mount in a single mount(2)
+    # call -- split them off and apply after the mount.
+    my $prop_mask = MS_PRIVATE | MS_SHARED | MS_SLAVE | MS_UNBINDABLE;
+    my $prop_flags = $flags & ($prop_mask | MS_REC);
+    my $mount_flags = $flags & ~$prop_mask;
+
+    # If ONLY propagation flags + MS_REC were set, strip MS_REC from
+    # the mount call (it's for propagation, not the fs mount).
+    if ($prop_flags && !($mount_flags & ~MS_REC)) {
+        $mount_flags &= ~MS_REC;
+    }
+    unless (do_mount($src, $dest, $type, $mount_flags, $data)) {
+
+        # cgroup2 mount can fail in userns that doesn't own the
+        # cgroup namespace (EBUSY/EPERM).  Fall back to bind-mounting
+        # the host cgroup2 hierarchy, matching runc behaviour.
+        if ($type eq 'cgroup2' && -d '/sys/fs/cgroup') {
+            unless (do_mount('/sys/fs/cgroup', $dest, '', MS_BIND, '')) {
+                warn "nacre: mount $type on $dest: $!\n";
+                return 0;
+            }
+
+            # Apply the same mount flags (e.g. ro, nosuid) via remount
+            if ($mount_flags & ~MS_BIND) {
+                do_mount('', $dest, '', MS_REMOUNT | MS_BIND | $mount_flags, '');
+            }
+        } else {
+            warn "nacre: mount $type on $dest: $!\n";
+            return 0;
+        }
+    }
+    log_debug("mounted $type on $dest ok, isdir=" . (-d $dest ? "yes" : "no"));
+
+    # Now apply propagation flags if any
+    if ($prop_flags & $prop_mask) {
+        do_mount('', $dest, '', $prop_flags, '')
+            or warn "nacre: mount propagation $dest: $!\n";
+    }
+
+    return 1;
+}
+
+## Apply recursive mount attributes via mount_setattr().
+sub _apply_recursive_attrs ($dest, $recursive_attrs_ref) {
+    my ($attr_set, $attr_clr) = (0, 0);
+    for my $ra (@{$recursive_attrs_ref}) {
+        my $def = $RECURSIVE_MOUNT_ATTRS{$ra};
+        if (exists $def->{atime} && $def->{atime}) {
+
+            # Atime setting: clear all atime bits first, then set
+            $attr_clr |= MOUNT_ATTR__ATIME;
+            $attr_set = ($attr_set & ~MOUNT_ATTR__ATIME) | $def->{set};
+        } elsif (exists $def->{atime} && !$def->{atime}) {
+
+            # Reset to relatime (clear atime flags)
+            $attr_clr |= MOUNT_ATTR__ATIME;
+        } else {
+            $attr_set |= $def->{set};
+            $attr_clr |= $def->{clear};
+        }
+    }
+    if ($attr_set || $attr_clr) {
+        do_mount_setattr(-1, $dest, AT_RECURSIVE, $attr_set, $attr_clr)
+            or warn "nacre: mount_setattr $dest: $!\n";
+    }
+    return;
+}
+
+## Apply idmap or ridmap via open_tree + mount_setattr + move_mount.
+sub _apply_idmap ($m, $dest, $flags, $has_idmap, $has_ridmap, $mount_source_fds, $chan_w, $chan_r) {
+    my $open_flags = OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC;
+    $open_flags |= AT_RECURSIVE if ($flags & MS_REC);
+    my $tree_fd = do_open_tree(-1, $dest, $open_flags);
+    fatal("open_tree $dest: $!") if $tree_fd < 0;
+
+    # Determine the user namespace fd for the mapping
+    my $userns_fd;
+    my $per_mount_maps = $m->{uidMappings} || $m->{gidMappings};
+    my $delegate_to_parent = 0;
+    if ($per_mount_maps) {
+
+        # Per-mount explicit mappings: create a user namespace
+        # with those mappings.  This may fail inside a container
+        # userns (writing /proc/$child/setgroups from a non-init
+        # userns is denied) -- fall back to parent in that case.
+        my $userns_err;
+        try {
+            $userns_fd = _create_userns_for_idmap($m->{uidMappings} // [], $m->{gidMappings} // [], $chan_w, $chan_r,);
+        } catch ($e) {
+            $userns_err = $e;
+        }
+        if ($userns_err || !defined $userns_fd || $userns_fd < 0) {
+            $delegate_to_parent = 1 if $chan_w;
+            fatal("create userns for idmap: $userns_err") unless $delegate_to_parent;
+        }
+    } else {
+
+        # Implied mapping: use the container's own user namespace.
+        # If we're inside a userns, /proc/self/ns/user is our userns.
+        sysopen(my $ns_fh, '/proc/self/ns/user', O_RDONLY)
+            or fatal("open /proc/self/ns/user: $!");
+        $userns_fd = fileno($ns_fh);
+
+        # Keep the fh alive
+        push @{$mount_source_fds->{_fhs}}, $ns_fh;
+    }
+
+    if ($delegate_to_parent) {
+
+        # Delegate entire idmap operation (userns creation +
+        # mount_setattr) to the parent, which is outside the
+        # container userns and can write /proc mappings.
+        channel_send(
+            $chan_w,
+            {
+                type => 'mount_fd_request',
+                ridmap => $has_ridmap ? 1 : 0,
+                uid_map => _build_map_string($m->{uidMappings}),
+                gid_map => _build_map_string($m->{gidMappings}),
+                implied => 0,
+            }
+        );
+        send_fd_over_fd($chan_w, $tree_fd);
+        my $resp = channel_recv($chan_r);
+        fatal("mount_setattr idmap failed") unless $resp && $resp->{type} eq 'mount_fd_done';
+    } else {
+
+        # Apply mount_setattr(MOUNT_ATTR_IDMAP)
+        my $setattr_flags = AT_EMPTY_PATH;
+        $setattr_flags |= AT_RECURSIVE if $has_ridmap;
+        my $ok = do_mount_setattr($tree_fd, "", $setattr_flags, MOUNT_ATTR_IDMAP, 0, $userns_fd);
+        if (!$ok) {
+
+            # If init can't do it (in userns), ask parent
+            if ($chan_w && $! == EPERM) {
+                channel_send(
+                    $chan_w,
+                    {
+                        type => 'mount_fd_request',
+                        ridmap => $has_ridmap ? 1 : 0,
+                        uid_map => _build_map_string($m->{uidMappings}),
+                        gid_map => _build_map_string($m->{gidMappings}),
+                        implied => $per_mount_maps ? 0 : 1,
+                    }
+                );
+                send_fd_over_fd($chan_w, $tree_fd);
+                my $resp = channel_recv($chan_r);
+                fatal("mount_setattr idmap failed") unless $resp && $resp->{type} eq 'mount_fd_done';
+            } else {
+                POSIX::close($tree_fd);
+                fatal("mount_setattr MOUNT_ATTR_IDMAP $dest: $!");
+            }
+        }
+    }
+
+    # Replace original mount with the idmapped one
+    do_umount($dest, MNT_DETACH);
+    do_move_mount($tree_fd, "", -1, $dest, MOVE_MOUNT_F_EMPTY_PATH)
+        or fatal("move_mount $dest: $!");
+    POSIX::close($tree_fd);
+    return;
+}
+
+## Process and apply a single OCI mount entry.
+sub _apply_single_mount ($m, $rootfs, $mount_source_fds, $chan_w, $chan_r, $dest_preexisted_ref, $dev_needs_ro_ref) {
+    my $mount_src = $m->{source} // '';
+
+    my ($dest, $type) = _resolve_mount_dest($m, $rootfs);
+
+    log_debug("apply_mounts: processing $m->{destination} type=$type dest=$dest");
+
+    _create_mountpoint($dest, $m, $dest_preexisted_ref);
+
+    my ($flags, $data, $src, $tmpcopyup, $has_idmap, $has_ridmap, $recursive_attrs, $dev_ro_deferred)
+        = _determine_mount_flags($m, $type, $dest, $dest_preexisted_ref);
+
+    ${$dev_needs_ro_ref} = 1 if $dev_ro_deferred;
+
+    # tmpcopyup: bind-mount dest to a temp location, mount tmpfs,
+    # then copy content from the temp back into the tmpfs.
+    my $tmpcopy_src;
+    if ($tmpcopyup && -d $dest) {
+        $tmpcopy_src = "$dest.tmpcopyup.$$";
+        mkdir $tmpcopy_src, 0755;
+        do_mount($dest, $tmpcopy_src, '', MS_BIND, '');
+    }
+
+    # Apply the mount (bind vs non-bind)
+    my $ok;
+    if ($flags & MS_BIND) {
+        $ok = _apply_bind_mount($src, $dest, $flags, $mount_src, $mount_source_fds, $chan_w, $chan_r);
+    } else {
+        $ok = _apply_fs_mount($src, $dest, $type, $flags, $data);
+    }
+
+    if (!$ok) {
+        return;
+    }
+
+    # Apply recursive mount attributes via mount_setattr()
+    if (@{$recursive_attrs}) {
+        _apply_recursive_attrs($dest, $recursive_attrs);
+    }
+
+    # Apply idmap/ridmap via open_tree + mount_setattr + move_mount
+    if ($has_idmap || $has_ridmap) {
+        _apply_idmap($m, $dest, $flags, $has_idmap, $has_ridmap, $mount_source_fds, $chan_w, $chan_r);
+    }
+
+    # Restore tmpcopyup content
+    if ($tmpcopy_src && -d $tmpcopy_src) {
+        _copy_dir_contents($tmpcopy_src, $dest);
+
+        # Unmount and remove the temporary bind mount
+        do_umount($tmpcopy_src, 0);
+        rmdir $tmpcopy_src;
+    }
+    return;
+}
+
 sub apply_mounts ($spec, $rootfs, $mount_source_fds, $chan_w, $chan_r) {
     $mount_source_fds //= {};
     log_debug("applying mounts, rootfs=$rootfs");
@@ -463,350 +880,7 @@ sub apply_mounts ($spec, $rootfs, $mount_source_fds, $chan_w, $chan_r) {
     my %dest_preexisted;
 
     for my $m (@{$spec->{mounts} // []}) {
-
-        # If the destination already starts with the rootfs path (e.g.
-        # container-relative bind mount sources use full paths), use it
-        # as-is to avoid doubling the prefix.
-        my $dest
-            = (index($m->{destination}, $rootfs) == 0)
-            ? $m->{destination}
-            : "$rootfs$m->{destination}";
-        my $mount_src = $m->{source} // '';
-        my $type = $m->{type} // '';
-
-        # Normalize cgroup mount type: runc's default spec uses "cgroup"
-        # for both v1 and v2.  On cgroup v2 systems, the kernel filesystem
-        # type is "cgroup2".
-        if ($type eq 'cgroup' && -f '/sys/fs/cgroup/cgroup.controllers') {
-            $type = 'cgroup2';
-        }
-
-        log_debug("apply_mounts: processing $m->{destination} type=$type dest=$dest");
-
-        # Security: /proc and /sys must not be symlinks (CVE-2023-27561 / CVE-2019-19921)
-        if ($type eq 'proc' || $type eq 'sysfs') {
-            if (-l $dest) {
-                fatal("$m->{destination} must be mounted on ordinary directory");
-            }
-        }
-
-        # Resolve symlinks in the destination path (within the rootfs).
-        # Mount destinations that go through symlinks (e.g. /etc/hosts →
-        # /tmp/hosts) must be resolved so the mount lands at the real path.
-        # The resolved target may not exist yet — that's fine, we create it.
-        {
-            my $container_dest = $m->{destination};
-            if (index($container_dest, $rootfs) == 0) {
-                $container_dest = substr($container_dest, length($rootfs));
-            }
-            my $resolved = _resolve_in_rootfs($rootfs, $container_dest);
-            if (defined $resolved && $resolved ne $dest) {
-                log_debug("  symlink resolved: $dest -> $resolved");
-                $dest = $resolved;
-            }
-        }
-
-        # For bind mounts of files, create a file mount point instead of dir
-        if ($mount_src ne '' && -f $mount_src && grep {$_ eq 'bind' || $_ eq 'rbind'} @{$m->{options} // []}) {
-            my $parent = dirname($dest);
-            ensure_dir($parent);
-            if (!-e $dest) {
-                if (open my $fh, '>', $dest) {
-                    close $fh;
-                }
-            }
-        } elsif ($mount_src ne '' && -d $mount_src && grep {$_ eq 'bind' || $_ eq 'rbind'} @{$m->{options} // []}) {
-
-            # Bind mount of a directory onto a symlink-resolved target:
-            # create the target as a directory.
-            ensure_dir($dest);
-            $dest_preexisted{$dest} = -d $dest;
-        } else {
-
-            # Track whether the directory existed before ensure_dir creates it.
-            # We only inherit tmpfs mode from pre-existing directories.
-            my $dest_preexisted = -d $dest;
-            ensure_dir($dest);
-            if (!-d $dest) {
-                warn "nacre: ensure_dir: $dest still not a dir after ensure_dir (exists="
-                    . (-e $dest ? "yes" : "no")
-                    . " uid=$< euid=$>)\n";
-            }
-            $dest_preexisted{$dest} = $dest_preexisted;
-        }
-
-        # Filter out OCI-specific pseudo-options and recursive mount attrs
-        my @raw_opts = @{$m->{options} // []};
-        my $tmpcopyup = 0;
-        my $has_idmap = 0;
-        my $has_ridmap = 0;
-        my @real_opts;
-        my @recursive_attrs;    # recursive mount_setattr options
-        for my $o (@raw_opts) {
-            if ($o eq 'tmpcopyup' || $o eq 'copy') {
-                $tmpcopyup = 1;
-            } elsif ($o eq 'idmap') {
-                $has_idmap = 1;
-            } elsif ($o eq 'ridmap') {
-                $has_ridmap = 1;
-            } elsif (exists $RECURSIVE_MOUNT_ATTRS{$o}) {
-                push @recursive_attrs, $o;
-            } else {
-                push @real_opts, $o;
-            }
-        }
-
-        # OCI spec: idmap mounts are also identified by per-mount
-        # uidMappings/gidMappings (not just the "idmap" option string).
-        if (!$has_idmap && !$has_ridmap && ($m->{uidMappings} || $m->{gidMappings})) {
-            $has_idmap = 1;
-        }
-        my ($flags, $data) = parse_mount_options(\@real_opts);
-        my $src = $m->{source} // $type;
-
-        # For /dev tmpfs mount, defer ro flag until after device creation
-        if ($m->{destination} eq '/dev' && $type eq 'tmpfs' && ($flags & MS_RDONLY)) {
-            $flags &= ~MS_RDONLY;
-            $dev_needs_ro = 1;
-        }
-
-        # tmpfs mode= inherit: if mounting tmpfs without explicit mode=
-        # in the options, inherit the existing directory's permissions.
-        # Only inherit from pre-existing directories — directories freshly
-        # created by ensure_dir have mode 0755 which is just the mkdir default,
-        # not a user intent.  Let the kernel use its tmpfs default (1777).
-        if ($type eq 'tmpfs' && $dest_preexisted{$dest} && $data !~ /\bmode=/) {
-            my @st = stat($dest);
-            if (@st) {
-                my $mode = sprintf('%o', $st[2] & 07777);
-                $data = $data ? "$data,mode=$mode" : "mode=$mode";
-            }
-        }
-
-        # tmpcopyup: bind-mount dest to a temp location, mount tmpfs,
-        # then copy content from the temp back into the tmpfs.
-        my $tmpcopy_src;
-        if ($tmpcopyup && -d $dest) {
-            $tmpcopy_src = "$dest.tmpcopyup.$$";
-            mkdir $tmpcopy_src, 0755;
-            do_mount($dest, $tmpcopy_src, '', MS_BIND, '');
-        }
-
-        if ($flags & MS_BIND) {
-
-            # Bind mount — if the source is inaccessible (e.g. after
-            # entering a user namespace), fall back to /proc/self/fd/N
-            # using a pre-opened fd.
-            my $mounted = do_mount($src, $dest, '', $flags, '');
-            if (!$mounted && defined $mount_source_fds->{$mount_src}) {
-                my $fd = $mount_source_fds->{$mount_src};
-                $mounted = do_mount("/proc/self/fd/$fd", $dest, '', $flags, '');
-            }
-
-            # If still not mounted and we have a parent channel, ask the
-            # parent to open the source fd inside our mount namespace
-            # (parent stays in init userns and has root access to
-            # inaccessible source directories).
-            if (!$mounted && $chan_w) {
-                eval {
-                    channel_send(
-                        $chan_w,
-                        {
-                            type => 'bind_source_request',
-                            source => $mount_src,
-                        }
-                    );
-                    my $resp = channel_recv($chan_r);
-                    if ($resp && $resp->{type} eq 'bind_source_done' && $resp->{ok}) {
-                        my $parent_fd = recv_fd_over_fd($chan_r);
-                        if ($parent_fd >= 0) {
-                            $mounted = do_mount("/proc/self/fd/$parent_fd", $dest, '', $flags, '');
-                            POSIX::close($parent_fd);
-                        }
-                    }
-                };
-            }
-            unless ($mounted) {
-                warn "nacre: mount bind $dest: $!\n";
-                next;
-            }
-
-            # Apply remaining flags via remount
-            if ($flags & ~(MS_BIND | MS_REC)) {
-                do_mount('', $dest, '', MS_REMOUNT | MS_BIND | ($flags & ~MS_REC), '')
-                    or warn "nacre: remount $dest: $!\n";
-            }
-        } else {
-
-            # Propagation flags (MS_PRIVATE, MS_SHARED, MS_SLAVE, MS_UNBINDABLE)
-            # cannot be combined with a filesystem mount in a single mount(2)
-            # call — split them off and apply after the mount.
-            my $prop_mask = MS_PRIVATE | MS_SHARED | MS_SLAVE | MS_UNBINDABLE;
-            my $prop_flags = $flags & ($prop_mask | MS_REC);
-            my $mount_flags = $flags & ~$prop_mask;
-
-            # If ONLY propagation flags + MS_REC were set, strip MS_REC from
-            # the mount call (it's for propagation, not the fs mount).
-            if ($prop_flags && !($mount_flags & ~MS_REC)) {
-                $mount_flags &= ~MS_REC;
-            }
-            unless (do_mount($src, $dest, $type, $mount_flags, $data)) {
-
-                # cgroup2 mount can fail in userns that doesn't own the
-                # cgroup namespace (EBUSY/EPERM).  Fall back to bind-mounting
-                # the host cgroup2 hierarchy, matching runc behaviour.
-                if ($type eq 'cgroup2' && -d '/sys/fs/cgroup') {
-                    unless (do_mount('/sys/fs/cgroup', $dest, '', MS_BIND, '')) {
-                        warn "nacre: mount $type on $dest: $!\n";
-                        next;
-                    }
-
-                    # Apply the same mount flags (e.g. ro, nosuid) via remount
-                    if ($mount_flags & ~MS_BIND) {
-                        do_mount('', $dest, '', MS_REMOUNT | MS_BIND | $mount_flags, '');
-                    }
-                } else {
-                    warn "nacre: mount $type on $dest: $!\n";
-                    next;
-                }
-            }
-            log_debug("mounted $type on $dest ok, isdir=" . (-d $dest ? "yes" : "no"));
-
-            # Now apply propagation flags if any
-            if ($prop_flags & $prop_mask) {
-                do_mount('', $dest, '', $prop_flags, '')
-                    or warn "nacre: mount propagation $dest: $!\n";
-            }
-        }
-
-        # Apply recursive mount attributes via mount_setattr()
-        if (@recursive_attrs) {
-            my ($attr_set, $attr_clr) = (0, 0);
-            for my $ra (@recursive_attrs) {
-                my $def = $RECURSIVE_MOUNT_ATTRS{$ra};
-                if (exists $def->{atime} && $def->{atime}) {
-
-                    # Atime setting: clear all atime bits first, then set
-                    $attr_clr |= MOUNT_ATTR__ATIME;
-                    $attr_set = ($attr_set & ~MOUNT_ATTR__ATIME) | $def->{set};
-                } elsif (exists $def->{atime} && !$def->{atime}) {
-
-                    # Reset to relatime (clear atime flags)
-                    $attr_clr |= MOUNT_ATTR__ATIME;
-                } else {
-                    $attr_set |= $def->{set};
-                    $attr_clr |= $def->{clear};
-                }
-            }
-            if ($attr_set || $attr_clr) {
-                do_mount_setattr(-1, $dest, AT_RECURSIVE, $attr_set, $attr_clr)
-                    or warn "nacre: mount_setattr $dest: $!\n";
-            }
-        }
-
-        # Apply idmap/ridmap via open_tree + mount_setattr + move_mount
-        if ($has_idmap || $has_ridmap) {
-            my $open_flags = OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC;
-            $open_flags |= AT_RECURSIVE if ($flags & MS_REC);
-            my $tree_fd = do_open_tree(-1, $dest, $open_flags);
-            fatal("open_tree $dest: $!") if $tree_fd < 0;
-
-            # Determine the user namespace fd for the mapping
-            my $userns_fd;
-            my $per_mount_maps = $m->{uidMappings} || $m->{gidMappings};
-            my $delegate_to_parent = 0;
-            if ($per_mount_maps) {
-
-                # Per-mount explicit mappings: create a user namespace
-                # with those mappings.  This may fail inside a container
-                # userns (writing /proc/$child/setgroups from a non-init
-                # userns is denied) — fall back to parent in that case.
-                my $userns_err;
-                try {
-                    $userns_fd
-                        = _create_userns_for_idmap($m->{uidMappings} // [], $m->{gidMappings} // [], $chan_w, $chan_r,);
-                } catch ($e) {
-                    $userns_err = $e;
-                }
-                if ($userns_err || !defined $userns_fd || $userns_fd < 0) {
-                    $delegate_to_parent = 1 if $chan_w;
-                    fatal("create userns for idmap: $userns_err") unless $delegate_to_parent;
-                }
-            } else {
-
-                # Implied mapping: use the container's own user namespace.
-                # If we're inside a userns, /proc/self/ns/user is our userns.
-                sysopen(my $ns_fh, '/proc/self/ns/user', O_RDONLY)
-                    or fatal("open /proc/self/ns/user: $!");
-                $userns_fd = fileno($ns_fh);
-
-                # Keep the fh alive
-                push @{$mount_source_fds->{_fhs}}, $ns_fh;
-            }
-
-            if ($delegate_to_parent) {
-
-                # Delegate entire idmap operation (userns creation +
-                # mount_setattr) to the parent, which is outside the
-                # container userns and can write /proc mappings.
-                channel_send(
-                    $chan_w,
-                    {
-                        type => 'mount_fd_request',
-                        ridmap => $has_ridmap ? 1 : 0,
-                        uid_map => _build_map_string($m->{uidMappings}),
-                        gid_map => _build_map_string($m->{gidMappings}),
-                        implied => 0,
-                    }
-                );
-                send_fd_over_fd($chan_w, $tree_fd);
-                my $resp = channel_recv($chan_r);
-                fatal("mount_setattr idmap failed") unless $resp && $resp->{type} eq 'mount_fd_done';
-            } else {
-
-                # Apply mount_setattr(MOUNT_ATTR_IDMAP)
-                my $setattr_flags = AT_EMPTY_PATH;
-                $setattr_flags |= AT_RECURSIVE if $has_ridmap;
-                my $ok = do_mount_setattr($tree_fd, "", $setattr_flags, MOUNT_ATTR_IDMAP, 0, $userns_fd);
-                if (!$ok) {
-
-                    # If init can't do it (in userns), ask parent
-                    if ($chan_w && $! == EPERM) {
-                        channel_send(
-                            $chan_w,
-                            {
-                                type => 'mount_fd_request',
-                                ridmap => $has_ridmap ? 1 : 0,
-                                uid_map => _build_map_string($m->{uidMappings}),
-                                gid_map => _build_map_string($m->{gidMappings}),
-                                implied => $per_mount_maps ? 0 : 1,
-                            }
-                        );
-                        send_fd_over_fd($chan_w, $tree_fd);
-                        my $resp = channel_recv($chan_r);
-                        fatal("mount_setattr idmap failed") unless $resp && $resp->{type} eq 'mount_fd_done';
-                    } else {
-                        POSIX::close($tree_fd);
-                        fatal("mount_setattr MOUNT_ATTR_IDMAP $dest: $!");
-                    }
-                }
-            }
-
-            # Replace original mount with the idmapped one
-            do_umount($dest, MNT_DETACH);
-            do_move_mount($tree_fd, "", -1, $dest, MOVE_MOUNT_F_EMPTY_PATH)
-                or fatal("move_mount $dest: $!");
-            POSIX::close($tree_fd);
-        }
-
-        # Restore tmpcopyup content
-        if ($tmpcopy_src && -d $tmpcopy_src) {
-            _copy_dir_contents($tmpcopy_src, $dest);
-
-            # Unmount and remove the temporary bind mount
-            do_umount($tmpcopy_src, 0);
-            rmdir $tmpcopy_src;
-        }
+        _apply_single_mount($m, $rootfs, $mount_source_fds, $chan_w, $chan_r, \%dest_preexisted, \$dev_needs_ro);
     }
 
     return $dev_needs_ro;

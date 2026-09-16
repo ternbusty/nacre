@@ -489,22 +489,23 @@ sub apply_final_cpu_affinity ($final_str) {
 # Exec Capabilities (--cap flag)
 # ═══════════════════════════════════════════════════════════════════════
 
+sub _cap_bitmask ($cap_hash) {
+    my ($lo, $hi) = (0, 0);
+    for my $name (keys %$cap_hash) {
+        my $n = $CAP_NUM{$name} // next;
+        if ($n < 32) {$lo |= (1 << $n);}
+        else {$hi |= (1 << ($n - 32));}
+    }
+    return ($lo, $hi);
+}
+
 sub apply_exec_caps ($cap_list, $spec) {
-
-    # Apply capabilities for exec'd processes.
-    # Always applies the container's capability config from the spec.
-    # If $cap_list has entries (from --cap), those are added to
-    # bounding+permitted+effective (runc semantics).
-
     my $spec_caps = $spec->{process}{capabilities};
-
-    # If no capabilities in spec and no --cap additions, nothing to do
     return unless $spec_caps || ($cap_list && @$cap_list);
     $spec_caps //= {};
 
     my $has_inheritable = $spec_caps->{inheritable} && @{$spec_caps->{inheritable}};
 
-    # Build the full capability sets from spec + additions
     my %bnd_caps = map {$_ => 1} @{$spec_caps->{bounding} // []};
     my %prm_caps = map {$_ => 1} @{$spec_caps->{permitted} // []};
     my %eff_caps = map {$_ => 1} @{$spec_caps->{effective} // []};
@@ -519,59 +520,28 @@ sub apply_exec_caps ($cap_list, $spec) {
         $bnd_caps{$name} = 1;
         $prm_caps{$name} = 1;
         $eff_caps{$name} = 1;
-        if ($has_inheritable) {
-            $amb_caps{$name} = 1;
-        }
+        $amb_caps{$name} = 1 if $has_inheritable;
     }
 
-    # Drop bounding set caps not in the desired set
     for my $name (@CAP_NAMES) {
         next if $bnd_caps{$name};
         my $num = $CAP_NUM{$name} // next;
         do_syscall(SYS_prctl, PR_CAPBSET_DROP, $num, 0, 0, 0);
     }
 
-    # Set KEEPCAPS across setuid
     do_syscall(SYS_prctl, PR_SET_KEEPCAPS, 1, 0, 0, 0);
 
-    # Build capset data
-    my ($eff_lo, $eff_hi) = (0, 0);
-    my ($prm_lo, $prm_hi) = (0, 0);
-    my ($inh_lo, $inh_hi) = (0, 0);
-
-    for my $name (keys %eff_caps) {
-        my $n = $CAP_NUM{$name} // next;
-        if ($n < 32) {$eff_lo |= (1 << $n);}
-        else {$eff_hi |= (1 << ($n - 32));}
-    }
-    for my $name (keys %prm_caps) {
-        my $n = $CAP_NUM{$name} // next;
-        if ($n < 32) {$prm_lo |= (1 << $n);}
-        else {$prm_hi |= (1 << ($n - 32));}
-    }
-    for my $name (keys %inh_caps) {
-        my $n = $CAP_NUM{$name} // next;
-        if ($n < 32) {$inh_lo |= (1 << $n);}
-        else {$inh_hi |= (1 << ($n - 32));}
-    }
-
-    # Ambient caps require the cap in BOTH permitted AND inheritable sets.
-    # Merge ambient into inheritable (same as runc's ApplyCaps).
-    for my $name (keys %amb_caps) {
-        my $n = $CAP_NUM{$name} // next;
-        if ($n < 32) {$inh_lo |= (1 << $n);}
-        else {$inh_hi |= (1 << ($n - 32));}
-    }
+    my ($eff_lo, $eff_hi) = _cap_bitmask(\%eff_caps);
+    my ($prm_lo, $prm_hi) = _cap_bitmask(\%prm_caps);
+    my ($inh_lo, $inh_hi) = _cap_bitmask({%inh_caps, %amb_caps});
 
     my $hdr = pack('Ii', _LINUX_CAPABILITY_VERSION_3, 0);
     my $data = pack('III III', $eff_lo, $prm_lo, $inh_lo, $eff_hi, $prm_hi, $inh_hi);
     my $nr_capset = SYS_capset + 0;
     syscall($nr_capset, $hdr, $data);
 
-    # Clear keepcaps
     do_syscall(SYS_prctl, PR_SET_KEEPCAPS, 0, 0, 0, 0);
 
-    # Raise ambient capabilities
     for my $name (keys %amb_caps) {
         my $n = $CAP_NUM{$name} // next;
         do_syscall(SYS_prctl, PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, $n, 0, 0);

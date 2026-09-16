@@ -1200,6 +1200,30 @@ sub cmd_state (%p) {
 # Container Lifecycle: kill
 # ═══════════════════════════════════════════════════════════════════════
 
+sub _validate_kill_state ($state, $signum, $all) {
+
+    # When --all/-a is used, silently succeed even if the container is not
+    # running (runc compat: -a is the obsoleted "all processes" flag).
+    return 1 if $all;
+
+    my $can_cg_kill = $signum && $signum == 9 && $state->{cgroupPath};
+
+    if ($state->{status} eq 'stopped') {
+
+        # In host PID namespace scenarios, the init may be gone but
+        # exec'd processes remain alive in the cgroup.  Allow SIGKILL
+        # to reach them via cgroup.kill.
+        fatal("container not running") unless $can_cg_kill;
+        my @pids = cgroup_pids($state->{cgroupPath});
+        fatal("container not running") unless @pids;
+    } else {
+
+        # For other states (paused, etc.): allow SIGKILL via cgroup.kill
+        fatal("container not running") unless $can_cg_kill;
+    }
+    return;
+}
+
 sub cmd_kill (%p) {
     my $id = $p{id} // fatal("container id required");
     my $root = $p{root} // $DEFAULT_ROOT;
@@ -1207,34 +1231,12 @@ sub cmd_kill (%p) {
     my $all = $p{all} // 0;
 
     my $state = load_state($root, $id);
-
-    # When --all/-a is used, silently succeed even if the container is not
-    # running (runc compat: -a is the obsoleted "all processes" flag).
-    if ($state->{status} ne 'running' && $state->{status} ne 'created') {
-        return if $all;
-
-        my $signum_check = _parse_signal($signal);
-
-        if ($state->{status} eq 'stopped') {
-
-            # In host PID namespace scenarios, the init may be gone but
-            # exec'd processes remain alive in the cgroup.  Allow SIGKILL
-            # to reach them via cgroup.kill.
-            unless ($signum_check && $signum_check == 9 && $state->{cgroupPath}) {
-                fatal("container not running");
-            }
-            my @pids = cgroup_pids($state->{cgroupPath});
-            fatal("container not running") unless @pids;
-        } else {
-
-            # For other states (paused, etc.): allow SIGKILL via cgroup.kill
-            unless ($signum_check && $signum_check == 9 && $state->{cgroupPath}) {
-                fatal("container not running");
-            }
-        }
-    }
-
     my $signum = _parse_signal($signal) // fatal("unknown signal: $signal");
+
+    if ($state->{status} ne 'running' && $state->{status} ne 'created') {
+        _validate_kill_state($state, $signum, $all);
+        return if $all;
+    }
 
     # For SIGKILL: use cgroup.kill (cgroup v2) to atomically kill all
     # processes in the container.  This is essential when the container
@@ -1412,7 +1414,7 @@ sub cmd_run (%p) {
         my $done = 0;
         $exit_code = 0;
         local $SIG{CHLD} = sub {
-            local $? = undef;
+            local $? = 0;
             while ((my $w = waitpid(-1, WNOHANG)) > 0) {
                 if ($w == $init_pid) {
                     $exit_code = wait_exit_code();
@@ -1664,7 +1666,7 @@ sub exec_tty_relay ($child_pid, $master_fd, $err_r_fd) {
     my $child_exited = 0;
     my $exit_status = 0;
     local $SIG{CHLD} = sub {
-        local $? = undef;
+        local $? = 0;
         my $ret = waitpid($child_pid, WNOHANG);
         if ($ret > 0) {
             $exit_status = wait_exit_code();
@@ -2566,6 +2568,80 @@ sub cmd_exec (%p) {
 }
 
 # ═══════════════════════════════════════════════════════════════════════
+# Container: update (resource limits) — helpers
+# ═══════════════════════════════════════════════════════════════════════
+
+sub _update_pids_resources (%p) {
+    return unless defined $p{pids_limit};
+    my $v = $p{pids_limit};
+    return {limit => ($v == -1) ? 'max' : $v};
+}
+
+sub _update_cpu_resources (%p) {
+    my %cpu;
+    $cpu{shares} = $p{cpu_share} if defined $p{cpu_share};
+    $cpu{quota} = ($p{cpu_quota} == -1 ? 'max' : $p{cpu_quota}) if defined $p{cpu_quota};
+    $cpu{period} = $p{cpu_period} if defined $p{cpu_period};
+    $cpu{burst} = $p{cpu_burst} if defined $p{cpu_burst};
+    if (defined $p{cpu_idle}) {
+        fatal("invalid cpu-idle value: $p{cpu_idle} (must be 0 or 1)")
+            unless $p{cpu_idle} == 0 || $p{cpu_idle} == 1;
+        $cpu{idle} = $p{cpu_idle};
+    }
+    $cpu{cpus} = $p{cpuset_cpus} if defined $p{cpuset_cpus};
+    $cpu{mems} = $p{cpuset_mems} if defined $p{cpuset_mems};
+    return %cpu ? \%cpu : undef;
+}
+
+sub _update_memory_resources (%p) {
+    my %mem;
+    if (defined $p{memory}) {
+        my $v = parse_size($p{memory});
+        $mem{limit} = ($v == -1) ? 'max' : $v;
+    }
+    if (defined $p{memory_swap}) {
+        my $v = parse_size($p{memory_swap});
+        $mem{swap} = ($v == -1) ? 'max' : $v;
+    }
+
+    # cgroup v2 compat: when memory is set to unlimited and swap is
+    # not explicitly specified, also set swap to unlimited (matching
+    # runc's ConvertMemorySwapToCgroupV2Value behaviour).
+    if (defined $mem{limit} && $mem{limit} eq 'max' && !defined $mem{swap}) {
+        $mem{swap} = 'max';
+    }
+    if (defined $p{memory_reservation}) {
+        my $v = parse_size($p{memory_reservation});
+        $mem{reservation} = ($v == -1) ? 'max' : $v;
+    }
+    return %mem ? \%mem : undef;
+}
+
+sub _check_memory_before_update ($cgpath, $mem) {
+    return unless $mem && $mem->{checkBeforeUpdate};
+    my $limit = $mem->{limit};
+    my $swap = $mem->{swap};
+    if (defined $limit && $limit ne 'max') {
+        my $current = eval {cg_read($cgpath, 'memory.current')} // 0;
+        chomp $current;
+        $current += 0;
+        if ($current > 0 && $limit < $current) {
+            fatal("rejecting memory limit $limit (too low; current usage is $current)");
+        }
+    }
+    if (defined $swap && $swap ne 'max') {
+        my $swap_current = eval {cg_read($cgpath, 'memory.swap.current')} // 0;
+        chomp $swap_current;
+        $swap_current += 0;
+        if ($swap_current > 0 && $swap < $swap_current) {
+            fatal("rejecting memory+swap limit $swap (too low; current swap usage is $swap_current)");
+        }
+    }
+    delete $mem->{checkBeforeUpdate};
+    return;
+}
+
+# ═══════════════════════════════════════════════════════════════════════
 # Container: update (resource limits)
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -2606,68 +2682,15 @@ sub cmd_update (%p) {
 
         # Build resources from CLI flags
         $resources = {};
-        if (defined $p{pids_limit}) {
-            my $v = $p{pids_limit};
-            $resources->{pids} = {limit => ($v == -1) ? 'max' : $v};
-        }
-        my %cpu;
-        $cpu{shares} = $p{cpu_share} if defined $p{cpu_share};
-        $cpu{quota} = ($p{cpu_quota} == -1 ? 'max' : $p{cpu_quota}) if defined $p{cpu_quota};
-        $cpu{period} = $p{cpu_period} if defined $p{cpu_period};
-        $cpu{burst} = $p{cpu_burst} if defined $p{cpu_burst};
-        if (defined $p{cpu_idle}) {
-            fatal("invalid cpu-idle value: $p{cpu_idle} (must be 0 or 1)")
-                unless $p{cpu_idle} == 0 || $p{cpu_idle} == 1;
-            $cpu{idle} = $p{cpu_idle};
-        }
-        $cpu{cpus} = $p{cpuset_cpus} if defined $p{cpuset_cpus};
-        $cpu{mems} = $p{cpuset_mems} if defined $p{cpuset_mems};
-        $resources->{cpu} = \%cpu if %cpu;
-        my %mem;
-        if (defined $p{memory}) {
-            my $v = parse_size($p{memory});
-            $mem{limit} = ($v == -1) ? 'max' : $v;
-        }
-        if (defined $p{memory_swap}) {
-            my $v = parse_size($p{memory_swap});
-            $mem{swap} = ($v == -1) ? 'max' : $v;
-        }
-
-        # cgroup v2 compat: when memory is set to unlimited and swap is
-        # not explicitly specified, also set swap to unlimited (matching
-        # runc's ConvertMemorySwapToCgroupV2Value behaviour).
-        if (defined $mem{limit} && $mem{limit} eq 'max' && !defined $mem{swap}) {
-            $mem{swap} = 'max';
-        }
-        if (defined $p{memory_reservation}) {
-            my $v = parse_size($p{memory_reservation});
-            $mem{reservation} = ($v == -1) ? 'max' : $v;
-        }
-        $resources->{memory} = \%mem if %mem;
+        my $pids = _update_pids_resources(%p);
+        $resources->{pids} = $pids if $pids;
+        my $cpu = _update_cpu_resources(%p);
+        $resources->{cpu} = $cpu if $cpu;
+        my $mem = _update_memory_resources(%p);
+        $resources->{memory} = $mem if $mem;
     }
 
-    # checkBeforeUpdate: reject if the new limit is below current usage
-    if ($resources->{memory} && $resources->{memory}{checkBeforeUpdate}) {
-        my $limit = $resources->{memory}{limit};
-        my $swap = $resources->{memory}{swap};
-        if (defined $limit && $limit ne 'max') {
-            my $current = eval {cg_read($cgpath, 'memory.current')} // 0;
-            chomp $current;
-            $current += 0;
-            if ($current > 0 && $limit < $current) {
-                fatal("rejecting memory limit $limit (too low; current usage is $current)");
-            }
-        }
-        if (defined $swap && $swap ne 'max') {
-            my $swap_current = eval {cg_read($cgpath, 'memory.swap.current')} // 0;
-            chomp $swap_current;
-            $swap_current += 0;
-            if ($swap_current > 0 && $swap < $swap_current) {
-                fatal("rejecting memory+swap limit $swap (too low; current swap usage is $swap_current)");
-            }
-        }
-        delete $resources->{memory}{checkBeforeUpdate};
-    }
+    _check_memory_before_update($cgpath, $resources->{memory});
 
     # Build a fake spec with just the resources
     my $fake_spec = {linux => {resources => $resources}};
@@ -2677,6 +2700,76 @@ sub cmd_update (%p) {
     if ($resources->{devices}) {
         apply_device_cgroup($cgpath, $fake_spec);
     }
+    return;
+}
+
+# ─── helpers for cmd_events ──────────────────────────────────────────
+
+sub _collect_cgroup_stats ($cgpath) {
+    my %s;
+    $s{pids}{current} = scalar(cgroup_pids($cgpath));
+    my $pids_max = read_file("$cgpath/pids.max") // 'max';
+    chomp $pids_max;
+    $s{pids}{limit} = ($pids_max =~ /^\d+$/) ? int($pids_max) : 0;
+
+    my $mem_current = read_file("$cgpath/memory.current") // '0';
+    chomp $mem_current;
+    $s{memory}{usage} = ($mem_current =~ /^\d+$/) ? int($mem_current) : 0;
+    my $mem_max = read_file("$cgpath/memory.max") // 'max';
+    chomp $mem_max;
+    $s{memory}{limit} = ($mem_max =~ /^\d+$/) ? int($mem_max) : 0;
+
+    my $cpu_stat = read_file("$cgpath/cpu.stat") // '';
+    for my $line (split /\n/, $cpu_stat) {
+        my ($k, $v) = split /\s+/, $line;
+        $s{cpu}{$k} = int($v) if defined $v;
+    }
+
+    # OOM events
+    my $events = read_file("$cgpath/memory.events") // '';
+    for my $line (split /\n/, $events) {
+        my ($k, $v) = split /\s+/, $line;
+        $s{memory}{$k} = int($v) if defined $v;
+    }
+
+    # PSI (pressure stall information) - io, cpu, memory
+    # Nest under each controller as {psi: {some: ..., full: ...}}
+    # to match runc's JSON format (e.g. data.cpu.psi.some.avg10)
+    for my $psi_type (qw(cpu io memory)) {
+        my $psi_data = read_file("$cgpath/$psi_type.pressure");
+        if (defined $psi_data) {
+            my %psi;
+            for my $line (split /\n/, $psi_data) {
+
+                # Format: some avg10=0.00 avg60=0.00 avg300=0.00 total=0
+                #         full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+                if ($line =~ /^(some|full)\s+(.*)/) {
+                    my ($level, $rest) = ($1, $2);
+                    my %vals;
+                    while ($rest =~ /(\w+)=([0-9.]+)/g) {
+                        my ($k, $v) = ($1, $2);
+                        $vals{$k} = ($k eq 'total') ? int($v) : $v + 0.0;
+                    }
+                    $psi{$level} = \%vals;
+                }
+            }
+            $s{$psi_type}{psi} = \%psi if %psi;
+        }
+    }
+
+    return \%s;
+}
+
+sub _emit_event ($event_data, $format = undef) {
+
+    # Build JSON with runc-compatible field order (type, id, data)
+    my @parts;
+    push @parts, sprintf '"type":%s', $JSON_COMPACT->encode($event_data->{type});
+    push @parts, sprintf '"id":%s', $JSON_COMPACT->encode($event_data->{id});
+    if (exists $event_data->{data}) {
+        push @parts, sprintf '"data":%s', $JSON_COMPACT->encode($event_data->{data});
+    }
+    printf "{%s}\n", join(q{,}, @parts);
     return;
 }
 
@@ -2707,64 +2800,8 @@ sub cmd_events (%p) {
     my $state = load_state($root, $id);
     my $cgpath = $state->{cgroupPath} // fatal("no cgroup path");
 
-    my $print_stats = sub {
-        my %s;
-        $s{pids}{current} = scalar(cgroup_pids($cgpath));
-        my $pids_max = read_file("$cgpath/pids.max") // 'max';
-        chomp $pids_max;
-        $s{pids}{limit} = ($pids_max =~ /^\d+$/) ? int($pids_max) : 0;
-
-        my $mem_current = read_file("$cgpath/memory.current") // '0';
-        chomp $mem_current;
-        $s{memory}{usage} = ($mem_current =~ /^\d+$/) ? int($mem_current) : 0;
-        my $mem_max = read_file("$cgpath/memory.max") // 'max';
-        chomp $mem_max;
-        $s{memory}{limit} = ($mem_max =~ /^\d+$/) ? int($mem_max) : 0;
-
-        my $cpu_stat = read_file("$cgpath/cpu.stat") // '';
-        for my $line (split /\n/, $cpu_stat) {
-            my ($k, $v) = split /\s+/, $line;
-            $s{cpu}{$k} = int($v) if defined $v;
-        }
-
-        # OOM events
-        my $events = read_file("$cgpath/memory.events") // '';
-        for my $line (split /\n/, $events) {
-            my ($k, $v) = split /\s+/, $line;
-            $s{memory}{$k} = int($v) if defined $v;
-        }
-
-        # PSI (pressure stall information) - io, cpu, memory
-        # Nest under each controller as {psi: {some: ..., full: ...}}
-        # to match runc's JSON format (e.g. data.cpu.psi.some.avg10)
-        for my $psi_type (qw(cpu io memory)) {
-            my $psi_data = read_file("$cgpath/$psi_type.pressure");
-            if (defined $psi_data) {
-                my %psi;
-                for my $line (split /\n/, $psi_data) {
-
-                    # Format: some avg10=0.00 avg60=0.00 avg300=0.00 total=0
-                    #         full avg10=0.00 avg60=0.00 avg300=0.00 total=0
-                    if ($line =~ /^(some|full)\s+(.*)/) {
-                        my ($level, $rest) = ($1, $2);
-                        my %vals;
-                        while ($rest =~ /(\w+)=([0-9.]+)/g) {
-                            my ($k, $v) = ($1, $2);
-                            $vals{$k} = ($k eq 'total') ? int($v) : $v + 0.0;
-                        }
-                        $psi{$level} = \%vals;
-                    }
-                }
-                $s{$psi_type}{psi} = \%psi if %psi;
-            }
-        }
-
-        # Build JSON with runc-compatible field order (type, id, data)
-        printf qq({"type":"stats","id":%s,"data":%s}\n), $JSON_COMPACT->encode($id), $JSON_COMPACT->encode(\%s);
-    };
-
     if ($stats) {
-        $print_stats->();
+        _emit_event({type => 'stats', id => $id, data => _collect_cgroup_stats($cgpath)});
         return;
     }
 
@@ -2776,16 +2813,14 @@ sub cmd_events (%p) {
     }
 
     while (1) {
-        $print_stats->();
+        _emit_event({type => 'stats', id => $id, data => _collect_cgroup_stats($cgpath)});
 
         # Check for OOM events
         $mem_events = read_file("$cgpath/memory.events");
         if (defined $mem_events && $mem_events =~ /^oom\s+(\d+)/m) {
             my $oom_count = $1;
             if ($oom_count > $last_oom_count) {
-
-                # Emit OOM event (runc-compatible format)
-                printf qq({"type":"oom","id":%s}\n), $JSON_COMPACT->encode($id);
+                _emit_event({type => 'oom', id => $id});
                 $last_oom_count = $oom_count;
             }
         }
@@ -2904,6 +2939,200 @@ sub cmd_features {
 # CLI Argument Parsing and Dispatch
 # ═══════════════════════════════════════════════════════════════════════
 
+sub _dispatch_create ($root, @) {
+    my ($bundle, $pid_file, $console_socket, $no_pivot, $pidfd_socket);
+    GetOptions(
+        'bundle|b=s' => \$bundle,
+        'pid-file=s' => \$pid_file,
+        'console-socket=s' => \$console_socket,
+        'pidfd-socket=s' => \$pidfd_socket,
+        'no-pivot' => \$no_pivot,
+    );
+    my $id = shift @ARGV // fatal("container id required");
+    cmd_create(
+        id => $id,
+        bundle => $bundle,
+        root => $root,
+        pid_file => $pid_file,
+        console_socket => $console_socket,
+        pidfd_socket => $pidfd_socket,
+        no_pivot => $no_pivot,
+    );
+    return;
+}
+
+sub _dispatch_kill ($root, @) {
+    my $all = 0;
+    GetOptions('all|a' => \$all);
+    my $id = shift @ARGV // fatal("container id required");
+    my $signal = shift @ARGV // 'TERM';
+    cmd_kill(id => $id, root => $root, signal => $signal, all => $all);
+    return;
+}
+
+sub _dispatch_delete ($root, @) {
+    my $force = 0;
+    GetOptions('force|f' => \$force);
+    my $id = shift @ARGV // fatal("container id required");
+    cmd_delete(id => $id, root => $root, force => $force);
+    return;
+}
+
+sub _dispatch_run ($root, @) {
+    my ($bundle, $pid_file, $console_socket, $pidfd_socket, $no_pivot, $detach);
+    GetOptions(
+        'bundle|b=s' => \$bundle,
+        'pid-file=s' => \$pid_file,
+        'console-socket=s' => \$console_socket,
+        'pidfd-socket=s' => \$pidfd_socket,
+        'no-pivot' => \$no_pivot,
+        'detach|d' => \$detach,
+    );
+    my $id = shift @ARGV // fatal("container id required");
+    cmd_run(
+        id => $id,
+        bundle => $bundle,
+        root => $root,
+        pid_file => $pid_file,
+        console_socket => $console_socket,
+        pidfd_socket => $pidfd_socket,
+        detach => $detach,
+        no_pivot => $no_pivot,
+    );
+    return;
+}
+
+sub _dispatch_list ($root, $root_explicit) {
+    my ($format, $quiet);
+    GetOptions('format|f=s' => \$format, 'quiet|q' => \$quiet);
+    cmd_list(root => $root, format => $format, quiet => $quiet, root_explicit => $root_explicit);
+    return;
+}
+
+sub _dispatch_exec ($root, @) {
+    my (
+        $exec_cwd, @exec_env, $exec_user, $detach, $pid_file,
+        $console_socket, $pidfd_socket, $tty, $process_file, $ignore_paused,
+        $preserve_fds, @additional_gids, @cap_add, $exec_cgroup
+    );
+
+    my @before;
+    my @exec_cmd;
+    my $found_sep = 0;
+    for my $arg (@ARGV) {
+        if ($arg eq '--' && !$found_sep) {
+            $found_sep = 1;
+            next;
+        }
+        if ($found_sep) {push @exec_cmd, $arg;}
+        else {push @before, $arg;}
+    }
+    @ARGV = @before;
+
+    Getopt::Long::Configure('require_order');
+    GetOptions(
+        'cwd=s' => \$exec_cwd,
+        'env|e=s' => \@exec_env,
+        'user|u=s' => \$exec_user,
+        'detach|d' => \$detach,
+        'pid-file=s' => \$pid_file,
+        'console-socket=s' => \$console_socket,
+        'pidfd-socket=s' => \$pidfd_socket,
+        'tty|t' => \$tty,
+        'process|p=s' => \$process_file,
+        'ignore-paused' => \$ignore_paused,
+        'preserve-fds=i' => \$preserve_fds,
+        'additional-gids=i' => \@additional_gids,
+        'cap=s' => \@cap_add,
+        'cgroup=s' => \$exec_cgroup,
+    );
+    Getopt::Long::Configure('permute');
+    my $id = shift @ARGV // fatal("container id required");
+    @exec_cmd = @ARGV unless @exec_cmd;
+    cmd_exec(
+        id => $id,
+        root => $root,
+        command => \@exec_cmd,
+        cwd => $exec_cwd,
+        env => (@exec_env ? \@exec_env : undef),
+        user => $exec_user,
+        pid_file => $pid_file,
+        preserve_fds => ($preserve_fds // 0),
+        additional_gids => (@additional_gids ? \@additional_gids : undef),
+        ignore_paused => $ignore_paused,
+        process_file => $process_file,
+        tty => $tty,
+        detach => $detach,
+        console_socket => $console_socket,
+        pidfd_socket => $pidfd_socket,
+        exec_cgroup => $exec_cgroup,
+        cap => (@cap_add ? \@cap_add : undef),
+    );
+    return;
+}
+
+sub _dispatch_update ($root, @) {
+    my (
+        $resources, $pids_limit, $cpu_period, $cpu_quota, $cpu_share, $cpu_burst,
+        $memory, $memory_swap, $memory_reservation, $cpuset_cpus, $cpuset_mems, $cpu_idle
+    );
+    GetOptions(
+        'resources|r=s' => \$resources,
+        'pids-limit=i' => \$pids_limit,
+        'cpu-period=i' => \$cpu_period,
+        'cpu-quota=i' => \$cpu_quota,
+        'cpu-share=i' => \$cpu_share,
+        'cpu-burst=i' => \$cpu_burst,
+        'memory=s' => \$memory,
+        'memory-swap=s' => \$memory_swap,
+        'memory-reservation=s' => \$memory_reservation,
+        'cpuset-cpus=s' => \$cpuset_cpus,
+        'cpuset-mems=s' => \$cpuset_mems,
+        'cpu-idle=i' => \$cpu_idle,
+    );
+    my $id = shift @ARGV // fatal("container id required");
+    cmd_update(
+        id => $id,
+        root => $root,
+        resources => $resources,
+        pids_limit => $pids_limit,
+        cpu_period => $cpu_period,
+        cpu_quota => $cpu_quota,
+        cpu_share => $cpu_share,
+        cpu_burst => $cpu_burst,
+        memory => $memory,
+        memory_swap => $memory_swap,
+        memory_reservation => $memory_reservation,
+        cpuset_cpus => $cpuset_cpus,
+        cpuset_mems => $cpuset_mems,
+        cpu_idle => $cpu_idle,
+    );
+    return;
+}
+
+sub _dispatch_events ($root, @) {
+    my ($interval, $stats);
+    GetOptions('interval|i=s' => \$interval, 'stats' => \$stats);
+    my $id = shift @ARGV // fatal("container id required");
+    cmd_events(id => $id, root => $root, interval => $interval, stats => $stats);
+    return;
+}
+
+sub _dispatch_ps ($root, @) {
+    my $format;
+    GetOptions('format|f=s' => \$format);
+    my $id = shift @ARGV // fatal("container id required");
+    cmd_ps(id => $id, root => $root, format => $format, ps_args => \@ARGV);
+    return;
+}
+
+sub _dispatch_spec ($, @) {
+    my ($bundle, $force);
+    GetOptions('bundle|b=s' => \$bundle, 'force' => \$force);
+    cmd_spec(bundle => $bundle, force => $force);
+    return;
+}
+
 sub main {
     my $root = $DEFAULT_ROOT;
     my $root_explicit = 0;
@@ -2933,15 +3162,29 @@ sub main {
 
     log_debug("nacre starting, command=$command root=$root");
 
-    # Handle `<command> -h` / `<command> --help` for known subcommands (runc compat)
-    my %_known_cmds = map {$_ => 1} qw(
-        create run start delete kill state list ps events pause resume
-        update exec spec version checkpoint restore features
+    my %known_cmds = map {$_ => 1} qw(version checkpoint restore);
+    my %dispatch = (
+        create => \&_dispatch_create,
+        start => sub {cmd_start(id => (shift @ARGV // fatal("container id required")), root => $root)},
+        state => sub {cmd_state(id => (shift @ARGV // fatal("container id required")), root => $root)},
+        kill => \&_dispatch_kill,
+        delete => \&_dispatch_delete,
+        run => \&_dispatch_run,
+        list => \&_dispatch_list,
+        pause => sub {cmd_pause(id => (shift @ARGV // fatal("container id required")), root => $root)},
+        resume => sub {cmd_resume(id => (shift @ARGV // fatal("container id required")), root => $root)},
+        exec => \&_dispatch_exec,
+        update => \&_dispatch_update,
+        events => \&_dispatch_events,
+        ps => \&_dispatch_ps,
+        spec => \&_dispatch_spec,
+        features => \&cmd_features,
     );
+
     if (   $command !~ /^-/
         && $command ne 'help'
         && grep {$_ eq '-h' || $_ eq '--help'} @ARGV) {
-        if ($_known_cmds{$command}) {
+        if ($dispatch{$command} || $known_cmds{$command}) {
             print "NAME:\n   runc $command\n\nUSAGE:\n   runc $command [options]\n";
             exit(0);
         } else {
@@ -2950,218 +3193,17 @@ sub main {
         }
     }
 
-    if ($command eq 'create') {
-        my ($bundle, $pid_file, $console_socket, $no_pivot, $pidfd_socket);
-        GetOptions(
-            'bundle|b=s' => \$bundle,
-            'pid-file=s' => \$pid_file,
-            'console-socket=s' => \$console_socket,
-            'pidfd-socket=s' => \$pidfd_socket,
-            'no-pivot' => \$no_pivot,
-        );
-        my $id = shift @ARGV // fatal("container id required");
-        cmd_create(
-            id => $id,
-            bundle => $bundle,
-            root => $root,
-            pid_file => $pid_file,
-            console_socket => $console_socket,
-            pidfd_socket => $pidfd_socket,
-            no_pivot => $no_pivot
-        );
-    } elsif ($command eq 'start') {
-        my $id = shift @ARGV // fatal("container id required");
-        cmd_start(id => $id, root => $root);
-    } elsif ($command eq 'state') {
-        my $id = shift @ARGV // fatal("container id required");
-        cmd_state(id => $id, root => $root);
-    } elsif ($command eq 'kill') {
-        my $all = 0;
-        GetOptions('all|a' => \$all);
-        my $id = shift @ARGV // fatal("container id required");
-        my $signal = shift @ARGV // 'TERM';
-        cmd_kill(id => $id, root => $root, signal => $signal, all => $all);
-    } elsif ($command eq 'delete') {
-        my $force = 0;
-        GetOptions('force|f' => \$force);
-        my $id = shift @ARGV // fatal("container id required");
-        cmd_delete(id => $id, root => $root, force => $force);
-    } elsif ($command eq 'run') {
-        my ($bundle, $pid_file, $console_socket, $pidfd_socket, $no_pivot, $detach);
-        GetOptions(
-            'bundle|b=s' => \$bundle,
-            'pid-file=s' => \$pid_file,
-            'console-socket=s' => \$console_socket,
-            'pidfd-socket=s' => \$pidfd_socket,
-            'no-pivot' => \$no_pivot,
-            'detach|d' => \$detach,
-        );
-        my $id = shift @ARGV // fatal("container id required");
-        cmd_run(
-            id => $id,
-            bundle => $bundle,
-            root => $root,
-            pid_file => $pid_file,
-            console_socket => $console_socket,
-            pidfd_socket => $pidfd_socket,
-            detach => $detach,
-            no_pivot => $no_pivot
-        );
-    } elsif ($command eq 'list') {
-        my ($format, $quiet);
-        GetOptions(
-            'format|f=s' => \$format,
-            'quiet|q' => \$quiet,
-        );
-        cmd_list(
-            root => $root,
-            format => $format,
-            quiet => $quiet,
-            root_explicit => $root_explicit
-        );
-    } elsif ($command eq 'pause') {
-        my $id = shift @ARGV // fatal("container id required");
-        cmd_pause(id => $id, root => $root);
-    } elsif ($command eq 'resume') {
-        my $id = shift @ARGV // fatal("container id required");
-        cmd_resume(id => $id, root => $root);
-    } elsif ($command eq 'exec') {
-        my (
-            $exec_cwd, @exec_env, $exec_user, $detach, $pid_file,
-            $console_socket, $pidfd_socket, $tty, $process_file, $ignore_paused,
-            $preserve_fds, @additional_gids, @cap_add, $exec_cgroup
-        );
-
-        # Separate exec args: everything after "--" or after container id
-        my @before;
-        my @exec_cmd;
-        my $found_sep = 0;
-        for my $arg (@ARGV) {
-            if ($arg eq '--' && !$found_sep) {
-                $found_sep = 1;
-                next;
-            }
-            if ($found_sep) {
-                push @exec_cmd, $arg;
-            } else {
-                push @before, $arg;
-            }
-        }
-        @ARGV = @before;
-
-        # Stop option parsing at the first non-option (the container id)
-        # so that command flags (e.g. chrt -p 1) are not consumed as
-        # nacre exec flags.
-        Getopt::Long::Configure('require_order');
-        GetOptions(
-            'cwd=s' => \$exec_cwd,
-            'env|e=s' => \@exec_env,
-            'user|u=s' => \$exec_user,
-            'detach|d' => \$detach,
-            'pid-file=s' => \$pid_file,
-            'console-socket=s' => \$console_socket,
-            'pidfd-socket=s' => \$pidfd_socket,
-            'tty|t' => \$tty,
-            'process|p=s' => \$process_file,
-            'ignore-paused' => \$ignore_paused,
-            'preserve-fds=i' => \$preserve_fds,
-            'additional-gids=i' => \@additional_gids,
-            'cap=s' => \@cap_add,
-            'cgroup=s' => \$exec_cgroup,
-        );
-        Getopt::Long::Configure('permute');
-        my $id = shift @ARGV // fatal("container id required");
-        @exec_cmd = @ARGV unless @exec_cmd;
-        cmd_exec(
-            id => $id,
-            root => $root,
-            command => \@exec_cmd,
-            cwd => $exec_cwd,
-            env => (@exec_env ? \@exec_env : undef),
-            user => $exec_user,
-            pid_file => $pid_file,
-            preserve_fds => ($preserve_fds // 0),
-            additional_gids => (@additional_gids ? \@additional_gids : undef),
-            ignore_paused => $ignore_paused,
-            process_file => $process_file,
-            tty => $tty,
-            detach => $detach,
-            console_socket => $console_socket,
-            pidfd_socket => $pidfd_socket,
-            exec_cgroup => $exec_cgroup,
-            cap => (@cap_add ? \@cap_add : undef)
-        );
-    } elsif ($command eq 'update') {
-        my (
-            $resources, $pids_limit, $cpu_period, $cpu_quota, $cpu_share, $cpu_burst,
-            $memory, $memory_swap, $memory_reservation, $cpuset_cpus, $cpuset_mems, $cpu_idle
-        );
-        GetOptions(
-            'resources|r=s' => \$resources,
-            'pids-limit=i' => \$pids_limit,
-            'cpu-period=i' => \$cpu_period,
-            'cpu-quota=i' => \$cpu_quota,
-            'cpu-share=i' => \$cpu_share,
-            'cpu-burst=i' => \$cpu_burst,
-            'memory=s' => \$memory,
-            'memory-swap=s' => \$memory_swap,
-            'memory-reservation=s' => \$memory_reservation,
-            'cpuset-cpus=s' => \$cpuset_cpus,
-            'cpuset-mems=s' => \$cpuset_mems,
-            'cpu-idle=i' => \$cpu_idle,
-        );
-        my $id = shift @ARGV // fatal("container id required");
-        cmd_update(
-            id => $id,
-            root => $root,
-            resources => $resources,
-            pids_limit => $pids_limit,
-            cpu_period => $cpu_period,
-            cpu_quota => $cpu_quota,
-            cpu_share => $cpu_share,
-            cpu_burst => $cpu_burst,
-            memory => $memory,
-            memory_swap => $memory_swap,
-            memory_reservation => $memory_reservation,
-            cpuset_cpus => $cpuset_cpus,
-            cpuset_mems => $cpuset_mems,
-            cpu_idle => $cpu_idle
-        );
-    } elsif ($command eq 'events') {
-        my ($interval, $stats);
-        GetOptions(
-            'interval|i=s' => \$interval,
-            'stats' => \$stats,
-        );
-        my $id = shift @ARGV // fatal("container id required");
-        cmd_events(id => $id, root => $root, interval => $interval, stats => $stats);
-    } elsif ($command eq 'ps') {
-        my $format;
-        GetOptions('format|f=s' => \$format);
-        my $id = shift @ARGV // fatal("container id required");
-        cmd_ps(id => $id, root => $root, format => $format, ps_args => \@ARGV);
-    } elsif ($command eq 'spec') {
-        my ($bundle, $force);
-        GetOptions(
-            'bundle|b=s' => \$bundle,
-            'force' => \$force,
-        );
-        cmd_spec(bundle => $bundle, force => $force);
-    } elsif ($command eq 'features') {
-        cmd_features();
-    } elsif ($command eq '--help' || $command eq '-h' || $command eq 'help') {
+    if ($command eq '--help' || $command eq '-h' || $command eq 'help') {
         usage();
     } elsif ($command eq '--version' || $command eq '-v' || $command eq 'version') {
         use Config;
-
-        # runc-compatible format for interoperability
         print "runc version 1.2.0-nacre\n";
         print "commit: nacre-0.5.1\n";
         print "spec: 1.2.0\n";
         print "go: n/a (perl $Config{archname})\n";
+    } elsif (my $handler = $dispatch{$command}) {
+        $handler->($root, $root_explicit);
     } else {
-
-        # runc compat: unknown command with -h prints "No help topic"
         if (@ARGV && ($ARGV[0] eq '-h' || $ARGV[0] eq '--help')) {
             print STDERR "No help topic for '$command'\n";
             exit(1);

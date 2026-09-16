@@ -622,6 +622,34 @@ use constant {
     _AUDIT_ARCH_AARCH64 => 0xc00000b7,
 };
 
+sub _emit_bpf_cond ($body, $c, $is_last, $gp, $arg_off) {
+    my $op = $c->{op} // 'SCMP_CMP_EQ';
+    my $val = $c->{value} // 0;
+    my $val2 = $c->{valueTwo} // 0;
+
+    if ($op eq 'SCMP_CMP_MASKED_EQ') {
+        push @$body, {code => _BPF_ALU_AND_K, k => $val, jt => 0, jf => 0};
+        if ($is_last) {
+            push @$body, {code => _BPF_JMP_JEQ_K, k => $val2, jt => 'pass', jf => 'fail'};
+        } else {
+            push @$body, {code => _BPF_JMP_JEQ_K, k => $val2, jt => $gp, jf => 'next'};
+            push @$body, {code => _BPF_LD_W_ABS, k => $arg_off, jt => 0, jf => 0};
+        }
+    } else {
+        my ($opcode, $swap) = _seccomp_cmp_opcode($op);
+        my ($jt_sym, $jf_sym);
+        if ($is_last) {
+            $jt_sym = $swap ? 'fail' : 'pass';
+            $jf_sym = $swap ? 'pass' : 'fail';
+        } else {
+            $jt_sym = $swap ? 'next' : $gp;
+            $jf_sym = $swap ? $gp : 'next';
+        }
+        push @$body, {code => $opcode, k => $val, jt => $jt_sym, jf => $jf_sym};
+    }
+    return;
+}
+
 sub _gen_seccomp_rule_bpf ($nr, $ret, $args) {
 
     unless (@$args) {
@@ -642,36 +670,10 @@ sub _gen_seccomp_rule_bpf ($nr, $ret, $args) {
         my $gp = "gp:$gi";
 
         $group_starts[$gi] = scalar @body;
-
         push @body, {code => _BPF_LD_W_ABS, k => $arg_off, jt => 0, jf => 0};
 
         for my $ci (0 .. $#conds) {
-            my $c = $conds[$ci];
-            my $op = $c->{op} // 'SCMP_CMP_EQ';
-            my $val = $c->{value} // 0;
-            my $val2 = $c->{valueTwo} // 0;
-            my $is_last = ($ci == $#conds);
-
-            if ($op eq 'SCMP_CMP_MASKED_EQ') {
-                push @body, {code => _BPF_ALU_AND_K, k => $val, jt => 0, jf => 0};
-                if ($is_last) {
-                    push @body, {code => _BPF_JMP_JEQ_K, k => $val2, jt => 'pass', jf => 'fail'};
-                } else {
-                    push @body, {code => _BPF_JMP_JEQ_K, k => $val2, jt => $gp, jf => 'next'};
-                    push @body, {code => _BPF_LD_W_ABS, k => $arg_off, jt => 0, jf => 0};
-                }
-            } else {
-                my ($opcode, $swap) = _seccomp_cmp_opcode($op);
-                my ($jt_sym, $jf_sym);
-                if ($is_last) {
-                    $jt_sym = $swap ? 'fail' : 'pass';
-                    $jf_sym = $swap ? 'pass' : 'fail';
-                } else {
-                    $jt_sym = $swap ? 'next' : $gp;
-                    $jf_sym = $swap ? $gp : 'next';
-                }
-                push @body, {code => $opcode, k => $val, jt => $jt_sym, jf => $jf_sym};
-            }
+            _emit_bpf_cond(\@body, $conds[$ci], ($ci == $#conds), $gp, $arg_off);
         }
     }
 
