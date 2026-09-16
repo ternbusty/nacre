@@ -555,9 +555,11 @@ sub _determine_mount_flags ($m, $type, $dest, $dest_preexisted_ref) {
             $has_idmap = 1 if $act eq 'idmap';
             $has_ridmap = 1 if $act eq 'ridmap';
             $tmpcopyup = 1 if $act eq 'skip';
+        } elsif (exists $RECURSIVE_MOUNT_ATTRS{$o}) {
+            push @recursive_attrs, $o;
+        } else {
+            push @real_opts, $o;
         }
-        elsif (exists $RECURSIVE_MOUNT_ATTRS{$o}) {push @recursive_attrs, $o;}
-        else {push @real_opts, $o;}
     }
 
     # OCI spec: idmap mounts are also identified by per-mount
