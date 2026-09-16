@@ -2176,6 +2176,7 @@ sub cmd_exec (%p) {    ## no critic (Subroutines::ProhibitExcessComplexity)
         sysread($pipes->{cg_sync_r}, my $cg_sync_buf, 1);
         close $pipes->{cg_sync_r};
 
+        log_debug("setns_init: about to exec");
         _exec_child_close_fds($preserve_fds, $pipes->{err_w});
         apply_final_cpu_affinity($final_affinity) if $final_affinity;
 
