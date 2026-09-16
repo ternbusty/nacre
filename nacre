@@ -2917,7 +2917,7 @@ sub main {
     } elsif ($command eq '--version' || $command eq '-v' || $command eq 'version') {
         require Config;
         print "runc version 1.2.0-nacre\n";
-        print "commit: nacre-0.5.1\n";
+        print "commit: nacre-0.5.1\n";    # x-release-please-version
         print "spec: 1.2.0\n";
         print "go: n/a (perl $Config::Config{archname})\n";    ## no critic (ProhibitPackageVars)
     } elsif (my $handler = $dispatch{$command}) {
