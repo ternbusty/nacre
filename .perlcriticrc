@@ -11,7 +11,6 @@ equivalent_modules = v5.38
 [-TestingAndDebugging::ProhibitNoWarnings]
 
 # -- Intentional patterns for a low-dependency systems program --
-[-Subroutines::ProhibitSubroutinePrototypes]
 [-Subroutines::RequireFinalReturn]
 [-InputOutput::ProhibitInteractiveTest]
 [-InputOutput::ProhibitExplicitStdin]
