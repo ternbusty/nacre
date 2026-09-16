@@ -3,7 +3,7 @@ use v5.38;
 use Exporter 'import';
 use JSON::PP;
 use File::Path qw(remove_tree);
-use Nacre::Util;
+use Nacre::Util qw($JSON fatal read_file read_file_or_die write_file_atomic ensure_dir);
 
 # ═══════════════════════════════════════════════════════════════════════
 # OCI Spec loading
@@ -18,14 +18,17 @@ sub load_spec ($bundle) {
 }
 
 sub cache_spec ($root, $id, $spec) {
+
     # OCI spec: updates to config.json after create MUST NOT affect the
     # container.  Snapshot the spec into the state directory.
     my $dir = state_dir($root, $id);
     ensure_dir($dir);
     write_file_atomic("$dir/config.json", $JSON->encode($spec));
+    return;
 }
 
 sub load_cached_spec ($root, $id, $bundle) {
+
     # Load the spec snapshot from create time, falling back to the
     # bundle's config.json for backwards compatibility.
     my $cached = state_dir($root, $id) . '/config.json';
@@ -39,64 +42,91 @@ sub load_cached_spec ($root, $id, $bundle) {
 sub default_spec {
     return {
         ociVersion => '1.2.0',
-        root => { path => 'rootfs', readonly => JSON::PP::true },
+        root => {path => 'rootfs', readonly => JSON::PP::true},
         process => {
             terminal => JSON::PP::true,
-            user => { uid => 0, gid => 0 },
-            args => [ 'sh' ],
-            env => [
-                'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
-                'TERM=xterm',
-            ],
+            user => {uid => 0, gid => 0},
+            args => ['sh'],
+            env => ['PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'TERM=xterm',],
             cwd => '/',
             capabilities => {
-                bounding   => [qw(CAP_AUDIT_WRITE CAP_KILL CAP_NET_BIND_SERVICE)],
-                effective  => [qw(CAP_AUDIT_WRITE CAP_KILL CAP_NET_BIND_SERVICE)],
-                permitted  => [qw(CAP_AUDIT_WRITE CAP_KILL CAP_NET_BIND_SERVICE)],
+                bounding => [qw(CAP_AUDIT_WRITE CAP_KILL CAP_NET_BIND_SERVICE)],
+                effective => [qw(CAP_AUDIT_WRITE CAP_KILL CAP_NET_BIND_SERVICE)],
+                permitted => [qw(CAP_AUDIT_WRITE CAP_KILL CAP_NET_BIND_SERVICE)],
             },
-            rlimits => [
-                { type => 'RLIMIT_NOFILE', hard => 1024, soft => 1024 },
-            ],
+            rlimits => [{type => 'RLIMIT_NOFILE', hard => 1024, soft => 1024},],
             noNewPrivileges => JSON::PP::true,
         },
         hostname => 'nacre',
         mounts => [
-            { destination => '/proc', type => 'proc', source => 'proc',
-              options => [qw(nosuid noexec nodev)] },
-            { destination => '/dev', type => 'tmpfs', source => 'tmpfs',
-              options => [qw(nosuid strictatime), 'mode=755', 'size=65536k'] },
-            { destination => '/dev/pts', type => 'devpts', source => 'devpts',
-              options => [qw(nosuid noexec), 'newinstance', 'ptmxmode=0666', 'mode=0620'] },
-            { destination => '/dev/shm', type => 'tmpfs', source => 'shm',
-              options => [qw(nosuid noexec nodev), 'mode=1777', 'size=65536k'] },
-            { destination => '/dev/mqueue', type => 'mqueue', source => 'mqueue',
-              options => [qw(nosuid noexec nodev)] },
-            { destination => '/sys', type => 'sysfs', source => 'sysfs',
-              options => [qw(nosuid noexec nodev ro)] },
-            { destination => '/sys/fs/cgroup', type => 'cgroup', source => 'cgroup',
-              options => [qw(nosuid noexec nodev ro)] },
+            {
+                destination => '/proc',
+                type => 'proc',
+                source => 'proc',
+                options => [qw(nosuid noexec nodev)]
+            },
+            {
+                destination => '/dev',
+                type => 'tmpfs',
+                source => 'tmpfs',
+                options => [qw(nosuid strictatime), 'mode=755', 'size=65536k']
+            },
+            {
+                destination => '/dev/pts',
+                type => 'devpts',
+                source => 'devpts',
+                options => [qw(nosuid noexec), 'newinstance', 'ptmxmode=0666', 'mode=0620']
+            },
+            {
+                destination => '/dev/shm',
+                type => 'tmpfs',
+                source => 'shm',
+                options => [qw(nosuid noexec nodev), 'mode=1777', 'size=65536k']
+            },
+            {
+                destination => '/dev/mqueue',
+                type => 'mqueue',
+                source => 'mqueue',
+                options => [qw(nosuid noexec nodev)]
+            },
+            {
+                destination => '/sys',
+                type => 'sysfs',
+                source => 'sysfs',
+                options => [qw(nosuid noexec nodev ro)]
+            },
+            {
+                destination => '/sys/fs/cgroup',
+                type => 'cgroup',
+                source => 'cgroup',
+                options => [qw(nosuid noexec nodev ro)]
+            },
         ],
         linux => {
             resources => {
-                devices => [ { allow => JSON::PP::false, access => 'rwm' } ],
+                devices => [{allow => JSON::PP::false, access => 'rwm'}],
             },
             namespaces => [
-                { type => 'pid' },
-                { type => 'network' },
-                { type => 'ipc' },
-                { type => 'uts' },
-                { type => 'mount' },
-                { type => 'cgroup' },
+                {type => 'pid'},
+                {type => 'network'},
+                {type => 'ipc'},
+                {type => 'uts'},
+                {type => 'mount'},
+                {type => 'cgroup'},
             ],
-            maskedPaths => [qw(
-                /proc/acpi /proc/asound /proc/kcore /proc/keys
-                /proc/latency_stats /proc/timer_list /proc/timer_stats
-                /proc/sched_debug /proc/scsi /sys/firmware
-                /sys/devices/virtual/powercap
-            )],
-            readonlyPaths => [qw(
-                /proc/bus /proc/fs /proc/irq /proc/sys /proc/sysrq-trigger
-            )],
+            maskedPaths => [
+                qw(
+                    /proc/acpi /proc/asound /proc/kcore /proc/keys
+                    /proc/latency_stats /proc/timer_list /proc/timer_stats
+                    /proc/sched_debug /proc/scsi /sys/firmware
+                    /sys/devices/virtual/powercap
+                )
+            ],
+            readonlyPaths => [
+                qw(
+                    /proc/bus /proc/fs /proc/irq /proc/sys /proc/sysrq-trigger
+                )
+            ],
         },
     };
 }
@@ -122,16 +152,18 @@ sub save_state ($root, $state) {
     my $dir = state_dir($root, $state->{id});
     ensure_dir($dir);
     write_file_atomic("$dir/state.json", $JSON->encode($state));
+    return;
 }
 
 sub delete_state ($root, $id) {
     my $dir = state_dir($root, $id);
     remove_tree($dir) if -d $dir;
+    return;
 }
 
 sub refresh_state ($state) {
     my $pid = $state->{pid};
-    return unless $pid && $pid > 0;
+    return if !$pid || $pid <= 0;
     my $status = $state->{status};
     return if $status eq 'stopped';
 
@@ -160,42 +192,47 @@ sub refresh_state ($state) {
             $state->{status} = 'stopped';
         }
     }
+    return;
 }
 
 sub parse_proc_starttime ($stat_line) {
+
     # /proc/pid/stat: pid (comm) state ppid pgrp session tty_nr tpgid flags
     #   minflt cminflt majflt cmajflt utime stime cutime cstime priority nice
     #   num_threads itrealvalue starttime ...
     # comm can contain spaces and parens, so find the last ')'
-    if ($stat_line =~ /\)\s+\S+\s+          # state
+    if (    ## no critic (ProhibitComplexRegexes)
+        $stat_line =~ /\)\s+\S+\s+          # state
                         \S+\s+\S+\s+\S+\s+  # ppid pgrp session
                         \S+\s+\S+\s+\S+\s+  # tty tpgid flags
                         \S+\s+\S+\s+\S+\s+  # minflt cminflt majflt
                         \S+\s+\S+\s+\S+\s+  # cmajflt utime stime
                         \S+\s+\S+\s+\S+\s+  # cutime cstime priority
                         \S+\s+\S+\s+\S+\s+  # nice threads itrealvalue
-                        (\S+)/x) {
+                        (\S+)/x
+    ) {
         return $1;
     }
-    return undef;
+    return;
 }
 
 sub get_pid_starttime ($pid) {
     my $stat = read_file("/proc/$pid/stat");
-    return undef unless $stat;
+    return unless $stat;
     return parse_proc_starttime($stat);
 }
 
 sub oci_state_json ($state) {
     my $out = {
-        ociVersion  => $state->{ociVersion} // '1.2.0',
-        id          => $state->{id},
-        status      => $state->{status},
-        bundle      => $state->{bundle},
-        rootfs      => $state->{rootfs} // '',
+        ociVersion => $state->{ociVersion} // '1.2.0',
+        id => $state->{id},
+        status => $state->{status},
+        bundle => $state->{bundle},
+        rootfs => $state->{rootfs} // '',
         annotations => $state->{annotations} // {},
-        created     => $state->{created} // '',
+        created => $state->{created} // '',
     };
+
     # OCI spec: pid MUST NOT be present when the container is stopped
     if ($state->{status} ne 'stopped') {
         $out->{pid} = $state->{pid} + 0;
@@ -203,7 +240,7 @@ sub oci_state_json ($state) {
     return $out;
 }
 
-our @EXPORT = qw(
+our @EXPORT_OK = qw(
     load_spec cache_spec load_cached_spec default_spec
     state_dir load_state save_state delete_state refresh_state
     parse_proc_starttime get_pid_starttime oci_state_json

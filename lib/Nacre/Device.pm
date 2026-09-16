@@ -1,7 +1,11 @@
 package Nacre::Device;
 use v5.38;
 use Exporter 'import';
-use Nacre::Const;
+use Nacre::Const qw(
+    SYS_bpf
+    BPF_PROG_LOAD BPF_PROG_ATTACH BPF_CGROUP_DEVICE
+    BPF_F_ALLOW_MULTI BPF_PROG_TYPE_CGROUP_DEVICE
+);
 use Fcntl qw(O_RDONLY O_DIRECTORY);
 use Errno qw(EINTR);
 
@@ -17,18 +21,16 @@ sub apply_device_cgroup ($cgpath, $spec) {
     my $prog = _build_device_bpf($default_allow, $exceptions);
     return unless @$prog;
 
-    my $insns = join('', map { _pack_bpf_insn(@$_) } @$prog);
+    my $insns = join('', map {_pack_bpf_insn(@$_)} @$prog);
     my $license = "GPL\0";
     my $log_buf = "\0" x 4096;
 
-    my $attr = pack('L      L      Q      Q      L      L      Q      a*',
-        BPF_PROG_TYPE_CGROUP_DEVICE,
-        scalar(@$prog),
+    my $attr = pack(
+        'L      L      Q      Q      L      L      Q      a*',
+        BPF_PROG_TYPE_CGROUP_DEVICE, scalar(@$prog),
         unpack('Q', pack('P', $insns)),
         unpack('Q', pack('P', $license)),
-        4,
-        4096,
-        unpack('Q', pack('P', $log_buf)),
+        4, 4096, unpack('Q', pack('P', $log_buf)),
     );
     $attr .= "\0" x (256 - length($attr)) if length($attr) < 256;
 
@@ -36,34 +38,28 @@ sub apply_device_cgroup ($cgpath, $spec) {
     my $bpf_cmd = BPF_PROG_LOAD + 0;
     my $attr_len = length($attr) + 0;
     my $prog_fd;
-    do { $prog_fd = syscall($nr_bpf, $bpf_cmd, $attr, $attr_len) }
-        while ($prog_fd == -1 && $! == EINTR);
+    do {$prog_fd = syscall($nr_bpf, $bpf_cmd, $attr, $attr_len)} while ($prog_fd == -1 && $! == EINTR);
     if ($prog_fd < 0) {
         warn "nacre: BPF_PROG_LOAD failed: $!\n";
         return;
     }
 
     sysopen(my $cgdir_fh, $cgpath, O_RDONLY | O_DIRECTORY)
-        or do { warn "nacre: open cgroup dir: $!\n"; return; };
+        or do {warn "nacre: open cgroup dir: $!\n"; return;};
     my $cgdir_fd = fileno($cgdir_fh);
 
-    my $attach_attr = pack('L L L L',
-        $cgdir_fd,
-        $prog_fd,
-        BPF_CGROUP_DEVICE,
-        BPF_F_ALLOW_MULTI,
-    );
+    my $attach_attr = pack('L L L L', $cgdir_fd, $prog_fd, BPF_CGROUP_DEVICE, BPF_F_ALLOW_MULTI,);
     $attach_attr .= "\0" x (256 - length($attach_attr)) if length($attach_attr) < 256;
 
     my $bpf_attach = BPF_PROG_ATTACH + 0;
     my $attach_len = length($attach_attr) + 0;
     my $ret;
-    do { $ret = syscall($nr_bpf, $bpf_attach, $attach_attr, $attach_len) }
-        while ($ret == -1 && $! == EINTR);
+    do {$ret = syscall($nr_bpf, $bpf_attach, $attach_attr, $attach_len)} while ($ret == -1 && $! == EINTR);
     warn "nacre: BPF_PROG_ATTACH failed: $!\n" if $ret < 0;
 
     close $cgdir_fh;
     POSIX::close($prog_fd);
+    return;
 }
 
 sub _emulate_device_rules ($rules) {
@@ -84,20 +80,18 @@ sub _emulate_device_rules ($rules) {
         }
 
         my $exc = {
-            type   => $type,
-            major  => $major // -1,
-            minor  => $minor // -1,
+            type => $type,
+            major => $major // -1,
+            minor => $minor // -1,
             access => $access,
         };
 
         if ($allow != $default_allow) {
             push @exceptions, $exc;
         } else {
-            @exceptions = grep {
-                !($_->{type} eq $exc->{type} &&
-                  $_->{major} == $exc->{major} &&
-                  $_->{minor} == $exc->{minor})
-            } @exceptions;
+            @exceptions
+                = grep {!($_->{type} eq $exc->{type} && $_->{major} == $exc->{major} && $_->{minor} == $exc->{minor})}
+                @exceptions;
         }
     }
 
@@ -113,7 +107,7 @@ sub _build_device_bpf ($default_allow, $exceptions) {
     push @prog, _bpf_st(0);
 
     my $num_exc = scalar @$exceptions;
-    for my $i (0..$num_exc-1) {
+    for my $i (0 .. $num_exc - 1) {
         my $exc = $exceptions->[$i];
 
         my $jumps_in_this_exc = 0;
@@ -166,14 +160,14 @@ sub _pack_bpf_insn ($code, $dst_src, $off, $imm) {
 }
 
 use constant {
-    _BPF_LDX_MEM_W  => 0x61,
-    _BPF_STX_MEM_W  => 0x63,
-    _BPF_ALU_AND_K  => 0x54,
-    _BPF_ALU_RSH_K  => 0x74,
-    _BPF_JNE_K      => 0x55,
-    _BPF_JEQ_K      => 0x15,
-    _BPF_MOV_K      => 0xb4,
-    _BPF_EXIT       => 0x95,
+    _BPF_LDX_MEM_W => 0x61,
+    _BPF_STX_MEM_W => 0x63,
+    _BPF_ALU_AND_K => 0x54,
+    _BPF_ALU_RSH_K => 0x74,
+    _BPF_JNE_K => 0x55,
+    _BPF_JEQ_K => 0x15,
+    _BPF_MOV_K => 0xb4,
+    _BPF_EXIT => 0x95,
 };
 
 sub _bpf_ld_abs ($off) {
@@ -208,6 +202,6 @@ sub _bpf_ret ($val) {
     return [_BPF_MOV_K, 0x00, 0, $val], [_BPF_EXIT, 0x00, 0, 0];
 }
 
-our @EXPORT = qw(apply_device_cgroup);
+our @EXPORT_OK = qw(apply_device_cgroup);
 
 1;

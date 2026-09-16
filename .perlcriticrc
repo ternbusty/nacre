@@ -1,0 +1,25 @@
+severity = 3
+verbose = %f:%l:%c: [%s] %m (%e)\n
+
+# -- v5.38 provides strict and warnings --
+[TestingAndDebugging::RequireUseStrict]
+equivalent_modules = v5.38
+
+[TestingAndDebugging::RequireUseWarnings]
+equivalent_modules = v5.38
+
+[-TestingAndDebugging::ProhibitNoWarnings]
+
+# -- Intentional patterns for a low-dependency systems program --
+[-InputOutput::ProhibitInteractiveTest]
+[-ValuesAndExpressions::ProhibitLeadingZeros]
+[-ValuesAndExpressions::ProhibitConstantPragma]
+[-ValuesAndExpressions::ProhibitVersionStrings]
+[-Variables::RequireLocalizedPunctuationVars]
+
+# -- Expression eval used for syscall probing --
+[-BuiltinFunctions::ProhibitStringyEval]
+
+# -- Severity 3 policies unsuitable for this codebase --
+[-RegularExpressions::RequireExtendedFormatting]
+[-ErrorHandling::RequireCheckingReturnValueOfEval]
