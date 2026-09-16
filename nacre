@@ -1808,18 +1808,18 @@ sub exec_tty_relay ($child_pid, $master_fd, $err_r_fd) {
 
 # Helper: fcntl F_GETFL / F_SETFL
 sub fcntl_getfl ($fd) {
-    return undef unless defined $fd;
+    return unless defined $fd;
 
     # Use +<& (dup) instead of +<&= to avoid closing the original fd
     # when $fh goes out of scope.
-    open my $fh, '+<&', $fd or return undef;
+    open my $fh, '+<&', $fd or return;
     my $fl = fcntl($fh, Fcntl::F_GETFL(), 0);
     return defined $fl ? ($fl + 0) : undef;
 }
 
 sub fcntl_setfl ($fd, $fl) {
-    return undef unless defined $fd;
-    open my $fh, '+<&', $fd or return undef;
+    return unless defined $fd;
+    open my $fh, '+<&', $fd or return;
     return fcntl($fh, Fcntl::F_SETFL(), $fl);
 }
 

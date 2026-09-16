@@ -31,7 +31,7 @@ use constant {
 };
 
 sub apply_seccomp_raw ($spec) {
-    my $seccomp = $spec->{linux}{seccomp} // return undef;
+    my $seccomp = $spec->{linux}{seccomp} // return;
 
     # If FFI::Platypus is available, use it
     if (eval {require FFI::Platypus; 1}) {
@@ -605,7 +605,7 @@ sub _seccomp_action_val ($str, $errno_override = undef) {
     if ($str =~ /^SCMP_ACT_TRACE\((\d+)\)$/) {
         return 0x7ff00000 | ($1 & 0xffff);
     }
-    return undef;
+    return;
 }
 
 # BPF opcodes (classic BPF for seccomp)
@@ -830,7 +830,7 @@ sub _apply_seccomp_minimal ($seccomp) {
         if ($ret != 0) {
             fatal("seccomp: BPF load failed (errno=$!), filter has $ninsns insns");
         }
-        return undef;
+        return;
     }
 }
 

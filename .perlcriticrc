@@ -12,7 +12,6 @@ equivalent_modules = v5.38
 
 # -- Intentional patterns for a low-dependency systems program --
 [-Subroutines::ProhibitSubroutinePrototypes]
-[-Subroutines::ProhibitExplicitReturnUndef]
 [-Subroutines::RequireFinalReturn]
 [-BuiltinFunctions::ProhibitSleepViaSelect]
 [-InputOutput::ProhibitInteractiveTest]

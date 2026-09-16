@@ -423,7 +423,7 @@ sub _resolve_in_rootfs ($rootfs, $path) {
     my @resolved;
     my $depth = 0;
     while (@parts) {
-        return undef if ++$depth > 255;    # symlink loop guard
+        return if ++$depth > 255;    # symlink loop guard
         my $c = shift @parts;
         next if $c eq '.';
         if ($c eq '..') {pop @resolved if @resolved; next;}

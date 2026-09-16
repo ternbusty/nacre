@@ -209,12 +209,12 @@ sub parse_proc_starttime ($stat_line) {
     ) {
         return $1;
     }
-    return undef;
+    return;
 }
 
 sub get_pid_starttime ($pid) {
     my $stat = read_file("/proc/$pid/stat");
-    return undef unless $stat;
+    return unless $stat;
     return parse_proc_starttime($stat);
 }
 

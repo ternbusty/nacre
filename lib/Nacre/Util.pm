@@ -68,7 +68,7 @@ sub fatal (@args) {
 }
 
 sub parse_size ($s) {
-    return undef unless defined $s;
+    return unless defined $s;
     $s =~ s/^\s+|\s+$//g;
     return -1 if $s eq '-1';
     if ($s =~ /^(-?\d+)$/i) {
@@ -95,7 +95,7 @@ sub write_file ($path, $content) {
 }
 
 sub read_file ($path) {
-    open my $fh, '<', $path or return undef;
+    open my $fh, '<', $path or return;
     local $/;
     my $data = <$fh>;
     close $fh;

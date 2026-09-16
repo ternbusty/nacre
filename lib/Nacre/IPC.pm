@@ -26,7 +26,7 @@ sub channel_send ($fd, $msg) {
 sub channel_recv ($fd) {
     my $buf;
     my $ret = POSIX::read($fd, $buf, 65536);
-    return undef unless defined $ret && $ret > 0;
+    return unless defined $ret && $ret > 0;
     return $JSON_COMPACT->decode($buf);
 }
 
