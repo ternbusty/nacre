@@ -2153,6 +2153,9 @@ sub cmd_exec (%p) {    ## no critic (Subroutines::ProhibitExcessComplexity)
         close $pipes->{pty_parent_fh} if $pipes->{pty_parent_fh};
         close $pipes->{seccomp_parent_fh} if $pipes->{seccomp_parent_fh};
 
+        log_debug("nsexec container setup");
+        log_debug("child process in init()");
+
         _exec_child_join_ns(\@ns_fds, $pipes->{err_w});
         for my $ns (@ns_fds) {close $ns->{fd};}
 
