@@ -143,7 +143,7 @@ my %_SYSCALL_NR;
 sub _init_syscall_table {
     return if %_SYSCALL_NR;
     require Config;
-    my $arch = $Config::Config{archname} // '';
+    my $arch = $Config::Config{archname} // '';    ## no critic (ProhibitPackageVars)
 
     my @hdrs;
     if ($arch =~ /x86_64|amd64/i) {
@@ -758,7 +758,7 @@ sub _apply_seccomp_minimal ($seccomp) {
     my @insns;
 
     require Config;
-    my $arch_val = ($Config::Config{archname} // '') =~ /aarch64|arm64/i ? _AUDIT_ARCH_AARCH64 : _AUDIT_ARCH_X86_64;
+    my $arch_val = ($Config::Config{archname} // '') =~ /aarch64|arm64/i ? _AUDIT_ARCH_AARCH64 : _AUDIT_ARCH_X86_64;   ## no critic (ProhibitPackageVars)
     push @insns, pack('SCCL', _BPF_LD_W_ABS, 0, 0, 4);
     push @insns, pack('SCCL', _BPF_JMP_JEQ_K, 1, 0, $arch_val);
     push @insns, pack('SCCL', _BPF_RET_K, 0, 0, 0x00000000);

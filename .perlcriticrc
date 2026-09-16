@@ -23,9 +23,3 @@ equivalent_modules = v5.38
 # -- Severity 3 policies unsuitable for this codebase --
 [-RegularExpressions::RequireExtendedFormatting]
 [-ErrorHandling::RequireCheckingReturnValueOfEval]
-[-Variables::ProhibitPackageVars]
-[-ValuesAndExpressions::ProhibitImplicitNewlines]
-[-RegularExpressions::ProhibitComplexRegexes]
-[-Modules::ProhibitConditionalUseStatements]
-[-RegularExpressions::ProhibitCaptureWithoutTest]
-[-NamingConventions::ProhibitAmbiguousNames]

@@ -353,7 +353,10 @@ sub _create_userns_for_idmap ($uid_maps, $gid_maps, $chan_w, $chan_r) {
     sysread($pr, $buf, 64);
     close $pr;
     chomp $buf;
-    my $proc_pid = ($buf =~ /^(\d+)$/) ? $1 : $child;
+    my $proc_pid = $child;
+    if ($buf =~ /^(\d+)$/) {
+        $proc_pid = $1;
+    }
 
     # Write mappings using the host PID (which matches /proc entries).
     # When called from inside a container userns, writing to the host

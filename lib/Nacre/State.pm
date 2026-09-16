@@ -201,7 +201,7 @@ sub parse_proc_starttime ($stat_line) {
     #   minflt cminflt majflt cmajflt utime stime cutime cstime priority nice
     #   num_threads itrealvalue starttime ...
     # comm can contain spaces and parens, so find the last ')'
-    if (
+    if (    ## no critic (ProhibitComplexRegexes)
         $stat_line =~ /\)\s+\S+\s+          # state
                         \S+\s+\S+\s+\S+\s+  # ppid pgrp session
                         \S+\s+\S+\s+\S+\s+  # tty tpgid flags

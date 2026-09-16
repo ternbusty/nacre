@@ -19,9 +19,9 @@ sub validate_capabilities ($spec) {
     # expect runc behavior.)
     return unless $spec->{process};    # avoid auto-vivifying {process}
     my $caps = $spec->{process}{capabilities} // return;
-    for my $set (qw(bounding effective permitted inheritable ambient)) {
-        my @known = grep {exists $CAP_NUM{$_}} @{$caps->{$set} // []};
-        $caps->{$set} = \@known;
+    for my $cap_set (qw(bounding effective permitted inheritable ambient)) {
+        my @known = grep {exists $CAP_NUM{$_}} @{$caps->{$cap_set} // []};
+        $caps->{$cap_set} = \@known;
     }
     return;
 }
