@@ -1,7 +1,11 @@
 package Nacre::Device;
 use v5.38;
 use Exporter 'import';
-use Nacre::Const;
+use Nacre::Const qw(
+    SYS_bpf
+    BPF_PROG_LOAD BPF_PROG_ATTACH BPF_CGROUP_DEVICE
+    BPF_F_ALLOW_MULTI BPF_PROG_TYPE_CGROUP_DEVICE
+);
 use Fcntl qw(O_RDONLY O_DIRECTORY);
 use Errno qw(EINTR);
 
@@ -197,6 +201,6 @@ sub _bpf_ret ($val) {
     return [_BPF_MOV_K, 0x00, 0, $val], [_BPF_EXIT, 0x00, 0, 0];
 }
 
-our @EXPORT = qw(apply_device_cgroup);
+our @EXPORT_OK = qw(apply_device_cgroup);
 
 1;

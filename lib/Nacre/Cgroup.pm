@@ -3,8 +3,9 @@ use v5.38;
 use feature 'try';
 no warnings 'experimental::try';
 use Exporter 'import';
-use Nacre::Util;
+use Nacre::Util qw(log_debug fatal write_file read_file ensure_dir);
 use Errno qw(EBUSY);
+use Time::HiRes qw(usleep);
 
 # ═══════════════════════════════════════════════════════════════════════
 # Cgroup v2
@@ -219,14 +220,14 @@ sub cgroup_cleanup ($cgpath) {
     while (time < $deadline) {
         $procs = read_file("$cgpath/cgroup.procs") // '';
         last unless $procs =~ /\d/;
-        select(undef, undef, undef, 0.05);
+        usleep(50_000);
     }
 
     # Remove cgroup directory with retry (EBUSY)
     for my $attempt (1 .. 10) {
         last if rmdir($cgpath);
         last unless $! == EBUSY;
-        select(undef, undef, undef, 0.05 * $attempt);
+        usleep(50_000 * $attempt);
     }
 }
 
@@ -265,7 +266,7 @@ sub convert_cpu_shares ($shares) {
     return int(exp($exponent * log(10)) + 0.99);
 }
 
-our @EXPORT = qw(
+our @EXPORT_OK = qw(
     cgroup_path cgroup_setup cgroup_apply_resources
     cgroup_add_process cgroup_cleanup cgroup_pids
     cg_read cg_write

@@ -3,8 +3,8 @@ use v5.38;
 use feature 'try';
 no warnings 'experimental::try';
 use Exporter 'import';
-use Nacre::Const;
-use Nacre::Util;
+use Nacre::Const qw(SYS_setns CLONE_NEWNET);
+use Nacre::Util qw(log_debug fatal);
 use Socket qw(AF_INET inet_aton inet_ntoa inet_pton inet_ntop);
 use Fcntl qw(O_RDONLY);
 
@@ -263,7 +263,7 @@ sub rename_net_devices ($netdevs) {
     }
 }
 
-our @EXPORT = qw(
+our @EXPORT_OK = qw(
     move_net_devices rename_net_devices
 );
 

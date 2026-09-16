@@ -315,7 +315,7 @@ our %NS_MAP = (
 # ═══════════════════════════════════════════════════════════════════════
 # Exports
 # ═══════════════════════════════════════════════════════════════════════
-our @EXPORT = qw(
+our @EXPORT_OK = qw(
     O_CLOEXEC O_PATH
 
     SYS_mount SYS_umount2 SYS_pivot_root SYS_unshare SYS_setns

@@ -2,10 +2,16 @@ package Nacre::Process;
 use v5.38;
 use Exporter 'import';
 use POSIX qw(setgid setuid);
-use Nacre::Const;
-use Nacre::Util;
-use Nacre::Seccomp;
-use Nacre::Caps;
+use Nacre::Const qw(
+    SYS_prctl SYS_capset SYS_setgroups SYS_prlimit64
+    SYS_ioprio_set SYS_sched_setattr SYS_sched_setaffinity SYS_set_mempolicy
+    PR_SET_NO_NEW_PRIVS PR_CAPBSET_DROP PR_SET_KEEPCAPS
+    PR_CAP_AMBIENT PR_CAP_AMBIENT_RAISE
+    @CAP_NAMES %CAP_NUM _LINUX_CAPABILITY_VERSION_3
+);
+use Nacre::Util qw(fatal write_file do_syscall);
+use Nacre::Seccomp qw(apply_seccomp_raw);
+use Nacre::Caps qw(apply_capabilities_bounding apply_capabilities_final);
 
 # ═══════════════════════════════════════════════════════════════════════
 # Process Security
@@ -590,7 +596,7 @@ sub apply_sysctls ($spec) {
     }
 }
 
-our @EXPORT = qw(
+our @EXPORT_OK = qw(
     apply_process_security
     validate_rlimits apply_rlimits
     apply_iopriority

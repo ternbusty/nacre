@@ -9,9 +9,22 @@ use Fcntl qw(:mode O_RDONLY);
 use Errno qw(EINTR EPERM);
 use Socket qw(AF_UNIX SOCK_STREAM);
 use Cwd qw(abs_path);
-use Nacre::Const;
-use Nacre::Util;
-use Nacre::IPC;
+use Nacre::Const qw(
+    SYS_mount SYS_umount2 SYS_pivot_root SYS_unshare SYS_mknod SYS_mknodat
+    SYS_open_tree SYS_move_mount SYS_mount_setattr
+    CLONE_NEWUSER
+    MS_RDONLY MS_NOSUID MS_NODEV MS_NOEXEC MS_REMOUNT
+    MS_NOATIME MS_NODIRATIME MS_BIND MS_MOVE MS_REC MS_SILENT
+    MS_RELATIME MS_STRICTATIME MS_SLAVE MS_SHARED MS_PRIVATE MS_UNBINDABLE
+    MNT_DETACH
+    AT_RECURSIVE AT_EMPTY_PATH
+    MOUNT_ATTR_RDONLY MOUNT_ATTR_NOSUID MOUNT_ATTR_NODEV MOUNT_ATTR_NOEXEC
+    MOUNT_ATTR_NOATIME MOUNT_ATTR_STRICTATIME MOUNT_ATTR_NODIRATIME
+    MOUNT_ATTR__ATIME MOUNT_ATTR_IDMAP
+    OPEN_TREE_CLONE OPEN_TREE_CLOEXEC MOVE_MOUNT_F_EMPTY_PATH
+);
+use Nacre::Util qw(log_debug fatal write_file ensure_dir do_syscall);
+use Nacre::IPC qw(channel_send channel_recv send_fd_over_fd recv_fd_over_fd);
 
 # ═══════════════════════════════════════════════════════════════════════
 # Mount / Rootfs
@@ -1035,7 +1048,7 @@ sub set_rootfs_readonly ($rootfs_readonly) {
         or fatal("remount / readonly: $!");
 }
 
-our @EXPORT = qw(
+our @EXPORT_OK = qw(
     do_mount do_umount do_pivot_root do_mount_setattr
     parse_mount_options
     prepare_rootfs apply_mounts create_devices create_symlinks

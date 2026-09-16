@@ -1,8 +1,12 @@
 package Nacre::Caps;
 use v5.38;
 use Exporter 'import';
-use Nacre::Const;
-use Nacre::Util;
+use Nacre::Const qw(
+    SYS_prctl SYS_capset
+    PR_CAPBSET_DROP PR_SET_KEEPCAPS PR_CAP_AMBIENT PR_CAP_AMBIENT_RAISE
+    @CAP_NAMES %CAP_NUM _LINUX_CAPABILITY_VERSION_3
+);
+use Nacre::Util qw(do_syscall);
 
 # ═══════════════════════════════════════════════════════════════════════
 # Capabilities
@@ -92,7 +96,7 @@ sub apply_capabilities_final ($spec) {
     }
 }
 
-our @EXPORT = qw(
+our @EXPORT_OK = qw(
     validate_capabilities apply_capabilities_bounding apply_capabilities_final
 );
 

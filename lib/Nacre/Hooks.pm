@@ -2,8 +2,9 @@ package Nacre::Hooks;
 use v5.38;
 use Exporter 'import';
 use POSIX qw(WNOHANG _exit);
-use Nacre::Util;
-use Nacre::State;
+use Time::HiRes qw(usleep);
+use Nacre::Util qw($JSON_COMPACT fatal);
+use Nacre::State qw(oci_state_json);
 
 # ═══════════════════════════════════════════════════════════════════════
 # Hooks
@@ -51,7 +52,7 @@ sub run_hooks ($hooks, $state, %opts) {
         while ($elapsed < $timeout) {
             my $w = waitpid($pid, WNOHANG);
             last if $w > 0;
-            select(undef, undef, undef, 0.1);
+            usleep(100_000);
             $elapsed += 0.1;
         }
         my $hook_label = $hook_type ? "$hook_type hook #$hook_idx" : "hook $hook->{path}";
@@ -92,6 +93,6 @@ sub run_hooks ($hooks, $state, %opts) {
     }
 }
 
-our @EXPORT = qw(run_hooks);
+our @EXPORT_OK = qw(run_hooks);
 
 1;

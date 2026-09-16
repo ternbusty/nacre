@@ -3,7 +3,7 @@ use v5.38;
 use Exporter 'import';
 use JSON::PP;
 use File::Path qw(remove_tree);
-use Nacre::Util;
+use Nacre::Util qw($JSON fatal read_file read_file_or_die write_file_atomic ensure_dir);
 
 # ═══════════════════════════════════════════════════════════════════════
 # OCI Spec loading
@@ -236,7 +236,7 @@ sub oci_state_json ($state) {
     return $out;
 }
 
-our @EXPORT = qw(
+our @EXPORT_OK = qw(
     load_spec cache_spec load_cached_spec default_spec
     state_dir load_state save_state delete_state refresh_state
     parse_proc_starttime get_pid_starttime oci_state_json

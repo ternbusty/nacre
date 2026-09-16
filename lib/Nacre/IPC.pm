@@ -1,8 +1,8 @@
 package Nacre::IPC;
 use v5.38;
 use Exporter 'import';
-use Nacre::Const;
-use Nacre::Util;
+use Nacre::Const qw(O_CLOEXEC SYS_sendmsg SYS_recvmsg TIOCGPTN TIOCSPTLCK);
+use Nacre::Util qw($JSON_COMPACT fatal);
 use Socket qw(AF_UNIX SOCK_STREAM SOCK_SEQPACKET SOL_SOCKET SCM_RIGHTS
     pack_sockaddr_un PF_UNIX);
 use Fcntl qw(O_RDWR O_NOCTTY);
@@ -232,7 +232,7 @@ sub pty_set_raw ($fd) {
     }
 }
 
-our @EXPORT = qw(
+our @EXPORT_OK = qw(
     create_channel channel_send channel_recv
     create_notify_listener wait_for_start notify_container_start
     send_fd_via_socket send_fd_over_fd recv_fd_over_fd

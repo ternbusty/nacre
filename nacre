@@ -12,22 +12,62 @@ use Fcntl qw(:flock :mode :seek O_RDONLY O_WRONLY O_RDWR O_CREAT
     O_TRUNC O_EXCL O_NONBLOCK O_NOCTTY
     F_GETFD F_SETFD FD_CLOEXEC);
 use Getopt::Long qw(:config pass_through no_auto_abbrev);
+use Time::HiRes qw(usleep);
 use Cwd qw(abs_path getcwd);
 use Errno qw(EINTR EAGAIN EWOULDBLOCK ENOENT EEXIST EBUSY EPERM ENOSYS EACCES EOVERFLOW);
 use FindBin;
 use lib "$FindBin::RealBin/lib";
-use Nacre::Const;
-use Nacre::Util;
-use Nacre::Seccomp;
-use Nacre::Device;
-use Nacre::Net;
-use Nacre::IPC;
-use Nacre::Caps;
-use Nacre::Cgroup;
-use Nacre::Process;
-use Nacre::State;
-use Nacre::Hooks;
-use Nacre::Mount;
+use Nacre::Const qw(
+    O_CLOEXEC O_PATH
+    SYS_unshare SYS_setns SYS_prctl SYS_pidfd_open SYS_close_range
+    SYS_sethostname SYS_setdomainname SYS_setgroups SYS_fchown SYS_waitid
+    CLONE_NEWNS CLONE_NEWUSER CLONE_NEWPID CLONE_NEWCGROUP CLONE_NEWTIME
+    SIGCHLD MS_MOVE
+    PR_SET_NO_NEW_PRIVS PR_SET_CHILD_SUBREAPER PR_SET_PDEATHSIG
+    SECCOMP_FILTER_FLAG_TSYNC SECCOMP_FILTER_FLAG_LOG
+    SECCOMP_FILTER_FLAG_NEW_LISTENER
+    CLOSE_RANGE_CLOEXEC AT_RECURSIVE AT_EMPTY_PATH MOUNT_ATTR_IDMAP
+    TIOCGPTN TIOCSPTLCK TIOCSCTTY TIOCSWINSZ TIOCGWINSZ
+    @CAP_NAMES %SIG_NUM %NS_MAP
+);
+use Nacre::Util qw(
+    $JSON $JSON_COMPACT $LOG_FH
+    setup_logging log_debug fatal parse_size
+    write_file read_file read_file_or_die ensure_dir iso8601_now do_syscall
+);
+use Nacre::Seccomp qw(apply_seccomp_raw);
+use Nacre::Device qw(apply_device_cgroup);
+use Nacre::Net qw(move_net_devices rename_net_devices);
+use Nacre::IPC qw(
+    create_channel channel_send channel_recv
+    create_notify_listener wait_for_start notify_container_start
+    send_fd_via_socket send_fd_over_fd recv_fd_over_fd pty_set_raw
+);
+use Nacre::Caps qw(validate_capabilities);
+use Nacre::Cgroup qw(
+    cgroup_path cgroup_setup cgroup_apply_resources
+    cgroup_add_process cgroup_cleanup cgroup_pids cg_read cg_write
+);
+use Nacre::Process qw(
+    apply_process_security validate_rlimits apply_rlimits
+    apply_iopriority apply_scheduler
+    validate_memory_policy apply_memory_policy apply_timens_offsets
+    apply_cpu_affinity_reset apply_exec_cpu_affinity apply_final_cpu_affinity
+    apply_exec_caps apply_sysctls
+);
+use Nacre::State qw(
+    load_spec cache_spec load_cached_spec default_spec
+    state_dir load_state save_state delete_state refresh_state
+    get_pid_starttime oci_state_json
+);
+use Nacre::Hooks qw(run_hooks);
+use Nacre::Mount qw(
+    do_mount do_mount_setattr
+    prepare_rootfs apply_mounts apply_pivot_root apply_rootfs_propagation
+    apply_masked_paths apply_readonly_paths set_rootfs_readonly
+    _mask_host_procfs_sysfs _create_userns_from_strings
+    %MOUNT_FLAGS
+);
 
 # -- Default root path for state --
 my $DEFAULT_ROOT = '/run/nacre';
@@ -1324,7 +1364,7 @@ sub cmd_delete (%p) {
             # Unfreeze first for paused containers so SIGKILL can be delivered
             if ($state->{status} eq 'paused' && $state->{cgroupPath}) {
                 eval {write_file("$state->{cgroupPath}/cgroup.freeze", "0\n")};
-                select(undef, undef, undef, 0.1);
+                usleep(100_000);
             }
 
             # Force kill
@@ -1332,7 +1372,7 @@ sub cmd_delete (%p) {
                 kill 9, $state->{pid};
 
                 # Wait a bit
-                select(undef, undef, undef, 0.1);
+                usleep(100_000);
             }
             if ($state->{cgroupPath}) {
                 cgroup_cleanup($state->{cgroupPath});
@@ -1586,7 +1626,7 @@ sub cmd_run (%p) {
                     }
                 }
                 last if $got_init;
-                select(undef, undef, undef, 0.1);
+                usleep(100_000);
             }
         }
     }
@@ -1883,7 +1923,8 @@ sub cmd_exec (%p) {
             log_debug("exec: container paused, waiting for resume (--ignore-paused)");
             my $cgpath = $state->{cgroupPath};
             while (1) {
-                my $freeze = read_file("$cgpath/cgroup.freeze") if $cgpath;
+                my $freeze;
+                $freeze = read_file("$cgpath/cgroup.freeze") if $cgpath;
                 if (defined $freeze) {
                     chomp $freeze;
                     last if $freeze eq '0';
@@ -1896,7 +1937,7 @@ sub cmd_exec (%p) {
                     exec_fatal("container not running");
                 }
                 last if $s2->{status} eq 'running';
-                select(undef, undef, undef, 0.1);
+                usleep(100_000);
             }
         } else {
             exec_fatal("cannot exec in a paused container, use --ignore-paused to wait");
@@ -2017,7 +2058,7 @@ sub cmd_exec (%p) {
                         }
                     }
                 }
-                open($fh, "+<&=$new") or next;
+                open($fh, '+<&=', $new) or next;
                 POSIX::close($cur);
 
                 # Preserve CLOEXEC if it was set
@@ -2855,9 +2896,9 @@ sub cmd_events (%p) {
             }
         }
 
-        # Use select for sub-second sleep
+        # Sleep for the requested interval
         if ($interval < 1) {
-            select(undef, undef, undef, $interval);
+            usleep($interval * 1_000_000);
         } else {
             sleep int($interval);
         }

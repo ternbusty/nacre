@@ -1,8 +1,12 @@
 package Nacre::Seccomp;
 use v5.38;
 use Exporter 'import';
-use Nacre::Const;
-use Nacre::Util;
+use Nacre::Const qw(
+    SYS_seccomp SECCOMP_SET_MODE_FILTER
+    SECCOMP_FILTER_FLAG_TSYNC SECCOMP_FILTER_FLAG_LOG
+    SECCOMP_FILTER_FLAG_NEW_LISTENER SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV
+);
+use Nacre::Util qw(log_debug fatal);
 
 # ═══════════════════════════════════════════════════════════════════════
 # Seccomp (via dlopen/dlsym of libseccomp, with BPF fallback)
@@ -834,6 +838,6 @@ sub _apply_seccomp_minimal ($seccomp) {
     }
 }
 
-our @EXPORT = qw(init_libseccomp apply_seccomp_raw);
+our @EXPORT_OK = qw(init_libseccomp apply_seccomp_raw);
 
 1;
