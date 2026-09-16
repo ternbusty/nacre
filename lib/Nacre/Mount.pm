@@ -385,7 +385,7 @@ sub _create_userns_for_idmap ($uid_maps, $gid_maps, $chan_w, $chan_r) {
 }
 
 # Create a user namespace from pre-built mapping strings (parent-side).
-sub _create_userns_from_strings ($uid_map_str, $gid_map_str) {
+sub _create_userns_from_strings ($uid_map_str, $gid_map_str) {    ## no critic (ProhibitUnusedPrivateSubroutines)
     socketpair(my $p_sock, my $c_sock, AF_UNIX, SOCK_STREAM, 0) or fatal("socketpair: $!");
     pipe(my $pr, my $cw) or fatal("pipe: $!");
     pipe(my $cr, my $pw) or fatal("pipe: $!");
@@ -548,18 +548,16 @@ sub _determine_mount_flags ($m, $type, $dest, $dest_preexisted_ref) {
     my @real_opts;
     my @recursive_attrs;
 
+    my %_opt_action = (tmpcopyup => 'skip', copy => 'skip', idmap => 'idmap', ridmap => 'ridmap');
     for my $o (@raw_opts) {
-        if ($o eq 'tmpcopyup' || $o eq 'copy') {
-            $tmpcopyup = 1;
-        } elsif ($o eq 'idmap') {
-            $has_idmap = 1;
-        } elsif ($o eq 'ridmap') {
-            $has_ridmap = 1;
-        } elsif (exists $RECURSIVE_MOUNT_ATTRS{$o}) {
-            push @recursive_attrs, $o;
-        } else {
-            push @real_opts, $o;
+        my $act = $_opt_action{$o};
+        if ($act) {
+            $has_idmap = 1 if $act eq 'idmap';
+            $has_ridmap = 1 if $act eq 'ridmap';
+            $tmpcopyup = 1 if $act eq 'skip';
         }
+        elsif (exists $RECURSIVE_MOUNT_ATTRS{$o}) {push @recursive_attrs, $o;}
+        else {push @real_opts, $o;}
     }
 
     # OCI spec: idmap mounts are also identified by per-mount
@@ -718,25 +716,15 @@ sub _apply_recursive_attrs ($dest, $recursive_attrs_ref) {
 }
 
 ## Apply idmap or ridmap via open_tree + mount_setattr + move_mount.
-sub _apply_idmap ($m, $dest, $flags, $has_idmap, $has_ridmap, $mount_source_fds, $chan_w, $chan_r) {
-    my $open_flags = OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC;
-    $open_flags |= AT_RECURSIVE if ($flags & MS_REC);
-    my $tree_fd = do_open_tree(-1, $dest, $open_flags);
-    fatal("open_tree $dest: $!") if $tree_fd < 0;
-
-    # Determine the user namespace fd for the mapping
-    my $userns_fd;
+sub _idmap_resolve_userns ($m, $mount_source_fds, $chan_w, $chan_r) {
     my $per_mount_maps = $m->{uidMappings} || $m->{gidMappings};
     my $delegate_to_parent = 0;
-    if ($per_mount_maps) {
+    my $userns_fd;
 
-        # Per-mount explicit mappings: create a user namespace
-        # with those mappings.  This may fail inside a container
-        # userns (writing /proc/$child/setgroups from a non-init
-        # userns is denied) -- fall back to parent in that case.
+    if ($per_mount_maps) {
         my $userns_err;
         try {
-            $userns_fd = _create_userns_for_idmap($m->{uidMappings} // [], $m->{gidMappings} // [], $chan_w, $chan_r,);
+            $userns_fd = _create_userns_for_idmap($m->{uidMappings} // [], $m->{gidMappings} // [], $chan_w, $chan_r);
         } catch ($e) {
             $userns_err = $e;
         }
@@ -745,58 +733,49 @@ sub _apply_idmap ($m, $dest, $flags, $has_idmap, $has_ridmap, $mount_source_fds,
             fatal("create userns for idmap: $userns_err") unless $delegate_to_parent;
         }
     } else {
-
-        # Implied mapping: use the container's own user namespace.
-        # If we're inside a userns, /proc/self/ns/user is our userns.
         sysopen(my $ns_fh, '/proc/self/ns/user', O_RDONLY)
             or fatal("open /proc/self/ns/user: $!");
         $userns_fd = fileno($ns_fh);
-
-        # Keep the fh alive
         push @{$mount_source_fds->{_fhs}}, $ns_fh;
     }
+    return ($userns_fd, $delegate_to_parent, $per_mount_maps);
+}
+
+sub _idmap_delegate_parent ($m, $has_ridmap, $implied, $tree_fd, $chan_w, $chan_r) {
+    channel_send(
+        $chan_w,
+        {
+            type => 'mount_fd_request',
+            ridmap => $has_ridmap ? 1 : 0,
+            uid_map => _build_map_string($m->{uidMappings}),
+            gid_map => _build_map_string($m->{gidMappings}),
+            implied => $implied,
+        }
+    );
+    send_fd_over_fd($chan_w, $tree_fd);
+    my $resp = channel_recv($chan_r);
+    fatal("mount_setattr idmap failed") unless $resp && $resp->{type} eq 'mount_fd_done';
+    return;
+}
+
+sub _apply_idmap ($m, $dest, $flags, $has_idmap, $has_ridmap, $mount_source_fds, $chan_w, $chan_r) {
+    my $open_flags = OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC;
+    $open_flags |= AT_RECURSIVE if ($flags & MS_REC);
+    my $tree_fd = do_open_tree(-1, $dest, $open_flags);
+    fatal("open_tree $dest: $!") if $tree_fd < 0;
+
+    my ($userns_fd, $delegate_to_parent, $per_mount_maps)
+        = _idmap_resolve_userns($m, $mount_source_fds, $chan_w, $chan_r);
 
     if ($delegate_to_parent) {
-
-        # Delegate entire idmap operation (userns creation +
-        # mount_setattr) to the parent, which is outside the
-        # container userns and can write /proc mappings.
-        channel_send(
-            $chan_w,
-            {
-                type => 'mount_fd_request',
-                ridmap => $has_ridmap ? 1 : 0,
-                uid_map => _build_map_string($m->{uidMappings}),
-                gid_map => _build_map_string($m->{gidMappings}),
-                implied => 0,
-            }
-        );
-        send_fd_over_fd($chan_w, $tree_fd);
-        my $resp = channel_recv($chan_r);
-        fatal("mount_setattr idmap failed") unless $resp && $resp->{type} eq 'mount_fd_done';
+        _idmap_delegate_parent($m, $has_ridmap, 0, $tree_fd, $chan_w, $chan_r);
     } else {
-
-        # Apply mount_setattr(MOUNT_ATTR_IDMAP)
         my $setattr_flags = AT_EMPTY_PATH;
         $setattr_flags |= AT_RECURSIVE if $has_ridmap;
         my $ok = do_mount_setattr($tree_fd, "", $setattr_flags, MOUNT_ATTR_IDMAP, 0, $userns_fd);
         if (!$ok) {
-
-            # If init can't do it (in userns), ask parent
             if ($chan_w && $! == EPERM) {
-                channel_send(
-                    $chan_w,
-                    {
-                        type => 'mount_fd_request',
-                        ridmap => $has_ridmap ? 1 : 0,
-                        uid_map => _build_map_string($m->{uidMappings}),
-                        gid_map => _build_map_string($m->{gidMappings}),
-                        implied => $per_mount_maps ? 0 : 1,
-                    }
-                );
-                send_fd_over_fd($chan_w, $tree_fd);
-                my $resp = channel_recv($chan_r);
-                fatal("mount_setattr idmap failed") unless $resp && $resp->{type} eq 'mount_fd_done';
+                _idmap_delegate_parent($m, $has_ridmap, $per_mount_maps ? 0 : 1, $tree_fd, $chan_w, $chan_r);
             } else {
                 POSIX::close($tree_fd);
                 fatal("mount_setattr MOUNT_ATTR_IDMAP $dest: $!");
@@ -804,7 +783,6 @@ sub _apply_idmap ($m, $dest, $flags, $has_idmap, $has_ridmap, $mount_source_fds,
         }
     }
 
-    # Replace original mount with the idmapped one
     do_umount($dest, MNT_DETACH);
     do_move_mount($tree_fd, "", -1, $dest, MOVE_MOUNT_F_EMPTY_PATH)
         or fatal("move_mount $dest: $!");
@@ -972,7 +950,7 @@ sub create_symlinks ($rootfs) {
     return;
 }
 
-sub _mask_host_procfs_sysfs ($rootfs) {
+sub _mask_host_procfs_sysfs ($rootfs) {    ## no critic (ProhibitUnusedPrivateSubroutines)
 
     # Unmount or cover all full procfs/sysfs mounts that are outside the
     # container rootfs.  This prevents the container from re-mounting

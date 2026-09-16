@@ -185,7 +185,7 @@ sub do_syscall (@args) {
     my $n = scalar @args;
     my $ret;
     do {
-        if ($n <= 1) {$ret = syscall($a0);}
+        if ($n <= 1) {$ret = syscall($a0);}    ## no critic (ProhibitCascadingIfElse)
         elsif ($n == 2) {$ret = syscall($a0, $a1);}
         elsif ($n == 3) {$ret = syscall($a0, $a1, $a2);}
         elsif ($n == 4) {$ret = syscall($a0, $a1, $a2, $a3);}
