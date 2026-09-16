@@ -60,6 +60,7 @@ sub send_netlink ($msg) {
         fatal("netlink error: " . ($error == 0 ? 'ok' : POSIX::strerror(-$error)))
             if $error != 0;
     }
+    return;
 }
 
 sub get_ifindex ($ifname) {
@@ -76,6 +77,7 @@ sub netlink_move_to_ns ($ifindex, $ns_pid) {
         . pack('C x S l L L', 0, 0, $ifindex, 0, 0)
         . pack('S S L', 8, IFLA_NET_NS_PID, $ns_pid);
     send_netlink($msg);
+    return;
 }
 
 sub netlink_rename ($ifindex, $new_name) {
@@ -90,18 +92,21 @@ sub netlink_rename ($ifindex, $new_name) {
         . $name_data
         . ("\0" x ($padded_len - $attr_len));
     send_netlink($msg);
+    return;
 }
 
 sub netlink_set_up ($ifindex) {
     my $msg = pack('L S S L L', 32, RTM_SETLINK, NLM_F_REQUEST | NLM_F_ACK, 1, 0)
         . pack('C x S l L L', 0, 0, $ifindex, IFF_UP, IFF_UP);
     send_netlink($msg);
+    return;
 }
 
 sub netlink_set_down ($ifindex) {
     my $msg = pack('L S S L L', 32, RTM_SETLINK, NLM_F_REQUEST | NLM_F_ACK, 1, 0)
         . pack('C x S l L L', 0, 0, $ifindex, 0, IFF_UP);
     send_netlink($msg);
+    return;
 }
 
 sub set_mtu ($ifname, $mtu) {
@@ -109,6 +114,7 @@ sub set_mtu ($ifname, $mtu) {
     my $ifreq = pack('a16 l x12', $ifname, $mtu);
     ioctl($sock, SIOCSIFMTU, $ifreq) or fatal("ioctl SIOCSIFMTU $ifname: $!");
     close $sock;
+    return;
 }
 
 sub set_mac_address ($ifname, $mac_str) {
@@ -119,6 +125,7 @@ sub set_mac_address ($ifname, $mac_str) {
     my $ifreq = pack('a16 a16', $ifname, $sa);
     ioctl($sock, SIOCSIFHWADDR, $ifreq) or fatal("ioctl SIOCSIFHWADDR $ifname: $!");
     close $sock;
+    return;
 }
 
 sub netlink_add_addr ($ifindex, $addr_str) {
@@ -144,6 +151,7 @@ sub netlink_add_addr ($ifindex, $addr_str) {
         . $addr_bytes
         . ("\0" x ($padded_attr - $attr_len));
     send_netlink($msg);
+    return;
 }
 
 sub netlink_list_addrs ($ifindex) {
@@ -250,6 +258,7 @@ sub move_net_devices ($netdevs, $ns_pid) {
         syscall($nr, $fd, $fl) == 0 or fatal("setns host netns: $!");
         close $host_ns;
     }
+    return;
 }
 
 sub rename_net_devices ($netdevs) {
@@ -261,6 +270,7 @@ sub rename_net_devices ($netdevs) {
         log_debug("netdev: renaming $host_name -> $new_name (idx=$ifindex)");
         netlink_rename($ifindex, $new_name);
     }
+    return;
 }
 
 our @EXPORT_OK = qw(

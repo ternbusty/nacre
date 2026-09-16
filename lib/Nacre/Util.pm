@@ -23,12 +23,14 @@ sub setup_logging (%p) {
     $LOG_DEBUG = $p{debug} // 0;
     $LOG_FORMAT = $p{format} // 'text';
     if ($p{log_file}) {
-        open($LOG_FH, '>>', $p{log_file})
+        open(my $fh, '>>', $p{log_file})
             or die "nacre: cannot open log file $p{log_file}: $!\n";
-        $LOG_FH->autoflush(1);
-    } else {
-        $LOG_FH = \*STDERR;
+        $fh->autoflush(1);
+        $LOG_FH = $fh;
+        return $fh;
     }
+    $LOG_FH = \*STDERR;
+    return;
 }
 
 sub log_msg ($level, $msg) {
@@ -50,12 +52,13 @@ sub log_msg ($level, $msg) {
     } else {
         print $LOG_FH "time=\"$ts\" level=$level msg=\"$msg\"\n";
     }
+    return;
 }
 
-sub log_debug ($msg) {log_msg('debug', $msg)}
-sub log_info ($msg) {log_msg('info', $msg)}
-sub log_warn ($msg) {log_msg('warning', $msg)}
-sub log_error ($msg) {log_msg('error', $msg)}
+sub log_debug ($msg) {log_msg('debug', $msg); return}
+sub log_info ($msg) {log_msg('info', $msg); return}
+sub log_warn ($msg) {log_msg('warning', $msg); return}
+sub log_error ($msg) {log_msg('error', $msg); return}
 
 # ═══════════════════════════════════════════════════════════════════════
 # Utility functions
@@ -86,12 +89,14 @@ sub parse_size ($s) {
         return int($n * ($mult{$u} // 1));
     }
     fatal("invalid size: '$s'");
+    return;
 }
 
 sub write_file ($path, $content) {
     open my $fh, '>', $path or fatal("write $path: $!");
     print $fh $content or fatal("write $path: $!");
     close $fh or fatal("close $path: $!");
+    return;
 }
 
 sub read_file ($path) {
@@ -112,6 +117,7 @@ sub write_file_atomic ($path, $content) {
     my $tmp = "$path.tmp.$$";
     write_file($tmp, $content);
     rename($tmp, $path) or do {unlink $tmp; fatal("rename $tmp -> $path: $!");};
+    return;
 }
 
 sub ensure_dir ($path) {
@@ -134,6 +140,7 @@ sub ensure_dir ($path) {
             warn "nacre: ensure_dir: mkdir $d failed: $!\n";
         }
     }
+    return;
 }
 
 sub iso8601_now {

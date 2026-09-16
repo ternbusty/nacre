@@ -21,6 +21,7 @@ sub channel_send ($fd, $msg) {
     my $data = $JSON_COMPACT->encode($msg);
     my $ret = POSIX::write($fd, $data, length($data));
     fatal("channel_send: $!") unless defined $ret && $ret > 0;
+    return;
 }
 
 sub channel_recv ($fd) {
@@ -55,6 +56,7 @@ sub notify_container_start ($sock_path) {
     connect($s, pack_sockaddr_un($sock_path)) or fatal("connect $sock_path: $!");
     syswrite($s, "start container");
     close $s;
+    return;
 }
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -97,6 +99,7 @@ sub send_fd_via_socket ($socket_path, $fd, $payload = undef) {
     $ret >= 0 or fatal("sendmsg (console socket): $!");
 
     close($sock);
+    return;
 }
 
 # Send a file descriptor over an already-connected socket fd (not a path).
@@ -230,6 +233,7 @@ sub pty_set_raw ($fd) {
         ioctl($fh, TCSETS_C, $termios);
         close $fh;
     }
+    return;
 }
 
 our @EXPORT_OK = qw(

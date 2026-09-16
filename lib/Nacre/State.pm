@@ -24,6 +24,7 @@ sub cache_spec ($root, $id, $spec) {
     my $dir = state_dir($root, $id);
     ensure_dir($dir);
     write_file_atomic("$dir/config.json", $JSON->encode($spec));
+    return;
 }
 
 sub load_cached_spec ($root, $id, $bundle) {
@@ -151,11 +152,13 @@ sub save_state ($root, $state) {
     my $dir = state_dir($root, $state->{id});
     ensure_dir($dir);
     write_file_atomic("$dir/state.json", $JSON->encode($state));
+    return;
 }
 
 sub delete_state ($root, $id) {
     my $dir = state_dir($root, $id);
     remove_tree($dir) if -d $dir;
+    return;
 }
 
 sub refresh_state ($state) {
@@ -189,6 +192,7 @@ sub refresh_state ($state) {
             $state->{status} = 'stopped';
         }
     }
+    return;
 }
 
 sub parse_proc_starttime ($stat_line) {

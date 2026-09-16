@@ -60,7 +60,7 @@ BEGIN {
             SYS_inotify_init1     => 294,
             SYS_inotify_add_watch => 254,
             SYS_waitid            => 247,
-        }; 1' or die $@;
+        }; 1' or die $@;    ## no critic (ErrorHandling::RequireCarping)
     } else {
         eval 'package Nacre::Const; use constant {
             SYS_mount             => 40,
@@ -105,7 +105,7 @@ BEGIN {
             SYS_inotify_init1     => 26,
             SYS_inotify_add_watch => 27,
             SYS_waitid            => 95,
-        }; 1' or die $@;
+        }; 1' or die $@;    ## no critic (ErrorHandling::RequireCarping)
     }
 }
 

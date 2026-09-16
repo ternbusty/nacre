@@ -58,10 +58,12 @@ sub cgroup_setup ($cgpath, $spec) {
                 eval {write_file($sc_file, "+$ctrl\n");};
             }
         }
+        return;
     }
 
     # Apply resources
     cgroup_apply_resources($cgpath, $spec);
+    return;
 }
 
 sub cgroup_apply_resources ($cgpath, $spec, %opts) {
@@ -199,10 +201,12 @@ sub cgroup_apply_resources ($cgpath, $spec, %opts) {
             }
         }
     }
+    return;
 }
 
 sub cgroup_add_process ($cgpath, $pid) {
     cg_write($cgpath, 'cgroup.procs', $pid);
+    return;
 }
 
 sub cgroup_cleanup ($cgpath) {
@@ -229,6 +233,7 @@ sub cgroup_cleanup ($cgpath) {
         last unless $! == EBUSY;
         usleep(50_000 * $attempt);
     }
+    return;
 }
 
 sub cgroup_pids ($cgpath) {
@@ -253,6 +258,7 @@ sub cg_write ($cgpath, $file, $value, %opts) {
 
         # Non-fatal by default: some cgroup files may not exist
     }
+    return;
 }
 
 sub convert_cpu_shares ($shares) {

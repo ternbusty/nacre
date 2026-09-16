@@ -112,6 +112,7 @@ sub validate_rlimits ($spec) {
         exists $RLIMIT_MAP{$rl->{type}}
             or fatal("unknown rlimit type '$rl->{type}'");
     }
+    return;
 }
 
 sub apply_rlimits ($spec) {
@@ -127,6 +128,7 @@ sub apply_rlimits ($spec) {
         my $new_rlim = pack('QQ', $soft, $hard);
         syscall($nr, 0, $t, $new_rlim, 0);
     }
+    return;
 }
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -152,6 +154,7 @@ sub apply_iopriority ($spec) {
     my $pid = 0 + 0;    # self
     my $val = $ioprio + 0;
     syscall($nr, $who, $pid, $val);
+    return;
 }
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -218,6 +221,7 @@ sub apply_scheduler ($spec) {
     if ($r == -1) {
         fatal("sched_setattr: $!");
     }
+    return;
 }
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -278,6 +282,7 @@ sub validate_memory_policy ($spec) {
     if ($mode_str eq 'MPOL_DEFAULT' && @nodes > 0) {
         fatal("set_mempolicy: mode requires 0 nodes but got " . scalar(@nodes));
     }
+    return;
 }
 
 sub apply_memory_policy ($spec) {
@@ -325,6 +330,7 @@ sub apply_memory_policy ($spec) {
     if ($r == -1) {
         fatal("set_mempolicy: $!");
     }
+    return;
 }
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -354,6 +360,7 @@ sub apply_timens_offsets ($spec) {
     } else {
         warn "nacre: open $path: $! (ignoring)\n";
     }
+    return;
 }
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -430,6 +437,7 @@ sub apply_cpu_affinity_reset ($spec) {
     my $pid = 0 + 0;    # 0 = current process
     my $l = $len + 0;
     syscall($nr, $pid, $l, $mask);
+    return;
 }
 
 sub apply_exec_cpu_affinity ($affinity, $dbg) {
@@ -474,6 +482,7 @@ sub apply_final_cpu_affinity ($final_str) {
     my $pid = 0 + 0;
     my $l = $len + 0;
     syscall($nr, $pid, $l, $mask);
+    return;
 }
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -567,6 +576,7 @@ sub apply_exec_caps ($cap_list, $spec) {
         my $n = $CAP_NUM{$name} // next;
         do_syscall(SYS_prctl, PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, $n, 0, 0);
     }
+    return;
 }
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -594,6 +604,7 @@ sub apply_sysctls ($spec) {
         my $path = '/proc/sys/' . ($key =~ s/\./\//gr);
         eval {write_file($path, $sysctls->{$key});};
     }
+    return;
 }
 
 our @EXPORT_OK = qw(

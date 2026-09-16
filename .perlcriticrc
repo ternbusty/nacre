@@ -11,16 +11,11 @@ equivalent_modules = v5.38
 [-TestingAndDebugging::ProhibitNoWarnings]
 
 # -- Intentional patterns for a low-dependency systems program --
-[-Subroutines::RequireFinalReturn]
 [-InputOutput::ProhibitInteractiveTest]
-[-InputOutput::ProhibitExplicitStdin]
 [-ValuesAndExpressions::ProhibitLeadingZeros]
 [-ValuesAndExpressions::ProhibitConstantPragma]
 [-ValuesAndExpressions::ProhibitVersionStrings]
-[-ErrorHandling::RequireCarping]
-[-ControlStructures::ProhibitPostfixControls]
 [-Variables::RequireLocalizedPunctuationVars]
-[-InputOutput::RequireBriefOpen]
 
 # -- Expression eval used for syscall probing --
 [-BuiltinFunctions::ProhibitStringyEval]

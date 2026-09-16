@@ -23,6 +23,7 @@ sub validate_capabilities ($spec) {
         my @known = grep {exists $CAP_NUM{$_}} @{$caps->{$set} // []};
         $caps->{$set} = \@known;
     }
+    return;
 }
 
 sub apply_capabilities_bounding ($spec) {
@@ -44,6 +45,7 @@ sub apply_capabilities_bounding ($spec) {
 
     # Keep caps across setuid (cleared in phase 2)
     do_syscall(SYS_prctl, PR_SET_KEEPCAPS, 1, 0, 0, 0);
+    return;
 }
 
 sub apply_capabilities_final ($spec) {
@@ -94,6 +96,7 @@ sub apply_capabilities_final ($spec) {
             warn "nacre: can't raise ambient capability $name: $!\n";
         }
     }
+    return;
 }
 
 our @EXPORT_OK = qw(

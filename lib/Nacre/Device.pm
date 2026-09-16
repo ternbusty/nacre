@@ -59,6 +59,7 @@ sub apply_device_cgroup ($cgpath, $spec) {
 
     close $cgdir_fh;
     POSIX::close($prog_fd);
+    return;
 }
 
 sub _emulate_device_rules ($rules) {

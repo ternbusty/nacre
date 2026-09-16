@@ -229,14 +229,15 @@ sub _copy_dir_contents ($src, $dst) {
                         print $out $buf;
                     }
                     close $out;
-                    my @st = stat($s);
-                    chmod $st[2] & 07777, $d if @st;
                 }
                 close $in;
+                my @st = stat($s);
+                chmod $st[2] & 07777, $d if @st;
             }
         }
     }
     closedir $dh;
+    return;
 }
 
 sub prepare_rootfs ($spec, $rootfs, $mount_source_fds, $chan_w, $chan_r) {
@@ -278,6 +279,7 @@ sub prepare_rootfs ($spec, $rootfs, $mount_source_fds, $chan_w, $chan_r) {
         do_mount('', "$rootfs/dev", '', MS_REMOUNT | MS_BIND | MS_RDONLY, '')
             or warn "nacre: remount /dev ro: $!\n";
     }
+    return;
 }
 
 # Build "containerID hostID size\n" mapping string for idmap userns
@@ -368,7 +370,7 @@ sub _create_userns_for_idmap ($uid_maps, $gid_maps, $chan_w, $chan_r) {
         close $p_sock;
         kill 'KILL', $child;
         waitpid($child, 0);
-        die $err;
+        die $err;    ## no critic (ErrorHandling::RequireCarping)
     }
 
     # Signal child: "mappings written"
@@ -837,6 +839,7 @@ sub create_devices ($rootfs, $spec) {
             }
         }
         push @devices, $spec_dev unless $found;
+        return;
     }
 
     for my $dev (@devices) {
@@ -886,6 +889,7 @@ sub create_devices ($rootfs, $spec) {
             }
         }
     }
+    return;
 }
 
 sub create_symlinks ($rootfs) {
@@ -894,6 +898,7 @@ sub create_symlinks ($rootfs) {
         next if -e $dest || -l $dest;
         symlink($s->{target}, $dest);
     }
+    return;
 }
 
 sub _mask_host_procfs_sysfs ($rootfs) {
@@ -902,24 +907,26 @@ sub _mask_host_procfs_sysfs ($rootfs) {
     # container rootfs.  This prevents the container from re-mounting
     # procfs/sysfs after chroot in --no-pivot mode (runc's msMoveRoot).
     my @to_mask;
+    my @mi_lines;
     if (open my $fh, '<', '/proc/self/mountinfo') {
-        while (my $line = <$fh>) {
-            chomp $line;
-
-            # mountinfo format: id parent_id major:minor root mountpoint ...
-            # fields after " - " are: fstype source super_options
-            my ($before, $after) = split / - /, $line, 2;
-            next unless defined $after;
-            my @b = split ' ', $before;
-            my $root = $b[3] // '';
-            my $mp = $b[4] // '';
-            my ($fstype) = split ' ', $after;
-            next unless $root eq '/';    # only full mounts
-            next unless $fstype eq 'proc' || $fstype eq 'sysfs';
-            next if $mp =~ /^\Q$rootfs\E(?:\/|$)/;    # skip container's own mounts
-            push @to_mask, $mp;
-        }
+        @mi_lines = <$fh>;
         close $fh;
+    }
+    for my $line (@mi_lines) {
+        chomp $line;
+
+        # mountinfo format: id parent_id major:minor root mountpoint ...
+        # fields after " - " are: fstype source super_options
+        my ($before, $after) = split / - /, $line, 2;
+        next unless defined $after;
+        my @b = split ' ', $before;
+        my $root = $b[3] // '';
+        my $mp = $b[4] // '';
+        my ($fstype) = split ' ', $after;
+        next unless $root eq '/';    # only full mounts
+        next unless $fstype eq 'proc' || $fstype eq 'sysfs';
+        next if $mp =~ /^\Q$rootfs\E(?:\/|$)/;    # skip container's own mounts
+        push @to_mask, $mp;
     }
     for my $p (@to_mask) {
 
@@ -931,6 +938,7 @@ sub _mask_host_procfs_sysfs ($rootfs) {
             do_mount('tmpfs', $p, 'tmpfs', 0, '');
         }
     }
+    return;
 }
 
 sub apply_pivot_root ($rootfs) {
@@ -944,6 +952,7 @@ sub apply_pivot_root ($rootfs) {
     do_umount('.', MNT_DETACH) or fatal("umount old root: $!");
 
     chdir('/') or fatal("chdir /: $!");
+    return;
 }
 
 sub apply_rootfs_propagation ($spec) {
@@ -979,6 +988,7 @@ sub apply_rootfs_propagation ($spec) {
         do_mount('', '/', '', $prop_flags, '')
             or fatal("mount propagation ($propagation) /: $!");
     }
+    return;
 }
 
 sub apply_masked_paths ($paths) {
@@ -1032,6 +1042,7 @@ sub apply_masked_paths ($paths) {
                 || log_debug("maskedPaths: could not remount $p read-only: $!");
         }
     }
+    return;
 }
 
 sub apply_readonly_paths ($paths) {
@@ -1040,12 +1051,14 @@ sub apply_readonly_paths ($paths) {
         do_mount($p, $p, '', MS_BIND | MS_REC, '');
         do_mount('', $p, '', MS_REMOUNT | MS_BIND | MS_RDONLY | MS_REC, '');
     }
+    return;
 }
 
 sub set_rootfs_readonly ($rootfs_readonly) {
     return unless $rootfs_readonly;
     do_mount('', '/', '', MS_REMOUNT | MS_BIND | MS_RDONLY, '')
         or fatal("remount / readonly: $!");
+    return;
 }
 
 our @EXPORT_OK = qw(

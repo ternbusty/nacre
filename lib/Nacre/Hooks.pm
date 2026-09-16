@@ -91,6 +91,7 @@ sub run_hooks ($hooks, $state, %opts) {
         }
         $hook_idx++;
     }
+    return;
 }
 
 our @EXPORT_OK = qw(run_hooks);

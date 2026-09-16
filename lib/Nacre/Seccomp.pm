@@ -21,6 +21,7 @@ sub init_libseccomp {
         $LIBSECCOMP = DynaLoader::dl_load_file('/usr/lib/x86_64-linux-gnu/libseccomp.so.2', 0);
         $SECCOMP_AVAILABLE = 1 if $LIBSECCOMP;
     };
+    return;
 }
 
 # Seccomp actions
@@ -175,6 +176,7 @@ sub _apply_seccomp_ffi ($spec) {
     }
 
     seccomp_release($ctx);
+    return;
 }
 
 my %_SYSCALL_NR;
@@ -581,6 +583,7 @@ sub _init_syscall_table {
             lsm_list_modules => 461,
         );
     }
+    return;
 }
 
 sub _resolve_seccomp_syscall ($name) {
@@ -678,6 +681,7 @@ sub _gen_seccomp_rule_bpf ($nr, $ret, $args) {
                 }
                 push @body, {code => $opcode, k => $val, jt => $jt_sym, jf => $jf_sym};
             }
+            return;
         }
     }
 
