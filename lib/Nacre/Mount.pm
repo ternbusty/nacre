@@ -840,7 +840,6 @@ sub create_devices ($rootfs, $spec) {
             }
         }
         push @devices, $spec_dev unless $found;
-        return;
     }
 
     for my $dev (@devices) {
