@@ -34,7 +34,7 @@ use Nacre::Util qw(
     $JSON $JSON_COMPACT $LOG_FH
     setup_logging log_debug fatal parse_size
     write_file read_file read_file_or_die ensure_dir iso8601_now do_syscall
-    do_setns do_unshare wait_exit_code
+    do_setns do_unshare wait_exit_code lookup_home_from_passwd
 );
 use Nacre::Seccomp qw(apply_seccomp_raw);
 use Nacre::Device qw(apply_device_cgroup);
@@ -307,24 +307,9 @@ sub run_init_process (    ## no critic (RequireFinalReturn)
         $ENV{$k} = $v if defined $k;
     }
 
-    # Default HOME from /etc/passwd if not set or empty (OCI / runc compat).
-    # runc overrides HOME="" with the passwd entry (de facto behavior).
-    # At this point we are already inside the container rootfs (post pivot_root).
     if (!defined $ENV{HOME} || $ENV{HOME} eq '') {
         my $uid = $spec->{process}{user}{uid} // 0;
-        my $home = '/';
-        if (open my $pw, '<', '/etc/passwd') {
-            while (my $line = <$pw>) {
-                chomp $line;
-                my @f = split /:/, $line;
-                if (@f >= 6 && $f[2] == $uid) {
-                    $home = $f[5] if $f[5] ne '';
-                    last;
-                }
-            }
-            close $pw;
-        }
-        $ENV{HOME} = $home;
+        $ENV{HOME} = lookup_home_from_passwd($uid);
     }
 
     # Run startContainer hooks (run inside the container namespace,
@@ -1120,14 +1105,8 @@ sub cmd_create (%p) {
         write_file($p{pid_file}, "$init_pid\n");
     }
 
-    # Send pidfd via socket if requested
     if ($p{pidfd_socket}) {
-        my $pidfd_nr = SYS_pidfd_open + 0;
-        my $pid_arg = $init_pid + 0;
-        my $pidfd = syscall($pidfd_nr, $pid_arg, 0);
-        fatal("pidfd_open($init_pid): $!") if $pidfd < 0;
-        send_fd_via_socket($p{pidfd_socket}, $pidfd);
-        POSIX::close($pidfd);
+        _send_pidfd($p{pidfd_socket}, $init_pid);
     }
 
     # Move network devices into the container's network namespace
@@ -1234,10 +1213,7 @@ sub cmd_kill (%p) {
     if ($state->{status} ne 'running' && $state->{status} ne 'created') {
         return if $all;
 
-        # Parse signal early for cgroup-based kill checks below
-        my $signum_check;
-        if ($signal =~ /^\d+$/) {$signum_check = $signal;}
-        else {my $s = $signal; $s =~ s/^SIG//i; $signum_check = $SIG_NUM{uc($s)};}
+        my $signum_check = _parse_signal($signal);
 
         if ($state->{status} eq 'stopped') {
 
@@ -1258,14 +1234,7 @@ sub cmd_kill (%p) {
         }
     }
 
-    # Parse signal
-    my $signum;
-    if ($signal =~ /^\d+$/) {
-        $signum = $signal;
-    } else {
-        $signal =~ s/^SIG//i;
-        $signum = $SIG_NUM{uc($signal)} // fatal("unknown signal: $signal");
-    }
+    my $signum = _parse_signal($signal) // fatal("unknown signal: $signal");
 
     # For SIGKILL: use cgroup.kill (cgroup v2) to atomically kill all
     # processes in the container.  This is essential when the container
@@ -1806,6 +1775,25 @@ sub _adopt_fd ($fd) {
     return $fh;
 }
 
+sub _send_pidfd ($socket_path, $pid) {
+    my $pidfd_nr = SYS_pidfd_open + 0;
+    my $pid_arg = $pid + 0;
+    my $pidfd = syscall($pidfd_nr, $pid_arg, 0);
+    fatal("pidfd_open($pid): $!") if $pidfd < 0;
+    send_fd_via_socket($socket_path, $pidfd);
+    POSIX::close($pidfd);
+    return;
+}
+
+sub _parse_signal ($signal) {
+    if ($signal =~ /^\d+$/) {
+        return $signal + 0;
+    }
+    my $s = $signal;
+    $s =~ s/^SIG//i;
+    return $SIG_NUM{uc($s)};
+}
+
 # ═══════════════════════════════════════════════════════════════════════
 # Container: exec
 # ═══════════════════════════════════════════════════════════════════════
@@ -2165,25 +2153,11 @@ sub cmd_exec (%p) {
             }
         }
 
-        # Set HOME from /etc/passwd if --user is given and HOME not
-        # explicitly provided in exec_env (runc compat).
         if ($exec_user) {
             my $target_uid;
             if ($exec_user =~ /^(\d+)/) {$target_uid = $1;}
             if (defined $target_uid && !$exec_env_keys{HOME}) {
-                my $home = '/';
-                if (open my $pw, '<', '/etc/passwd') {
-                    while (my $line = <$pw>) {
-                        chomp $line;
-                        my @f = split /:/, $line;
-                        if (@f >= 6 && $f[2] == $target_uid) {
-                            $home = $f[5] if $f[5] ne '';
-                            last;
-                        }
-                    }
-                    close $pw;
-                }
-                $ENV{HOME} = $home;
+                $ENV{HOME} = lookup_home_from_passwd($target_uid);
             }
         }
 
@@ -2541,14 +2515,8 @@ sub cmd_exec (%p) {
         $pty_master_fd = undef;
     }
 
-    # Send pidfd via socket if requested (use final_pid for actual exec process)
     if ($pidfd_socket) {
-        my $pidfd_nr = SYS_pidfd_open + 0;
-        my $pid_arg = $final_pid + 0;
-        my $pidfd = syscall($pidfd_nr, $pid_arg, 0);
-        fatal("pidfd_open($final_pid): $!") if $pidfd < 0;
-        send_fd_via_socket($pidfd_socket, $pidfd);
-        POSIX::close($pidfd);
+        _send_pidfd($pidfd_socket, $final_pid);
     }
 
     # Close namespace fds in parent
