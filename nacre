@@ -1750,7 +1750,7 @@ sub _exec_setup_pipes ($tty, $spec) {
     };
 }
 
-sub _exec_relocate_fds ($preserve_fds, $pipes, $err_w_orig) {
+sub _exec_relocate_fds ($preserve_fds, $pipes) {
     my $min_fd = 3 + $preserve_fds;
     for my $key (
         qw(err_r err_w sync_r sync_w gc_pid_r gc_pid_w cg_sync_r cg_sync_w
