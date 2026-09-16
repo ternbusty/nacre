@@ -16,7 +16,7 @@ sub apply_process_security ($spec) {
 
     # 1. OOM score adj
     if (defined $proc->{oomScoreAdj}) {
-        eval { write_file('/proc/self/oom_score_adj', $proc->{oomScoreAdj}); };
+        eval {write_file('/proc/self/oom_score_adj', $proc->{oomScoreAdj});};
     }
 
     # 2. Umask
@@ -50,7 +50,7 @@ sub apply_process_security ($spec) {
     #    Must happen AFTER KEEPCAPS is set and BEFORE the final capset.
     if (my $groups = $proc->{user}{additionalGids}) {
         my $nr = SYS_setgroups + 0;
-        my $n  = scalar(@$groups) + 0;
+        my $n = scalar(@$groups) + 0;
         my $pk = pack('L*', @$groups);
         syscall($nr, $n, $pk);
     } else {
@@ -78,28 +78,29 @@ sub apply_process_security ($spec) {
 # ═══════════════════════════════════════════════════════════════════════
 
 my %RLIMIT_MAP = (
-    RLIMIT_AS         => 9,
-    RLIMIT_CORE       => 4,
-    RLIMIT_CPU        => 0,
-    RLIMIT_DATA       => 2,
-    RLIMIT_FSIZE      => 1,
-    RLIMIT_LOCKS      => 10,
-    RLIMIT_MEMLOCK    => 8,
-    RLIMIT_MSGQUEUE   => 12,
-    RLIMIT_NICE       => 13,
-    RLIMIT_NOFILE     => 7,
-    RLIMIT_NPROC      => 6,
-    RLIMIT_RSS        => 5,
-    RLIMIT_RTPRIO     => 14,
-    RLIMIT_RTTIME     => 15,
+    RLIMIT_AS => 9,
+    RLIMIT_CORE => 4,
+    RLIMIT_CPU => 0,
+    RLIMIT_DATA => 2,
+    RLIMIT_FSIZE => 1,
+    RLIMIT_LOCKS => 10,
+    RLIMIT_MEMLOCK => 8,
+    RLIMIT_MSGQUEUE => 12,
+    RLIMIT_NICE => 13,
+    RLIMIT_NOFILE => 7,
+    RLIMIT_NPROC => 6,
+    RLIMIT_RSS => 5,
+    RLIMIT_RTPRIO => 14,
+    RLIMIT_RTTIME => 15,
     RLIMIT_SIGPENDING => 11,
-    RLIMIT_STACK      => 3,
+    RLIMIT_STACK => 3,
 );
 
 sub validate_rlimits ($spec) {
+
     # OCI spec: "The runtime MUST generate an error for any values
     # which cannot be mapped to a relevant kernel interface."
-    return unless $spec->{process};  # avoid auto-vivifying {process}
+    return unless $spec->{process};    # avoid auto-vivifying {process}
     my $rlimits = $spec->{process}{rlimits} // return;
     for my $rl (@$rlimits) {
         exists $RLIMIT_MAP{$rl->{type}}
@@ -113,9 +114,10 @@ sub apply_rlimits ($spec) {
         my $type = $RLIMIT_MAP{$rl->{type}} // next;
         my $soft = $rl->{soft} // 0;
         my $hard = $rl->{hard} // 0;
+
         # prlimit64(pid=0, resource, new_rlim, old_rlim=NULL)
         my $nr = SYS_prlimit64 + 0;
-        my $t  = $type + 0;
+        my $t = $type + 0;
         my $new_rlim = pack('QQ', $soft, $hard);
         syscall($nr, 0, $t, $new_rlim, 0);
     }
@@ -126,22 +128,23 @@ sub apply_rlimits ($spec) {
 # ═══════════════════════════════════════════════════════════════════════
 
 my %IOPRIO_CLASS_MAP = (
-    IOPRIO_CLASS_RT   => 1,
-    IOPRIO_CLASS_BE   => 2,
+    IOPRIO_CLASS_RT => 1,
+    IOPRIO_CLASS_BE => 2,
     IOPRIO_CLASS_IDLE => 3,
 );
 
 sub apply_iopriority ($spec) {
     my $iop = $spec->{process}{ioPriority} // return;
     my $class = $IOPRIO_CLASS_MAP{$iop->{class} // ''} // return;
-    my $prio  = $iop->{priority} // 0;
+    my $prio = $iop->{priority} // 0;
+
     # ioprio_set(IOPRIO_WHO_PROCESS=1, pid=0, ioprio)
     # ioprio = (class << 13) | prio
     my $ioprio = ($class << 13) | ($prio & 0x1fff);
     my $nr = SYS_ioprio_set + 0;
-    my $who  = 1 + 0;  # IOPRIO_WHO_PROCESS
-    my $pid  = 0 + 0;  # self
-    my $val  = $ioprio + 0;
+    my $who = 1 + 0;    # IOPRIO_WHO_PROCESS
+    my $pid = 0 + 0;    # self
+    my $val = $ioprio + 0;
     syscall($nr, $who, $pid, $val);
 }
 
@@ -150,20 +153,20 @@ sub apply_iopriority ($spec) {
 # ═══════════════════════════════════════════════════════════════════════
 
 my %SCHED_POLICY_MAP = (
-    SCHED_OTHER    => 0,
-    SCHED_FIFO     => 1,
-    SCHED_RR       => 2,
-    SCHED_BATCH    => 3,
-    SCHED_IDLE     => 5,
+    SCHED_OTHER => 0,
+    SCHED_FIFO => 1,
+    SCHED_RR => 2,
+    SCHED_BATCH => 3,
+    SCHED_IDLE => 5,
     SCHED_DEADLINE => 6,
 );
 
 my %SCHED_FLAG_MAP = (
-    SCHED_FLAG_RESET_ON_FORK  => 0x01,
-    SCHED_FLAG_RECLAIM        => 0x02,
-    SCHED_FLAG_DL_OVERRUN     => 0x04,
-    SCHED_FLAG_KEEP_POLICY    => 0x08,
-    SCHED_FLAG_KEEP_PARAMS    => 0x10,
+    SCHED_FLAG_RESET_ON_FORK => 0x01,
+    SCHED_FLAG_RECLAIM => 0x02,
+    SCHED_FLAG_DL_OVERRUN => 0x04,
+    SCHED_FLAG_KEEP_POLICY => 0x08,
+    SCHED_FLAG_KEEP_PARAMS => 0x10,
     SCHED_FLAG_UTIL_CLAMP_MIN => 0x20,
     SCHED_FLAG_UTIL_CLAMP_MAX => 0x40,
 );
@@ -182,17 +185,18 @@ sub apply_scheduler ($spec) {
     for my $f (@{$sched->{flags} // []}) {
         $flags |= ($SCHED_FLAG_MAP{$f} // 0);
     }
-    my $nice      = $sched->{nice}     // 0;
-    my $priority  = $sched->{priority} // 0;
-    my $runtime   = $sched->{runtime}  // 0;
-    my $deadline  = $sched->{deadline} // 0;
-    my $period    = $sched->{period}   // 0;
+    my $nice = $sched->{nice} // 0;
+    my $priority = $sched->{priority} // 0;
+    my $runtime = $sched->{runtime} // 0;
+    my $deadline = $sched->{deadline} // 0;
+    my $period = $sched->{period} // 0;
 
     # struct sched_attr (48 bytes):
     #   u32 size, u32 sched_policy, u64 sched_flags, s32 sched_nice,
     #   u32 sched_priority, u64 sched_runtime, u64 sched_deadline, u64 sched_period
-    my $attr = pack('LLQlLQQQ',
-        48,        # size
+    my $attr = pack(
+        'LLQlLQQQ',
+        48,    # size
         $policy,
         $flags,
         $nice,
@@ -202,7 +206,7 @@ sub apply_scheduler ($spec) {
         $period,
     );
     my $nr = SYS_sched_setattr + 0;
-    my $pid_val = 0 + 0;  # self
+    my $pid_val = 0 + 0;    # self
     my $fl = 0 + 0;
     my $r = syscall($nr, $pid_val, $attr, $fl);
     if ($r == -1) {
@@ -215,15 +219,15 @@ sub apply_scheduler ($spec) {
 # ═══════════════════════════════════════════════════════════════════════
 
 my %MPOL_MODE_MAP = (
-    MPOL_DEFAULT    => 0,
-    MPOL_PREFERRED  => 1,
-    MPOL_BIND       => 2,
+    MPOL_DEFAULT => 0,
+    MPOL_PREFERRED => 1,
+    MPOL_BIND => 2,
     MPOL_INTERLEAVE => 3,
-    MPOL_LOCAL      => 4,
+    MPOL_LOCAL => 4,
 );
 
 my %MPOL_FLAG_MAP = (
-    MPOL_F_STATIC_NODES   => (1 << 15),
+    MPOL_F_STATIC_NODES => (1 << 15),
     MPOL_F_RELATIVE_NODES => (1 << 14),
     MPOL_F_NUMA_BALANCING => (1 << 13),
 );
@@ -275,7 +279,7 @@ sub apply_memory_policy ($spec) {
 
     my $mode_str = $mp->{mode} // '';
     if ($mode_str eq '' || !exists $MPOL_MODE_MAP{$mode_str}) {
-        return;  # validation already done
+        return;    # validation already done
     }
     my $mode = $MPOL_MODE_MAP{$mode_str};
 
@@ -294,7 +298,8 @@ sub apply_memory_policy ($spec) {
     my $maxnode = 0;
     my @mask;
     if (@nodes) {
-        $maxnode = (sort { $b <=> $a } @nodes)[0] + 1;
+        $maxnode = (sort {$b <=> $a} @nodes)[0] + 1;
+
         # Round maxnode up to multiple of 64 for kernel alignment
         my $mask_longs = int(($maxnode + 63) / 64);
         @mask = (0) x $mask_longs;
@@ -306,9 +311,9 @@ sub apply_memory_policy ($spec) {
         $maxnode = $mask_longs * 64 + 1;
     }
 
-    my $nodemask = @mask ? pack('Q*', @mask) : 0;  # 0 = NULL pointer
+    my $nodemask = @mask ? pack('Q*', @mask) : 0;    # 0 = NULL pointer
     my $nr = SYS_set_mempolicy + 0;
-    my $m  = $mode + 0;
+    my $m = $mode + 0;
     my $mn = $maxnode + 0;
     my $r = syscall($nr, $m, $nodemask, $mn);
     if ($r == -1) {
@@ -322,6 +327,7 @@ sub apply_memory_policy ($spec) {
 
 sub apply_timens_offsets ($spec) {
     my $offsets = $spec->{linux}{timeOffsets} // return;
+
     # Only write if there are actual offsets to set
     return unless ref $offsets eq 'HASH' && %$offsets;
 
@@ -329,7 +335,7 @@ sub apply_timens_offsets ($spec) {
     my @lines;
     for my $clock (qw(monotonic boottime)) {
         my $entry = $offsets->{$clock} // next;
-        my $secs  = $entry->{secs}     // 0;
+        my $secs = $entry->{secs} // 0;
         my $nsecs = $entry->{nanosecs} // 0;
         push @lines, "$clock $secs $nsecs\n";
     }
@@ -349,6 +355,7 @@ sub apply_timens_offsets ($spec) {
 # ═══════════════════════════════════════════════════════════════════════
 
 sub parse_cpu_list ($str) {
+
     # Parse a CPU list string like "0", "0-3", "0,2,4-7" into a list of
     # individual CPU numbers.
     my @cpus;
@@ -363,12 +370,14 @@ sub parse_cpu_list ($str) {
 }
 
 sub cpu_list_to_mask (@cpus) {
+
     # Convert a list of CPU numbers to a bitmask for sched_setaffinity.
     # Returns ($mask_bytes, $mask_len).  The mask is a packed byte string
     # suitable for the syscall.
     return ('', 0) unless @cpus;
     my $max = 0;
-    for my $c (@cpus) { $max = $c if $c > $max; }
+    for my $c (@cpus) {$max = $c if $c > $max;}
+
     # Kernel expects mask size in bytes, aligned to sizeof(unsigned long)=8
     my $longs = int(($max + 64) / 64);
     my @mask = (0) x $longs;
@@ -380,6 +389,7 @@ sub cpu_list_to_mask (@cpus) {
 }
 
 sub get_available_cpus () {
+
     # Read the set of online CPUs from /sys/devices/system/cpu/online.
     my $online = '';
     if (open my $fh, '<', '/sys/devices/system/cpu/online') {
@@ -391,6 +401,7 @@ sub get_available_cpus () {
 }
 
 sub apply_cpu_affinity_reset ($spec) {
+
     # Reset CPU affinity to the full available set (cgroup cpuset or system).
     # This undoes any taskset/affinity constraint inherited from the parent.
 
@@ -409,13 +420,14 @@ sub apply_cpu_affinity_reset ($spec) {
     return unless @cpus;
 
     my ($mask, $len) = cpu_list_to_mask(@cpus);
-    my $nr  = SYS_sched_setaffinity + 0;
-    my $pid = 0 + 0;  # 0 = current process
-    my $l   = $len + 0;
+    my $nr = SYS_sched_setaffinity + 0;
+    my $pid = 0 + 0;    # 0 = current process
+    my $l = $len + 0;
     syscall($nr, $pid, $l, $mask);
 }
 
 sub apply_exec_cpu_affinity ($affinity, $dbg) {
+
     # Apply execCPUAffinity from config/process for exec.
     # Sets initial affinity before exec and returns final affinity to set
     # right before exec (or undef if no final).
@@ -426,15 +438,16 @@ sub apply_exec_cpu_affinity ($affinity, $dbg) {
         my @cpus = parse_cpu_list($initial);
         if (@cpus) {
             my ($mask, $len) = cpu_list_to_mask(@cpus);
-            my $nr  = SYS_sched_setaffinity + 0;
+            my $nr = SYS_sched_setaffinity + 0;
             my $pid = 0 + 0;
-            my $l   = $len + 0;
+            my $l = $len + 0;
             syscall($nr, $pid, $l, $mask);
+
             # Log in nsexec-compatible format for bats tests.
             # Print directly to stderr (like runc's nsexec.c does),
             # not through the debug logger, so the pattern matches.
             my $hex_mask = 0;
-            for my $c (@cpus) { $hex_mask |= (1 << $c); }
+            for my $c (@cpus) {$hex_mask |= (1 << $c);}
             printf STDERR "nsexec: affinity: 0x%x\n", $hex_mask;
         }
     }
@@ -451,9 +464,9 @@ sub apply_final_cpu_affinity ($final_str) {
     my @cpus = parse_cpu_list($final_str);
     return unless @cpus;
     my ($mask, $len) = cpu_list_to_mask(@cpus);
-    my $nr  = SYS_sched_setaffinity + 0;
+    my $nr = SYS_sched_setaffinity + 0;
     my $pid = 0 + 0;
-    my $l   = $len + 0;
+    my $l = $len + 0;
     syscall($nr, $pid, $l, $mask);
 }
 
@@ -462,12 +475,14 @@ sub apply_final_cpu_affinity ($final_str) {
 # ═══════════════════════════════════════════════════════════════════════
 
 sub apply_exec_caps ($cap_list, $spec) {
+
     # Apply capabilities for exec'd processes.
     # Always applies the container's capability config from the spec.
     # If $cap_list has entries (from --cap), those are added to
     # bounding+permitted+effective (runc semantics).
 
     my $spec_caps = $spec->{process}{capabilities};
+
     # If no capabilities in spec and no --cap additions, nothing to do
     return unless $spec_caps || ($cap_list && @$cap_list);
     $spec_caps //= {};
@@ -475,11 +490,11 @@ sub apply_exec_caps ($cap_list, $spec) {
     my $has_inheritable = $spec_caps->{inheritable} && @{$spec_caps->{inheritable}};
 
     # Build the full capability sets from spec + additions
-    my %bnd_caps  = map { $_ => 1 } @{$spec_caps->{bounding}   // []};
-    my %prm_caps  = map { $_ => 1 } @{$spec_caps->{permitted}  // []};
-    my %eff_caps  = map { $_ => 1 } @{$spec_caps->{effective}  // []};
-    my %inh_caps  = map { $_ => 1 } @{$spec_caps->{inheritable}// []};
-    my %amb_caps  = map { $_ => 1 } @{$spec_caps->{ambient}    // []};
+    my %bnd_caps = map {$_ => 1} @{$spec_caps->{bounding} // []};
+    my %prm_caps = map {$_ => 1} @{$spec_caps->{permitted} // []};
+    my %eff_caps = map {$_ => 1} @{$spec_caps->{effective} // []};
+    my %inh_caps = map {$_ => 1} @{$spec_caps->{inheritable} // []};
+    my %amb_caps = map {$_ => 1} @{$spec_caps->{ambient} // []};
 
     for my $cap (@{$cap_list // []}) {
         my $name = $cap;
@@ -511,27 +526,30 @@ sub apply_exec_caps ($cap_list, $spec) {
 
     for my $name (keys %eff_caps) {
         my $n = $CAP_NUM{$name} // next;
-        if ($n < 32) { $eff_lo |= (1 << $n); } else { $eff_hi |= (1 << ($n - 32)); }
+        if ($n < 32) {$eff_lo |= (1 << $n);}
+        else {$eff_hi |= (1 << ($n - 32));}
     }
     for my $name (keys %prm_caps) {
         my $n = $CAP_NUM{$name} // next;
-        if ($n < 32) { $prm_lo |= (1 << $n); } else { $prm_hi |= (1 << ($n - 32)); }
+        if ($n < 32) {$prm_lo |= (1 << $n);}
+        else {$prm_hi |= (1 << ($n - 32));}
     }
     for my $name (keys %inh_caps) {
         my $n = $CAP_NUM{$name} // next;
-        if ($n < 32) { $inh_lo |= (1 << $n); } else { $inh_hi |= (1 << ($n - 32)); }
+        if ($n < 32) {$inh_lo |= (1 << $n);}
+        else {$inh_hi |= (1 << ($n - 32));}
     }
+
     # Ambient caps require the cap in BOTH permitted AND inheritable sets.
     # Merge ambient into inheritable (same as runc's ApplyCaps).
     for my $name (keys %amb_caps) {
         my $n = $CAP_NUM{$name} // next;
-        if ($n < 32) { $inh_lo |= (1 << $n); } else { $inh_hi |= (1 << ($n - 32)); }
+        if ($n < 32) {$inh_lo |= (1 << $n);}
+        else {$inh_hi |= (1 << ($n - 32));}
     }
 
     my $hdr = pack('Ii', _LINUX_CAPABILITY_VERSION_3, 0);
-    my $data = pack('III III',
-        $eff_lo, $prm_lo, $inh_lo,
-        $eff_hi, $prm_hi, $inh_hi);
+    my $data = pack('III III', $eff_lo, $prm_lo, $inh_lo, $eff_hi, $prm_hi, $inh_hi);
     my $nr_capset = SYS_capset + 0;
     syscall($nr_capset, $hdr, $data);
 
@@ -549,7 +567,7 @@ sub apply_exec_caps ($cap_list, $spec) {
 # Sysctls
 # ═══════════════════════════════════════════════════════════════════════
 
-my %SYSCTL_ALLOWED_PREFIXES = map { $_ => 1 } qw(
+my %SYSCTL_ALLOWED_PREFIXES = map {$_ => 1} qw(
     net. fs.mqueue.
     kernel.msgmax kernel.msgmnb kernel.msgmni
     kernel.sem kernel.shmall kernel.shmmax kernel.shmmni
@@ -568,7 +586,7 @@ sub apply_sysctls ($spec) {
     for my $key (keys %$sysctls) {
         fatal("sysctl '$key' not allowed") unless validate_sysctl($key);
         my $path = '/proc/sys/' . ($key =~ s/\./\//gr);
-        eval { write_file($path, $sysctls->{$key}); };
+        eval {write_file($path, $sysctls->{$key});};
     }
 }
 

@@ -1,0 +1,32 @@
+severity = 4
+verbose = %f:%l:%c: [%s] %m (%e)\n
+
+# -- v5.38 provides strict and warnings --
+[TestingAndDebugging::RequireUseStrict]
+equivalent_modules = v5.38
+
+[TestingAndDebugging::RequireUseWarnings]
+equivalent_modules = v5.38
+
+[-TestingAndDebugging::ProhibitNoWarnings]
+
+# -- Intentional patterns for a low-dependency systems program --
+[-Subroutines::ProhibitSubroutinePrototypes]
+[-Subroutines::ProhibitExplicitReturnUndef]
+[-Subroutines::RequireFinalReturn]
+[-BuiltinFunctions::ProhibitSleepViaSelect]
+[-InputOutput::ProhibitInteractiveTest]
+[-InputOutput::ProhibitTwoArgOpen]
+[-InputOutput::ProhibitExplicitStdin]
+[-Variables::ProhibitConditionalDeclarations]
+[-ValuesAndExpressions::ProhibitLeadingZeros]
+[-ValuesAndExpressions::ProhibitConstantPragma]
+[-ValuesAndExpressions::ProhibitVersionStrings]
+[-ErrorHandling::RequireCarping]
+[-Modules::ProhibitAutomaticExportation]
+[-ControlStructures::ProhibitPostfixControls]
+[-Variables::RequireLocalizedPunctuationVars]
+[-InputOutput::RequireBriefOpen]
+
+# -- Expression eval used for syscall probing --
+[-BuiltinFunctions::ProhibitStringyEval]

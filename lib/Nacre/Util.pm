@@ -15,12 +15,12 @@ our $JSON_COMPACT = JSON::PP->new->utf8->canonical->allow_nonref;
 # ═══════════════════════════════════════════════════════════════════════
 # Debug logging (--debug / --log / --log-format)
 # ═══════════════════════════════════════════════════════════════════════
-our $LOG_DEBUG  = 0;
-our $LOG_FH     = undef;
+our $LOG_DEBUG = 0;
+our $LOG_FH = undef;
 our $LOG_FORMAT = 'text';
 
 sub setup_logging (%p) {
-    $LOG_DEBUG  = $p{debug}  // 0;
+    $LOG_DEBUG = $p{debug} // 0;
     $LOG_FORMAT = $p{format} // 'text';
     if ($p{log_file}) {
         open($LOG_FH, '>>', $p{log_file})
@@ -36,23 +36,26 @@ sub log_msg ($level, $msg) {
     return if $level eq 'debug' && !$LOG_DEBUG;
 
     my @t = gmtime();
-    my $ts = sprintf('%04d-%02d-%02dT%02d:%02d:%02dZ',
-        $t[5]+1900, $t[4]+1, $t[3], $t[2], $t[1], $t[0]);
+    my $ts = sprintf('%04d-%02d-%02dT%02d:%02d:%02dZ', $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1], $t[0]);
 
     if ($LOG_FORMAT eq 'json') {
-        my $entry = $JSON_COMPACT->encode({
-            level => $level, msg => $msg, time => $ts,
-        });
+        my $entry = $JSON_COMPACT->encode(
+            {
+                level => $level,
+                msg => $msg,
+                time => $ts,
+            }
+        );
         print $LOG_FH "$entry\n";
     } else {
         print $LOG_FH "time=\"$ts\" level=$level msg=\"$msg\"\n";
     }
 }
 
-sub log_debug ($msg) { log_msg('debug', $msg) }
-sub log_info  ($msg) { log_msg('info',  $msg) }
-sub log_warn  ($msg) { log_msg('warning', $msg) }
-sub log_error ($msg) { log_msg('error', $msg) }
+sub log_debug ($msg) {log_msg('debug', $msg)}
+sub log_info ($msg) {log_msg('info', $msg)}
+sub log_warn ($msg) {log_msg('warning', $msg)}
+sub log_error ($msg) {log_msg('error', $msg)}
 
 # ═══════════════════════════════════════════════════════════════════════
 # Utility functions
@@ -72,8 +75,14 @@ sub parse_size ($s) {
         return int($1);
     } elsif ($s =~ /^(\d+(?:\.\d+)?)\s*([kmgtpe])b?$/i) {
         my ($n, $u) = ($1, lc $2);
-        my %mult = (k => 1024, m => 1024**2, g => 1024**3,
-                     t => 1024**4, p => 1024**5, e => 1024**6);
+        my %mult = (
+            k => 1024,
+            m => 1024**2,
+            g => 1024**3,
+            t => 1024**4,
+            p => 1024**5,
+            e => 1024**6
+        );
         return int($n * ($mult{$u} // 1));
     }
     fatal("invalid size: '$s'");
@@ -102,7 +111,7 @@ sub read_file_or_die ($path) {
 sub write_file_atomic ($path, $content) {
     my $tmp = "$path.tmp.$$";
     write_file($tmp, $content);
-    rename($tmp, $path) or do { unlink $tmp; fatal("rename $tmp -> $path: $!"); };
+    rename($tmp, $path) or do {unlink $tmp; fatal("rename $tmp -> $path: $!");};
 }
 
 sub ensure_dir ($path) {
@@ -129,21 +138,20 @@ sub ensure_dir ($path) {
 
 sub iso8601_now {
     my @t = gmtime(time);
-    return sprintf('%04d-%02d-%02dT%02d:%02d:%02dZ',
-        $t[5]+1900, $t[4]+1, $t[3], $t[2], $t[1], $t[0]);
+    return sprintf('%04d-%02d-%02dT%02d:%02d:%02dZ', $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1], $t[0]);
 }
 
 sub do_syscall (@args) {
-    my ($a0,$a1,$a2,$a3,$a4,$a5) = map { $_ + 0 } @args;
+    my ($a0, $a1, $a2, $a3, $a4, $a5) = map {$_ + 0} @args;
     my $n = scalar @args;
     my $ret;
     do {
-        if    ($n <= 1) { $ret = syscall($a0); }
-        elsif ($n == 2) { $ret = syscall($a0,$a1); }
-        elsif ($n == 3) { $ret = syscall($a0,$a1,$a2); }
-        elsif ($n == 4) { $ret = syscall($a0,$a1,$a2,$a3); }
-        elsif ($n == 5) { $ret = syscall($a0,$a1,$a2,$a3,$a4); }
-        else            { $ret = syscall($a0,$a1,$a2,$a3,$a4,$a5); }
+        if ($n <= 1) {$ret = syscall($a0);}
+        elsif ($n == 2) {$ret = syscall($a0, $a1);}
+        elsif ($n == 3) {$ret = syscall($a0, $a1, $a2);}
+        elsif ($n == 4) {$ret = syscall($a0, $a1, $a2, $a3);}
+        elsif ($n == 5) {$ret = syscall($a0, $a1, $a2, $a3, $a4);}
+        else {$ret = syscall($a0, $a1, $a2, $a3, $a4, $a5);}
     } while ($ret == -1 && $! == EINTR);
     return $ret;
 }

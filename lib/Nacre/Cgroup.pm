@@ -31,6 +31,7 @@ sub cgroup_setup ($cgpath, $spec) {
         if (defined $procs && $procs =~ /\d/) {
             fatal("container's cgroup is not empty: $cgpath");
         }
+
         # Check if cgroup is frozen
         my $freeze = read_file("$cgpath/cgroup.freeze");
         if (defined $freeze) {
@@ -47,13 +48,13 @@ sub cgroup_setup ($cgpath, $spec) {
     my @parts = split m{/}, $cgpath;
     my $root_parts = scalar(split m{/}, $CGROUP_ROOT);
     for my $depth ($root_parts .. $#parts - 1) {
-        my $ancestor = join('/', @parts[0..$depth]);
+        my $ancestor = join('/', @parts[0 .. $depth]);
         my $sc_file = "$ancestor/cgroup.subtree_control";
         next unless -f $sc_file;
         my $current = read_file($sc_file) // '';
         for my $ctrl (qw(cpu memory pids io cpuset hugetlb)) {
             if ($current !~ /\b$ctrl\b/) {
-                eval { write_file($sc_file, "+$ctrl\n"); };
+                eval {write_file($sc_file, "+$ctrl\n");};
             }
         }
     }
@@ -71,18 +72,16 @@ sub cgroup_apply_resources ($cgpath, $spec, %opts) {
     # first; when decreasing, write swap first.
     if (my $mem = $res->{memory}) {
         my $new_limit = $mem->{limit};
-        my $new_swap  = $mem->{swap};
+        my $new_swap = $mem->{swap};
         my $cur_limit = read_file("$cgpath/memory.max");
         chomp($cur_limit //= 'max');
         my $cur_val = ($cur_limit eq 'max') ? ~0 : int($cur_limit);
-        my $new_val = (defined $new_limit && $new_limit ne 'max')
-                        ? int($new_limit) : ~0;
+        my $new_val = (defined $new_limit && $new_limit ne 'max') ? int($new_limit) : ~0;
 
         # cgroup v2: memory.swap.max = swap-only, but OCI spec's "swap"
         # field is memory+swap total.  Convert: swap_only = swap - limit.
         if (defined $new_swap && $new_swap ne 'max') {
-            my $mem_for_sub = (defined $new_limit && $new_limit ne 'max')
-                              ? int($new_limit) : $cur_val;
+            my $mem_for_sub = (defined $new_limit && $new_limit ne 'max') ? int($new_limit) : $cur_val;
             if ($mem_for_sub != ~0) {
                 $new_swap = int($new_swap) - int($mem_for_sub);
                 $new_swap = 0 if $new_swap < 0;
@@ -90,13 +89,15 @@ sub cgroup_apply_resources ($cgpath, $spec, %opts) {
         }
 
         if ($new_val > $cur_val) {
+
             # Increasing memory.max — write limit first so swap stays valid
-            cg_write($cgpath, 'memory.max',      $new_limit) if defined $new_limit;
-            cg_write($cgpath, 'memory.swap.max', $new_swap)  if defined $new_swap;
+            cg_write($cgpath, 'memory.max', $new_limit) if defined $new_limit;
+            cg_write($cgpath, 'memory.swap.max', $new_swap) if defined $new_swap;
         } else {
+
             # Decreasing or unchanged — write swap first, then limit
-            cg_write($cgpath, 'memory.swap.max', $new_swap)  if defined $new_swap;
-            cg_write($cgpath, 'memory.max',      $new_limit) if defined $new_limit;
+            cg_write($cgpath, 'memory.swap.max', $new_swap) if defined $new_swap;
+            cg_write($cgpath, 'memory.max', $new_limit) if defined $new_limit;
         }
         cg_write($cgpath, 'memory.low', $mem->{reservation}) if defined $mem->{reservation};
     }
@@ -108,6 +109,7 @@ sub cgroup_apply_resources ($cgpath, $spec, %opts) {
             cg_write($cgpath, 'cpu.weight', $weight);
         }
         if (defined $cpu->{quota} || defined $cpu->{period}) {
+
             # When only one of quota/period is being updated, read the
             # current value of the other from cpu.max.
             my ($cur_quota, $cur_period) = ('max', 100000);
@@ -115,7 +117,7 @@ sub cgroup_apply_resources ($cgpath, $spec, %opts) {
             if (defined $cur && $cur =~ /^(\S+)\s+(\d+)/) {
                 ($cur_quota, $cur_period) = ($1, int($2));
             }
-            my $quota  = $cpu->{quota}  // $cur_quota;
+            my $quota = $cpu->{quota} // $cur_quota;
             my $period = $cpu->{period} // $cur_period;
             cg_write($cgpath, 'cpu.max', "$quota $period", fatal => 1);
         }
@@ -136,6 +138,7 @@ sub cgroup_apply_resources ($cgpath, $spec, %opts) {
             if ($max eq 'max' || $max < 0) {
                 $max = 'max';
             } elsif ($max == 0) {
+
                 # pids.limit=0 means 1 (minimum useful value)
                 $max = 1;
             }
@@ -184,6 +187,7 @@ sub cgroup_apply_resources ($cgpath, $spec, %opts) {
     if (my $u = $res->{unified}) {
         for my $key (keys %$u) {
             my $val = $u->{$key};
+
             # Multi-line values: write each line separately (cgroup files
             # like io.max only process one device-line per write syscall)
             for my $line (split /\n/, $val) {
@@ -219,7 +223,7 @@ sub cgroup_cleanup ($cgpath) {
     }
 
     # Remove cgroup directory with retry (EBUSY)
-    for my $attempt (1..10) {
+    for my $attempt (1 .. 10) {
         last if rmdir($cgpath);
         last unless $! == EBUSY;
         select(undef, undef, undef, 0.05 * $attempt);
@@ -228,7 +232,7 @@ sub cgroup_cleanup ($cgpath) {
 
 sub cgroup_pids ($cgpath) {
     my $data = read_file("$cgpath/cgroup.procs") // '';
-    return grep { /^\d+$/ } split /\n/, $data;
+    return grep {/^\d+$/} split /\n/, $data;
 }
 
 sub cg_read ($cgpath, $file) {
@@ -245,6 +249,7 @@ sub cg_write ($cgpath, $file, $value, %opts) {
             chomp $e;
             fatal("unable to write $file: $e");
         }
+
         # Non-fatal by default: some cgroup files may not exist
     }
 }
@@ -253,9 +258,10 @@ sub convert_cpu_shares ($shares) {
     return 0 if !$shares || $shares == 0;
     return 1 if $shares <= 2;
     return 10000 if $shares >= 262144;
+
     # Logarithmic conversion matching runc's ConvertCPUSharesToCgroupV2Value
     my $l = log($shares) / log(2);
-    my $exponent = ($l * $l + 125 * $l) / 612.0 - 7.0/34.0;
+    my $exponent = ($l * $l + 125 * $l) / 612.0 - 7.0 / 34.0;
     return int(exp($exponent * log(10)) + 0.99);
 }
 

@@ -1,0 +1,46 @@
+pre-commit:
+  parallel: true
+  commands:
+    perltidy:
+      glob: "{nacre,lib/Nacre/*.pm}"
+      run: |
+        export PATH="$HOME/perl5/bin:$PATH" PERL5LIB="$HOME/perl5/lib/perl5:$PERL5LIB"
+        perltidy --profile=.perltidyrc -b {staged_files}
+        for file in {staged_files}; do
+          rm -f "$file.bak"
+          git add "$file"
+        done
+
+    perlcritic:
+      glob: "{nacre,lib/Nacre/*.pm}"
+      run: |
+        export PATH="$HOME/perl5/bin:$PATH" PERL5LIB="$HOME/perl5/lib/perl5:$PERL5LIB"
+        perlcritic --profile .perlcriticrc {staged_files}
+
+    trailing-whitespace:
+      glob: "**/*"
+      exclude:
+        - "*.md"
+        - "*.bak"
+      run: |
+        for file in {staged_files}; do
+          if ! file --mime-type "$file" | grep -q "text/"; then
+            continue
+          fi
+          if grep -q '[[:space:]]$' "$file"; then
+            sed -i 's/[[:space:]]*$//' "$file"
+            git add "$file"
+          fi
+        done
+
+commit-msg:
+  commands:
+    msg-check:
+      run: |
+        if ! grep -qE '^(hotfix|feat|fix|docs|style|refactor|perf|test|chore|ci)(\([^\)]*\))?!?:\s*' {1}; then
+          echo "Commit message must follow Conventional Commits format."
+          echo "Format: <type>(<scope>): <description>"
+          exit 1
+        fi
+
+colors: true

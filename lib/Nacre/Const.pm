@@ -6,7 +6,7 @@ use Exporter 'import';
 # Fcntl extras (may not be available on all systems)
 # ═══════════════════════════════════════════════════════════════════════
 use constant O_CLOEXEC => 0o2000000;
-use constant O_PATH    => 0o10000000;
+use constant O_PATH => 0o10000000;
 
 # ═══════════════════════════════════════════════════════════════════════
 # Syscall numbers (architecture-dependent)
@@ -113,40 +113,40 @@ BEGIN {
 # Clone / Namespace flags
 # ═══════════════════════════════════════════════════════════════════════
 use constant {
-    CLONE_NEWNS     => 0x00020000,
-    CLONE_NEWUTS    => 0x04000000,
-    CLONE_NEWIPC    => 0x08000000,
-    CLONE_NEWUSER   => 0x10000000,
-    CLONE_NEWPID    => 0x20000000,
-    CLONE_NEWNET    => 0x40000000,
+    CLONE_NEWNS => 0x00020000,
+    CLONE_NEWUTS => 0x04000000,
+    CLONE_NEWIPC => 0x08000000,
+    CLONE_NEWUSER => 0x10000000,
+    CLONE_NEWPID => 0x20000000,
+    CLONE_NEWNET => 0x40000000,
     CLONE_NEWCGROUP => 0x02000000,
-    CLONE_NEWTIME   => 0x00000080,
-    SIGCHLD         => 17,
+    CLONE_NEWTIME => 0x00000080,
+    SIGCHLD => 17,
 };
 
 # ═══════════════════════════════════════════════════════════════════════
 # Mount flags
 # ═══════════════════════════════════════════════════════════════════════
 use constant {
-    MS_RDONLY       => 1,
-    MS_NOSUID      => 2,
-    MS_NODEV        => 4,
-    MS_NOEXEC      => 8,
-    MS_REMOUNT     => 32,
-    MS_NOATIME     => 1024,
-    MS_NODIRATIME  => 2048,
-    MS_BIND        => 4096,
-    MS_MOVE        => 8192,
-    MS_REC         => 16384,
-    MS_SILENT      => 32768,
-    MS_RELATIME    => (1 << 21),
+    MS_RDONLY => 1,
+    MS_NOSUID => 2,
+    MS_NODEV => 4,
+    MS_NOEXEC => 8,
+    MS_REMOUNT => 32,
+    MS_NOATIME => 1024,
+    MS_NODIRATIME => 2048,
+    MS_BIND => 4096,
+    MS_MOVE => 8192,
+    MS_REC => 16384,
+    MS_SILENT => 32768,
+    MS_RELATIME => (1 << 21),
     MS_STRICTATIME => (1 << 24),
-    MS_SLAVE       => (1 << 19),
-    MS_SHARED      => (1 << 20),
-    MS_PRIVATE     => (1 << 18),
-    MS_UNBINDABLE  => (1 << 17),
-    MNT_DETACH     => 2,
-    MNT_FORCE      => 1,
+    MS_SLAVE => (1 << 19),
+    MS_SHARED => (1 << 20),
+    MS_PRIVATE => (1 << 18),
+    MS_UNBINDABLE => (1 << 17),
+    MNT_DETACH => 2,
+    MNT_FORCE => 1,
 };
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -154,17 +154,17 @@ use constant {
 # ═══════════════════════════════════════════════════════════════════════
 use constant {
     PR_SET_NO_NEW_PRIVS => 38,
-    PR_CAPBSET_READ     => 23,
-    PR_CAPBSET_DROP     => 24,
-    PR_SET_KEEPCAPS     => 8,
-    PR_CAP_AMBIENT      => 47,
-    PR_CAP_AMBIENT_RAISE   => 2,
-    PR_CAP_AMBIENT_LOWER   => 3,
+    PR_CAPBSET_READ => 23,
+    PR_CAPBSET_DROP => 24,
+    PR_SET_KEEPCAPS => 8,
+    PR_CAP_AMBIENT => 47,
+    PR_CAP_AMBIENT_RAISE => 2,
+    PR_CAP_AMBIENT_LOWER => 3,
     PR_CAP_AMBIENT_CLEAR_ALL => 4,
-    PR_SET_CHILD_SUBREAPER  => 36,
-    PR_SET_PDEATHSIG        => 1,
-    PR_SET_DUMPABLE         => 4,
-    PR_SET_NAME             => 15,
+    PR_SET_CHILD_SUBREAPER => 36,
+    PR_SET_PDEATHSIG => 1,
+    PR_SET_DUMPABLE => 4,
+    PR_SET_NAME => 15,
 };
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -182,12 +182,12 @@ our @CAP_NAMES = qw(
     CAP_AUDIT_READ CAP_PERFMON CAP_BPF CAP_CHECKPOINT_RESTORE
 );
 our %CAP_NUM;
-for my $i (0..$#CAP_NAMES) { $CAP_NUM{$CAP_NAMES[$i]} = $i; }
+for my $i (0 .. $#CAP_NAMES) {$CAP_NUM{$CAP_NAMES[$i]} = $i;}
 
 use constant {
     _LINUX_CAPABILITY_VERSION_3 => 0x20080522,
-    _LINUX_CAPABILITY_U32S_3   => 2,
-    VFS_CAP_REVISION_2         => 0x02000000,
+    _LINUX_CAPABILITY_U32S_3 => 2,
+    VFS_CAP_REVISION_2 => 0x02000000,
 };
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -195,8 +195,8 @@ use constant {
 # ═══════════════════════════════════════════════════════════════════════
 use constant {
     SECCOMP_SET_MODE_FILTER => 1,
-    SECCOMP_FILTER_FLAG_TSYNC     => (1 << 0),
-    SECCOMP_FILTER_FLAG_LOG       => (1 << 1),
+    SECCOMP_FILTER_FLAG_TSYNC => (1 << 0),
+    SECCOMP_FILTER_FLAG_LOG => (1 << 1),
     SECCOMP_FILTER_FLAG_NEW_LISTENER => (1 << 3),
     SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV => (1 << 5),
 };
@@ -205,7 +205,7 @@ use constant {
 # BPF (cgroup device)
 # ═══════════════════════════════════════════════════════════════════════
 use constant {
-    BPF_PROG_LOAD   => 5,
+    BPF_PROG_LOAD => 5,
     BPF_PROG_ATTACH => 8,
     BPF_CGROUP_DEVICE => 9,
     BPF_F_ALLOW_MULTI => (1 << 1),
@@ -215,28 +215,26 @@ use constant {
 # ═══════════════════════════════════════════════════════════════════════
 # close_range
 # ═══════════════════════════════════════════════════════════════════════
-use constant {
-    CLOSE_RANGE_CLOEXEC => (1 << 2),
-};
+use constant {CLOSE_RANGE_CLOEXEC => (1 << 2),};
 
 # ═══════════════════════════════════════════════════════════════════════
 # mount_setattr flags (kernel 5.12+)
 # ═══════════════════════════════════════════════════════════════════════
 use constant {
-    AT_RECURSIVE        => 0x8000,
-    AT_EMPTY_PATH       => 0x1000,
-    MOUNT_ATTR_RDONLY   => 0x00000001,
-    MOUNT_ATTR_NOSUID   => 0x00000002,
-    MOUNT_ATTR_NODEV    => 0x00000004,
-    MOUNT_ATTR_NOEXEC   => 0x00000008,
-    MOUNT_ATTR_NOATIME     => 0x00000010,
+    AT_RECURSIVE => 0x8000,
+    AT_EMPTY_PATH => 0x1000,
+    MOUNT_ATTR_RDONLY => 0x00000001,
+    MOUNT_ATTR_NOSUID => 0x00000002,
+    MOUNT_ATTR_NODEV => 0x00000004,
+    MOUNT_ATTR_NOEXEC => 0x00000008,
+    MOUNT_ATTR_NOATIME => 0x00000010,
     MOUNT_ATTR_STRICTATIME => 0x00000020,
-    MOUNT_ATTR_NODIRATIME  => 0x00000080,
-    MOUNT_ATTR__ATIME      => 0x00000070,
+    MOUNT_ATTR_NODIRATIME => 0x00000080,
+    MOUNT_ATTR__ATIME => 0x00000070,
     MOUNT_ATTR_NOSYMFOLLOW => 0x00200000,
-    MOUNT_ATTR_IDMAP       => 0x00100000,
-    OPEN_TREE_CLONE     => 1,
-    OPEN_TREE_CLOEXEC   => 0x80000,
+    MOUNT_ATTR_IDMAP => 0x00100000,
+    OPEN_TREE_CLONE => 1,
+    OPEN_TREE_CLOEXEC => 0x80000,
     MOVE_MOUNT_F_EMPTY_PATH => 0x00000004,
 };
 
@@ -244,9 +242,9 @@ use constant {
 # PTY / terminal ioctls
 # ═══════════════════════════════════════════════════════════════════════
 use constant {
-    TIOCGPTN   => 0x80045430,
+    TIOCGPTN => 0x80045430,
     TIOCSPTLCK => 0x40045431,
-    TIOCSCTTY  => 0x5480,
+    TIOCSCTTY => 0x5480,
     TIOCSWINSZ => 0x5414,
     TIOCGWINSZ => 0x5413,
 };
@@ -258,18 +256,43 @@ use Config;
 our %SIG_NUM;
 {
     my @names = split ' ', $Config{sig_name} // '';
-    my @nums  = split ' ', $Config{sig_num}  // '';
+    my @nums = split ' ', $Config{sig_num} // '';
     if (!@names) {
         %SIG_NUM = (
-            HUP => 1, INT => 2, QUIT => 3, ILL => 4, TRAP => 5, ABRT => 6,
-            BUS => 7, FPE => 8, KILL => 9, USR1 => 10, SEGV => 11, USR2 => 12,
-            PIPE => 13, ALRM => 14, TERM => 15, STKFLT => 16, CHLD => 17,
-            CONT => 18, STOP => 19, TSTP => 20, TTIN => 21, TTOU => 22,
-            URG => 23, XCPU => 24, XFSZ => 25, VTALRM => 26, PROF => 27,
-            WINCH => 28, IO => 29, PWR => 30, SYS => 31,
+            HUP => 1,
+            INT => 2,
+            QUIT => 3,
+            ILL => 4,
+            TRAP => 5,
+            ABRT => 6,
+            BUS => 7,
+            FPE => 8,
+            KILL => 9,
+            USR1 => 10,
+            SEGV => 11,
+            USR2 => 12,
+            PIPE => 13,
+            ALRM => 14,
+            TERM => 15,
+            STKFLT => 16,
+            CHLD => 17,
+            CONT => 18,
+            STOP => 19,
+            TSTP => 20,
+            TTIN => 21,
+            TTOU => 22,
+            URG => 23,
+            XCPU => 24,
+            XFSZ => 25,
+            VTALRM => 26,
+            PROF => 27,
+            WINCH => 28,
+            IO => 29,
+            PWR => 30,
+            SYS => 31,
         );
     } else {
-        for my $i (0..$#names) {
+        for my $i (0 .. $#names) {
             $SIG_NUM{$names[$i]} = $nums[$i] if $names[$i] && $nums[$i];
         }
     }
@@ -279,14 +302,14 @@ our %SIG_NUM;
 # OCI namespace type -> clone flag & proc name
 # ═══════════════════════════════════════════════════════════════════════
 our %NS_MAP = (
-    pid     => { flag => CLONE_NEWPID,    proc => 'pid'     },
-    network => { flag => CLONE_NEWNET,    proc => 'net'     },
-    mount   => { flag => CLONE_NEWNS,     proc => 'mnt'     },
-    ipc     => { flag => CLONE_NEWIPC,    proc => 'ipc'     },
-    uts     => { flag => CLONE_NEWUTS,    proc => 'uts'     },
-    user    => { flag => CLONE_NEWUSER,   proc => 'user'    },
-    cgroup  => { flag => CLONE_NEWCGROUP, proc => 'cgroup'  },
-    time    => { flag => CLONE_NEWTIME,   proc => 'time_for_children' },
+    pid => {flag => CLONE_NEWPID, proc => 'pid'},
+    network => {flag => CLONE_NEWNET, proc => 'net'},
+    mount => {flag => CLONE_NEWNS, proc => 'mnt'},
+    ipc => {flag => CLONE_NEWIPC, proc => 'ipc'},
+    uts => {flag => CLONE_NEWUTS, proc => 'uts'},
+    user => {flag => CLONE_NEWUSER, proc => 'user'},
+    cgroup => {flag => CLONE_NEWCGROUP, proc => 'cgroup'},
+    time => {flag => CLONE_NEWTIME, proc => 'time_for_children'},
 );
 
 # ═══════════════════════════════════════════════════════════════════════
