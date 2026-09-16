@@ -3,7 +3,7 @@
   "packages": {
     ".": {
       "release-type": "simple",
-      "initial-version": "0.5.1",
+      "initial-version": "0.1.0",
       "extra-files": [
         {
           "type": "generic",
