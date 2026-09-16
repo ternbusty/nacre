@@ -2,14 +2,15 @@
 
 A Linux OCI container runtime written in Perl.
 
-Implements the [OCI Runtime Specification](https://github.com/opencontainers/runtime-spec) — the same interface as runc, crun, and youki.
+Implements the [OCI Runtime Specification](https://github.com/opencontainers/runtime-spec), the same interface as runc, crun, and youki.
 
 ## Requirements
 
 - Linux (kernel 5.x+)
-- Perl 5.20+
+- Perl 5.38+
 - libseccomp (libseccomp-dev)
-- FFI::Platypus (cpan)
+
+FFI::Platypus is optional. If installed, the seccomp filter compiler uses it for efficient BPF assembly; otherwise nacre falls back to a pure-Perl implementation.
 
 ## Usage
 
