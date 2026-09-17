@@ -157,8 +157,8 @@ sub _build_device_bpf ($default_allow, $exceptions) {
         $access_mask |= 2 if $exc->{access} =~ /r/;
         $access_mask |= 4 if $exc->{access} =~ /w/;
         push @prog, _bpf_alu_rsh(16);
-        push @prog, _bpf_alu_and($access_mask);
-        push @prog, _bpf_jeq(0, 2, 0);
+        push @prog, _bpf_alu_and((~$access_mask) & 0x7);
+        push @prog, _bpf_jne(0, 2, 0);
 
         push @prog, _bpf_ret($default_allow ? 0 : 1);
     }
@@ -180,7 +180,6 @@ use constant {
     _BPF_ALU_AND_K => 0x54,
     _BPF_ALU_RSH_K => 0x74,
     _BPF_JNE_K => 0x55,
-    _BPF_JEQ_K => 0x15,
     _BPF_MOV_K => 0xb4,
     _BPF_EXIT => 0x95,
 };
@@ -207,10 +206,6 @@ sub _bpf_alu_rsh ($imm) {
 
 sub _bpf_jne ($imm, $jt, $jf) {
     return [_BPF_JNE_K, 0x00, $jt, $imm];
-}
-
-sub _bpf_jeq ($imm, $jt, $jf) {
-    return [_BPF_JEQ_K, 0x00, $jt, $imm];
 }
 
 sub _bpf_ret ($val) {
