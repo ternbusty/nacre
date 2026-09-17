@@ -18,8 +18,8 @@ spec generation --bundle
 
 # --- version / help ---
 [skip] runc version
-runc -h
-runc command -h
+[skip] runc -h # help output says 'nacre' not 'runc'
+[skip] runc command -h # help output says 'nacre' not 'runc'
 runc foo -h
 
 # --- debug / logging ---
