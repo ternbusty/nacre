@@ -13,10 +13,24 @@ use Errno qw(EINTR);
 # eBPF Device Cgroup
 # ═══════════════════════════════════════════════════════════════════════
 
+my @_DEFAULT_ALLOWED_DEVICES = (
+    {type => 'c', access => 'm', allow => 1},
+    {type => 'b', access => 'm', allow => 1},
+    {type => 'c', major => 1, minor => 3, access => 'rwm', allow => 1},
+    {type => 'c', major => 1, minor => 5, access => 'rwm', allow => 1},
+    {type => 'c', major => 1, minor => 7, access => 'rwm', allow => 1},
+    {type => 'c', major => 1, minor => 8, access => 'rwm', allow => 1},
+    {type => 'c', major => 1, minor => 9, access => 'rwm', allow => 1},
+    {type => 'c', major => 5, minor => 0, access => 'rwm', allow => 1},
+    {type => 'c', major => 5, minor => 1, access => 'rwm', allow => 1},
+    {type => 'c', major => 5, minor => 2, access => 'rwm', allow => 1},
+    {type => 'c', major => 136, access => 'rwm', allow => 1},
+);
+
 sub apply_device_cgroup ($cgpath, $spec) {
     my $rules = $spec->{linux}{resources}{devices} // return;
 
-    my ($default_allow, $exceptions) = _emulate_device_rules($rules);
+    my ($default_allow, $exceptions) = _emulate_device_rules([@$rules, @_DEFAULT_ALLOWED_DEVICES]);
 
     my $prog = _build_device_bpf($default_allow, $exceptions);
     return unless @$prog;
@@ -101,39 +115,40 @@ sub _emulate_device_rules ($rules) {
 sub _build_device_bpf ($default_allow, $exceptions) {
     my @prog;
 
-    return \@prog unless @$exceptions;
+    if (!@$exceptions) {
+        push @prog, _bpf_ret($default_allow ? 1 : 0) unless $default_allow;
+        return \@prog;
+    }
 
     push @prog, _bpf_ld_abs(0);
     push @prog, _bpf_st(0);
 
-    my $num_exc = scalar @$exceptions;
-    for my $i (0 .. $num_exc - 1) {
-        my $exc = $exceptions->[$i];
+    for my $exc (@$exceptions) {
+        my $has_major = $exc->{major} != -1;
+        my $has_minor = $exc->{minor} != -1;
 
-        my $jumps_in_this_exc = 0;
-        $jumps_in_this_exc++ if $exc->{type};
-        $jumps_in_this_exc++ if $exc->{major} != -1;
-        $jumps_in_this_exc++ if $exc->{minor} != -1;
-        $jumps_in_this_exc++;
-        $jumps_in_this_exc++;
+        # Instructions remaining after each JNE to end of this block:
+        #   access check = 4 insns (ld_mem, rsh, and, jeq)
+        #   return       = 2 insns (MOV, EXIT)
+        my $skip = 4 + 2;
+        $skip += 2 if $has_minor;
+        $skip += 2 if $has_major;
 
         my $type_val = $exc->{type} eq 'b' ? 1 : 2;
-        my $skip = $jumps_in_this_exc - 1;
-
         push @prog, _bpf_ld_mem(0);
         push @prog, _bpf_alu_and(0xffff);
-        push @prog, _bpf_jne($type_val, $skip - 2, 0);
+        push @prog, _bpf_jne($type_val, $skip, 0);
 
-        if ($exc->{major} != -1) {
+        if ($has_major) {
+            $skip -= 2;
             push @prog, _bpf_ld_abs(4);
-            $skip -= 3;
-            push @prog, _bpf_jne($exc->{major}, $skip > 0 ? $skip : 0, 0);
+            push @prog, _bpf_jne($exc->{major}, $skip, 0);
         }
 
-        if ($exc->{minor} != -1) {
-            push @prog, _bpf_ld_abs(8);
+        if ($has_minor) {
             $skip -= 2;
-            push @prog, _bpf_jne($exc->{minor}, $skip > 0 ? $skip : 0, 0);
+            push @prog, _bpf_ld_abs(8);
+            push @prog, _bpf_jne($exc->{minor}, $skip, 0);
         }
 
         push @prog, _bpf_ld_mem(0);
@@ -142,8 +157,8 @@ sub _build_device_bpf ($default_allow, $exceptions) {
         $access_mask |= 2 if $exc->{access} =~ /r/;
         $access_mask |= 4 if $exc->{access} =~ /w/;
         push @prog, _bpf_alu_rsh(16);
-        push @prog, _bpf_alu_and($access_mask);
-        push @prog, _bpf_jeq(0, 1, 0);
+        push @prog, _bpf_alu_and((~$access_mask) & 0x7);
+        push @prog, _bpf_jne(0, 2, 0);
 
         push @prog, _bpf_ret($default_allow ? 0 : 1);
     }
@@ -165,7 +180,6 @@ use constant {
     _BPF_ALU_AND_K => 0x54,
     _BPF_ALU_RSH_K => 0x74,
     _BPF_JNE_K => 0x55,
-    _BPF_JEQ_K => 0x15,
     _BPF_MOV_K => 0xb4,
     _BPF_EXIT => 0x95,
 };
@@ -175,11 +189,11 @@ sub _bpf_ld_abs ($off) {
 }
 
 sub _bpf_st ($off) {
-    return [_BPF_STX_MEM_W, 0xa0, -4 - $off * 4, 0];
+    return [_BPF_STX_MEM_W, 0x0a, -4 - $off * 4, 0];
 }
 
 sub _bpf_ld_mem ($off) {
-    return [_BPF_LDX_MEM_W, 0x0a, -4 - $off * 4, 0];
+    return [_BPF_LDX_MEM_W, 0xa0, -4 - $off * 4, 0];
 }
 
 sub _bpf_alu_and ($imm) {
@@ -192,10 +206,6 @@ sub _bpf_alu_rsh ($imm) {
 
 sub _bpf_jne ($imm, $jt, $jf) {
     return [_BPF_JNE_K, 0x00, $jt, $imm];
-}
-
-sub _bpf_jeq ($imm, $jt, $jf) {
-    return [_BPF_JEQ_K, 0x00, $jt, $imm];
 }
 
 sub _bpf_ret ($val) {
