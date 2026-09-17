@@ -186,26 +186,21 @@ emit_section "prctl constants" \
     PR_CAP_AMBIENT_CLEAR_ALL PR_SET_CHILD_SUBREAPER PR_SET_PDEATHSIG \
     PR_SET_DUMPABLE PR_SET_NAME
 
-# Capabilities (Perl data, not from C)
-cat <<'CAP'
-
-# ═══════════════════════════════════════════════════════════════════════
-# Capabilities
-# ═══════════════════════════════════════════════════════════════════════
-our @CAP_NAMES = qw(
-    CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_FSETID
-    CAP_KILL CAP_SETGID CAP_SETUID CAP_SETPCAP CAP_LINUX_IMMUTABLE
-    CAP_NET_BIND_SERVICE CAP_NET_BROADCAST CAP_NET_ADMIN CAP_NET_RAW
-    CAP_IPC_LOCK CAP_IPC_OWNER CAP_SYS_MODULE CAP_SYS_RAWIO CAP_SYS_CHROOT
-    CAP_SYS_PTRACE CAP_SYS_PACCT CAP_SYS_ADMIN CAP_SYS_BOOT CAP_SYS_NICE
-    CAP_SYS_RESOURCE CAP_SYS_TIME CAP_SYS_TTY_CONFIG CAP_MKNOD CAP_LEASE
-    CAP_AUDIT_WRITE CAP_AUDIT_CONTROL CAP_SETFCAP CAP_MAC_OVERRIDE
-    CAP_MAC_ADMIN CAP_SYSLOG CAP_WAKE_ALARM CAP_BLOCK_SUSPEND
-    CAP_AUDIT_READ CAP_PERFMON CAP_BPF CAP_CHECKPOINT_RESTORE
-);
-our %CAP_NUM;
-for my $i (0 .. $#CAP_NAMES) {$CAP_NUM{$CAP_NAMES[$i]} = $i;}
-CAP
+# Capabilities (names extracted from C output, sorted by number)
+printf '\n# %s\n# %s\n# %s\n' \
+    "═══════════════════════════════════════════════════════════════════════" \
+    "Capabilities" \
+    "═══════════════════════════════════════════════════════════════════════"
+echo 'our @CAP_NAMES = qw('
+grep '^CAP_' "$TMPDIR/x86_64.txt" | sort -t= -k2 -n | cut -d= -f1 \
+    | awk '{
+        buf = buf " " $0
+        if (NR % 5 == 0) { print "   " buf; buf = "" }
+    }
+    END { if (buf != "") print "   " buf }'
+echo ');'
+echo 'our %CAP_NUM;'
+echo 'for my $i (0 .. $#CAP_NAMES) {$CAP_NUM{$CAP_NAMES[$i]} = $i;}'
 
 printf '\nuse constant {\n'
 printf '    _LINUX_CAPABILITY_VERSION_3 => %s,\n' "${CONST[_LINUX_CAPABILITY_VERSION_3]}"
