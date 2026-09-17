@@ -101,7 +101,10 @@ sub _emulate_device_rules ($rules) {
 sub _build_device_bpf ($default_allow, $exceptions) {
     my @prog;
 
-    return \@prog unless @$exceptions;
+    if (!@$exceptions) {
+        push @prog, _bpf_ret($default_allow ? 1 : 0) unless $default_allow;
+        return \@prog;
+    }
 
     push @prog, _bpf_ld_abs(0);
     push @prog, _bpf_st(0);

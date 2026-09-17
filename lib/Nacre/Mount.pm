@@ -839,6 +839,13 @@ sub _apply_single_mount ($m, $rootfs, $mount_source_fds, $chan_w, $chan_r, $dest
     # Apply idmap/ridmap via open_tree + mount_setattr + move_mount
     if ($has_idmap || $has_ridmap) {
         _apply_idmap($m, $dest, $flags, $has_idmap, $has_ridmap, $mount_source_fds, $chan_w, $chan_r);
+
+        my $prop_mask = MS_PRIVATE | MS_SHARED | MS_SLAVE | MS_UNBINDABLE;
+        my $prop_flags = $flags & ($prop_mask | MS_REC);
+        if ($prop_flags & $prop_mask) {
+            do_mount('', $dest, '', $prop_flags, '')
+                or warn "nacre: mount propagation after idmap $dest: $!\n";
+        }
     }
 
     # Restore tmpcopyup content
