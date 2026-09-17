@@ -186,11 +186,11 @@ sub _bpf_ld_abs ($off) {
 }
 
 sub _bpf_st ($off) {
-    return [_BPF_STX_MEM_W, 0xa0, -4 - $off * 4, 0];
+    return [_BPF_STX_MEM_W, 0x0a, -4 - $off * 4, 0];
 }
 
 sub _bpf_ld_mem ($off) {
-    return [_BPF_LDX_MEM_W, 0x0a, -4 - $off * 4, 0];
+    return [_BPF_LDX_MEM_W, 0xa0, -4 - $off * 4, 0];
 }
 
 sub _bpf_alu_and ($imm) {
