@@ -17,9 +17,9 @@ spec generation cwd
 spec generation --bundle
 
 # --- version / help ---
-[skip] runc version
-[skip] runc -h # help output says 'nacre' not 'runc'
-[skip] runc command -h # help output says 'nacre' not 'runc'
+[skip] runc version # version string differs from runc
+runc -h
+runc command -h
 runc foo -h
 
 # --- debug / logging ---
