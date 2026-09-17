@@ -213,7 +213,7 @@ use constant {
     BPF_PROG_ATTACH => 8,
     BPF_PROG_DETACH => 9,
     BPF_PROG_QUERY => 16,
-    BPF_CGROUP_DEVICE => 9,
+    BPF_CGROUP_DEVICE => 6,
     BPF_F_ALLOW_MULTI => (1 << 1),
     BPF_PROG_TYPE_CGROUP_DEVICE => 15,
 };
