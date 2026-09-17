@@ -13,10 +13,20 @@ use Errno qw(EINTR);
 # eBPF Device Cgroup
 # ═══════════════════════════════════════════════════════════════════════
 
+my @_DEFAULT_ALLOWED_DEVICES = (
+    {type => 'c', access => 'm', allow => 1},
+    {type => 'c', major => 1, minor => 3, access => 'rwm', allow => 1},
+    {type => 'c', major => 1, minor => 5, access => 'rwm', allow => 1},
+    {type => 'c', major => 1, minor => 7, access => 'rwm', allow => 1},
+    {type => 'c', major => 1, minor => 8, access => 'rwm', allow => 1},
+    {type => 'c', major => 1, minor => 9, access => 'rwm', allow => 1},
+    {type => 'c', major => 5, minor => 0, access => 'rwm', allow => 1},
+);
+
 sub apply_device_cgroup ($cgpath, $spec) {
     my $rules = $spec->{linux}{resources}{devices} // return;
 
-    my ($default_allow, $exceptions) = _emulate_device_rules($rules);
+    my ($default_allow, $exceptions) = _emulate_device_rules([@$rules, @_DEFAULT_ALLOWED_DEVICES]);
 
     my $prog = _build_device_bpf($default_allow, $exceptions);
     return unless @$prog;
