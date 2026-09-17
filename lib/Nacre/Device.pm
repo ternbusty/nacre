@@ -15,12 +15,16 @@ use Errno qw(EINTR);
 
 my @_DEFAULT_ALLOWED_DEVICES = (
     {type => 'c', access => 'm', allow => 1},
+    {type => 'b', access => 'm', allow => 1},
     {type => 'c', major => 1, minor => 3, access => 'rwm', allow => 1},
     {type => 'c', major => 1, minor => 5, access => 'rwm', allow => 1},
     {type => 'c', major => 1, minor => 7, access => 'rwm', allow => 1},
     {type => 'c', major => 1, minor => 8, access => 'rwm', allow => 1},
     {type => 'c', major => 1, minor => 9, access => 'rwm', allow => 1},
     {type => 'c', major => 5, minor => 0, access => 'rwm', allow => 1},
+    {type => 'c', major => 5, minor => 1, access => 'rwm', allow => 1},
+    {type => 'c', major => 5, minor => 2, access => 'rwm', allow => 1},
+    {type => 'c', major => 136, access => 'rwm', allow => 1},
 );
 
 sub apply_device_cgroup ($cgpath, $spec) {
