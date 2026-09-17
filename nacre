@@ -2350,11 +2350,15 @@ sub _check_memory_before_update ($cgpath, $mem) {
         }
     }
     if (defined $swap && $swap ne 'max') {
+        my $mem_current = eval {cg_read($cgpath, 'memory.current')} // 0;
+        chomp $mem_current;
+        $mem_current += 0;
         my $swap_current = eval {cg_read($cgpath, 'memory.swap.current')} // 0;
         chomp $swap_current;
         $swap_current += 0;
-        if ($swap_current > 0 && $swap < $swap_current) {
-            push @errors, "rejecting memory+swap limit $swap (too low; current swap usage is $swap_current)";
+        my $total = $mem_current + $swap_current;
+        if ($total > 0 && $swap < $total) {
+            push @errors, "rejecting memory+swap limit $swap (too low; current usage is $total)";
         }
     }
     fatal(join('; ', @errors)) if @errors;

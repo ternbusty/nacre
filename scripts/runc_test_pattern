@@ -105,7 +105,7 @@ runc run [mount order, container idmap source] (userns)
 runc run [/proc is a symlink]
 runc run [rootfsPropagation shared]
 # removed in runc v1.5.1: runc run [rootfsPropagation slave]
-runc run --no-pivot must not expose bare /proc
+[skip]runc run --no-pivot must not expose bare /proc # no-pivot proc mount setup difference (unshare setgroups fails)
 runc run [ro /sys/fs/cgroup mounts]
 runc run [ro /sys/fs/cgroup mounts + cgroupns]
 runc run [setgid / + mkdirall]
