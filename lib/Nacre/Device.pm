@@ -119,34 +119,32 @@ sub _build_device_bpf ($default_allow, $exceptions) {
     push @prog, _bpf_ld_abs(0);
     push @prog, _bpf_st(0);
 
-    my $num_exc = scalar @$exceptions;
-    for my $i (0 .. $num_exc - 1) {
-        my $exc = $exceptions->[$i];
+    for my $exc (@$exceptions) {
+        my $has_major = $exc->{major} != -1;
+        my $has_minor = $exc->{minor} != -1;
 
-        my $jumps_in_this_exc = 0;
-        $jumps_in_this_exc++ if $exc->{type};
-        $jumps_in_this_exc++ if $exc->{major} != -1;
-        $jumps_in_this_exc++ if $exc->{minor} != -1;
-        $jumps_in_this_exc++;
-        $jumps_in_this_exc++;
+        # Instructions remaining after each JNE to end of this block:
+        #   access check = 4 insns (ld_mem, rsh, and, jeq)
+        #   return       = 2 insns (MOV, EXIT)
+        my $skip = 4 + 2;
+        $skip += 2 if $has_minor;
+        $skip += 2 if $has_major;
 
         my $type_val = $exc->{type} eq 'b' ? 1 : 2;
-        my $skip = $jumps_in_this_exc - 1;
-
         push @prog, _bpf_ld_mem(0);
         push @prog, _bpf_alu_and(0xffff);
-        push @prog, _bpf_jne($type_val, $skip - 2, 0);
+        push @prog, _bpf_jne($type_val, $skip, 0);
 
-        if ($exc->{major} != -1) {
+        if ($has_major) {
+            $skip -= 2;
             push @prog, _bpf_ld_abs(4);
-            $skip -= 3;
-            push @prog, _bpf_jne($exc->{major}, $skip > 0 ? $skip : 0, 0);
+            push @prog, _bpf_jne($exc->{major}, $skip, 0);
         }
 
-        if ($exc->{minor} != -1) {
-            push @prog, _bpf_ld_abs(8);
+        if ($has_minor) {
             $skip -= 2;
-            push @prog, _bpf_jne($exc->{minor}, $skip > 0 ? $skip : 0, 0);
+            push @prog, _bpf_ld_abs(8);
+            push @prog, _bpf_jne($exc->{minor}, $skip, 0);
         }
 
         push @prog, _bpf_ld_mem(0);
@@ -156,7 +154,7 @@ sub _build_device_bpf ($default_allow, $exceptions) {
         $access_mask |= 4 if $exc->{access} =~ /w/;
         push @prog, _bpf_alu_rsh(16);
         push @prog, _bpf_alu_and($access_mask);
-        push @prog, _bpf_jeq(0, 1, 0);
+        push @prog, _bpf_jeq(0, 2, 0);
 
         push @prog, _bpf_ret($default_allow ? 0 : 1);
     }
