@@ -2910,7 +2910,8 @@ sub main {
         && $command ne 'help'
         && grep {$_ eq '-h' || $_ eq '--help'} @ARGV) {
         if ($dispatch{$command} || $known_cmds{$command}) {
-            print "NAME:\n   runc $command\n\nUSAGE:\n   runc $command [options]\n";
+            my $n = _binary_name();
+            print "NAME:\n   $n $command\n\nUSAGE:\n   $n $command [options]\n";
             exit(0);
         } else {
             print STDERR "No help topic for '$command'\n";
@@ -2922,7 +2923,8 @@ sub main {
         usage();
     } elsif ($command eq '--version' || $command eq '-v' || $command eq 'version') {
         require Config;
-        print "runc version 1.2.0-nacre\n";
+        my $n = _binary_name();
+        print "$n version 0.1.0\n";    # x-release-please-version
         print "commit: nacre-0.1.0\n";    # x-release-please-version
         print "spec: 1.2.0\n";
         print "go: n/a (perl $Config::Config{archname})\n";    ## no critic (ProhibitPackageVars)
@@ -2938,13 +2940,16 @@ sub main {
     return;
 }
 
+sub _binary_name {return $ENV{_NACRE_BINARY_NAME} // 'nacre'}
+
 sub usage {
-    print <<'USAGE';
+    my $n = _binary_name();
+    print <<"USAGE";
 NAME:
-   runc - Open Container Initiative runtime (nacre)
+   $n - Open Container Initiative runtime
 
 USAGE:
-   runc [global options] command [command options] [arguments...]
+   $n [global options] command [command options] [arguments...]
 
 COMMANDS:
      checkpoint  checkpoint a running container (not supported)
@@ -2953,7 +2958,7 @@ COMMANDS:
      events      display container events such as OOM notifications, cpu, memory, and IO usage statistics
      exec        execute new process inside the container
      kill        kill sends the specified signal to the container's init process
-     list        lists containers started by runc with the given root
+     list        lists containers started by $n with the given root
      pause       pause suspends all processes inside the container
      ps          ps displays the processes running inside a container
      restore     restore a container from a previous checkpoint (not supported)

@@ -17,7 +17,7 @@ spec generation cwd
 spec generation --bundle
 
 # --- version / help ---
-runc version
+[skip] runc version # version string differs from runc
 runc -h
 runc command -h
 runc foo -h
