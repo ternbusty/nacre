@@ -233,55 +233,18 @@ emit_section "mount_setattr flags (kernel 5.12+)" \
 emit_section "PTY / terminal ioctls" \
     TIOCGPTN TIOCSPTLCK TIOCSCTTY TIOCSWINSZ TIOCGWINSZ
 
-# Signals (Perl data, not from C)
 cat <<'SIGNALS'
 
 # ═══════════════════════════════════════════════════════════════════════
-# Signals (name -> number)
+# Signals (name -> number, from Perl's Config at runtime)
 # ═══════════════════════════════════════════════════════════════════════
 use Config;
 our %SIG_NUM;
 {
-    my @names = split ' ', $Config{sig_name} // '';
-    my @nums = split ' ', $Config{sig_num} // '';
-    if (!@names) {
-        %SIG_NUM = (
-            HUP => 1,
-            INT => 2,
-            QUIT => 3,
-            ILL => 4,
-            TRAP => 5,
-            ABRT => 6,
-            BUS => 7,
-            FPE => 8,
-            KILL => 9,
-            USR1 => 10,
-            SEGV => 11,
-            USR2 => 12,
-            PIPE => 13,
-            ALRM => 14,
-            TERM => 15,
-            STKFLT => 16,
-            CHLD => 17,
-            CONT => 18,
-            STOP => 19,
-            TSTP => 20,
-            TTIN => 21,
-            TTOU => 22,
-            URG => 23,
-            XCPU => 24,
-            XFSZ => 25,
-            VTALRM => 26,
-            PROF => 27,
-            WINCH => 28,
-            IO => 29,
-            PWR => 30,
-            SYS => 31,
-        );
-    } else {
-        for my $i (0 .. $#names) {
-            $SIG_NUM{$names[$i]} = $nums[$i] if $names[$i] && $nums[$i];
-        }
+    my @names = split ' ', $Config{sig_name};
+    my @nums = split ' ', $Config{sig_num};
+    for my $i (0 .. $#names) {
+        $SIG_NUM{$names[$i]} = $nums[$i] if $names[$i] && $nums[$i];
     }
 }
 SIGNALS
