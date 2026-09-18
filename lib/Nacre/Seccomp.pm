@@ -156,19 +156,13 @@ sub _init_syscall_table {
 
     for my $hdr (@hdrs) {
         my $ok = open my $fh, '<', $hdr;
-        warn "nacre: DEBUG syscall header $hdr: " . ($ok ? "opened" : "failed ($!)") . "\n" if $ENV{NACRE_DEBUG};
         next unless $ok;
         while (<$fh>) {
             $_SYSCALL_NR{$1} = $2 + 0
                 if /^\s*#\s*define\s+__NR(?:3264)?_(\w+)\s+(\d+)/;
         }
         close $fh;
-        warn "nacre: DEBUG parsed " . scalar(keys %_SYSCALL_NR) . " syscalls from $hdr\n" if $ENV{NACRE_DEBUG};
         last if %_SYSCALL_NR;
-    }
-
-    if (!%_SYSCALL_NR) {
-        warn "nacre: DEBUG syscall table empty after header scan (arch=$arch)\n" if $ENV{NACRE_DEBUG};
     }
     return;
 }
