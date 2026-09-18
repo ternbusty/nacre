@@ -58,6 +58,15 @@ jobs:
           NACRE_BIN="$(pwd)/nacre-wrapper"
           echo "NACRE_BIN=$NACRE_BIN" >> "$GITHUB_ENV"
 
+      - name: Load AppArmor profile for nacre
+        # Ubuntu 24.04 restricts unprivileged user namespace creation via
+        # AppArmor. Adapt the system runc profile (which grants the
+        # "userns" rule) for nacre, matching runc's own CI approach.
+        # Ref: https://discourse.ubuntu.com/t/39890#unprivileged-user-namespace-restrictions-15
+        run: |
+          sed "s;^profile runc /usr/sbin/runc;profile nacre /usr/bin/perl;" \
+            < /etc/apparmor.d/runc | sudo apparmor_parser
+
       - name: System diagnostics
         run: |
           echo "=== Architecture ==="
@@ -76,7 +85,7 @@ jobs:
       - name: Run runc bats integration tests
         id: bats
         run: |
-          sudo env \
+          sudo aa-exec -p nacre -- env \
             NACRE_BIN="$NACRE_BIN" \
             RUNC_TAG="$RUNC_TAG" \
             SUMMARY_FILE="$GITHUB_STEP_SUMMARY" \
