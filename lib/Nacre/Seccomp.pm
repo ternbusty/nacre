@@ -437,4 +437,6 @@ sub _apply_seccomp_minimal ($seccomp) {
 
 our @EXPORT_OK = qw(init_libseccomp apply_seccomp_raw);
 
+_init_syscall_table();
+
 1;
