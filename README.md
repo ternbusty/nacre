@@ -12,18 +12,26 @@ Implements the [OCI Runtime Specification](https://github.com/opencontainers/run
 
 FFI::Platypus is optional. If installed, the seccomp filter compiler uses it for efficient BPF assembly; otherwise nacre falls back to a pure-Perl implementation.
 
+## Getting Started
+
+```bash
+git clone https://github.com/ternbusty/nacre.git
+cd nacre
+```
+
 ## Usage
 
 ```bash
 # Generate a default OCI spec
-nacre spec
+sudo ./nacre spec --bundle mycontainer
 
 # Create and start a container
-nacre create --bundle /path/to/bundle mycontainer
-nacre start mycontainer
+sudo ./nacre run --bundle mycontainer mycontainer
 
-# Or run directly
-nacre run --bundle /path/to/bundle mycontainer
+# Or step by step
+sudo ./nacre create --bundle mycontainer mycontainer
+sudo ./nacre start mycontainer
+sudo ./nacre delete mycontainer
 ```
 
 ## OCI Commands
