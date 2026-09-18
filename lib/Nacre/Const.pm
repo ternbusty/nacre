@@ -56,6 +56,7 @@ package Nacre::Const; use constant {
     SYS_fsopen            => 430,
     SYS_fsconfig          => 431,
     SYS_fsmount           => 432,
+    SYS_statfs            => 137,
     SYS_fchown            => 93,
     SYS_sendmsg           => 46,
     SYS_recvmsg           => 47,
@@ -103,6 +104,7 @@ package Nacre::Const; use constant {
     SYS_fsopen            => 430,
     SYS_fsconfig          => 431,
     SYS_fsmount           => 432,
+    SYS_statfs            => 43,
     SYS_fchown            => 55,
     SYS_sendmsg           => 211,
     SYS_recvmsg           => 212,
@@ -299,7 +301,7 @@ our @EXPORT_OK = qw(
     SYS_prlimit64 SYS_ioprio_set SYS_sched_setattr SYS_sched_setaffinity
     SYS_set_mempolicy SYS_keyctl SYS_add_key SYS_memfd_create
     SYS_open_tree SYS_move_mount SYS_mount_setattr
-    SYS_fsopen SYS_fsconfig SYS_fsmount SYS_fchown
+    SYS_fsopen SYS_fsconfig SYS_fsmount SYS_statfs SYS_fchown
     SYS_sendmsg SYS_recvmsg SYS_epoll_create1 SYS_epoll_ctl
     SYS_epoll_wait SYS_inotify_init1 SYS_inotify_add_watch SYS_waitid
 

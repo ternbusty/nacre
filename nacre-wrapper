@@ -3,4 +3,6 @@
 # runc bats tests expect the runtime at $RUNC or ./runc; this script
 # finds the Perl source relative to itself and invokes it.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export _NACRE_BINARY_NAME
+_NACRE_BINARY_NAME="$(basename "$0")"
 exec perl "$SCRIPT_DIR/nacre" "$@"

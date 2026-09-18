@@ -11,7 +11,7 @@ use Socket qw(AF_UNIX SOCK_STREAM);
 use Cwd qw(abs_path);
 use Nacre::Const qw(
     SYS_mount SYS_umount2 SYS_pivot_root SYS_mknod SYS_mknodat
-    SYS_open_tree SYS_move_mount SYS_mount_setattr
+    SYS_open_tree SYS_move_mount SYS_mount_setattr SYS_statfs
     CLONE_NEWUSER
     MS_RDONLY MS_NOSUID MS_NODEV MS_NOEXEC MS_REMOUNT
     MS_NOATIME MS_NODIRATIME MS_BIND MS_MOVE MS_REC MS_SILENT
@@ -839,6 +839,13 @@ sub _apply_single_mount ($m, $rootfs, $mount_source_fds, $chan_w, $chan_r, $dest
     # Apply idmap/ridmap via open_tree + mount_setattr + move_mount
     if ($has_idmap || $has_ridmap) {
         _apply_idmap($m, $dest, $flags, $has_idmap, $has_ridmap, $mount_source_fds, $chan_w, $chan_r);
+
+        my $prop_mask = MS_PRIVATE | MS_SHARED | MS_SLAVE | MS_UNBINDABLE;
+        my $prop_flags = $flags & ($prop_mask | MS_REC);
+        if ($prop_flags & $prop_mask) {
+            do_mount('', $dest, '', $prop_flags, '')
+                or warn "nacre: mount propagation after idmap $dest: $!\n";
+        }
     }
 
     # Restore tmpcopyup content
@@ -1103,9 +1110,19 @@ sub apply_readonly_paths ($paths) {
     for my $p (@{$paths // []}) {
         next unless -e $p;
         do_mount($p, $p, '', MS_BIND | MS_REC, '');
-        do_mount('', $p, '', MS_REMOUNT | MS_BIND | MS_RDONLY | MS_REC, '');
+        my $flags = _statfs_flags($p);
+        do_mount('', $p, '', $flags | MS_REMOUNT | MS_BIND | MS_RDONLY, '');
     }
     return;
+}
+
+sub _statfs_flags ($path) {
+    my $buf = "\0" x 120;
+    my $nr = SYS_statfs + 0;
+    my $ret = syscall($nr, $path, $buf);
+    return 0 if $ret != 0;
+    my $f_flags = unpack('q', substr($buf, 80, 8));
+    return $f_flags & (MS_NOSUID | MS_NODEV | MS_NOEXEC);
 }
 
 sub set_rootfs_readonly ($rootfs_readonly) {
