@@ -25,17 +25,6 @@ jobs:
           WRAPPER
           sudo chmod +x /opt/nacre/bin
 
-      - name: System diagnostics
-        run: |
-          echo "=== Architecture ==="
-          uname -m
-          uname -a
-          echo "=== Perl ==="
-          perl -v | head -5
-          perl -e 'use Config; print "archname=$Config{archname}\n"'
-          echo "=== Nacre version ==="
-          perl /opt/nacre/nacre version 2>&1 || true
-
       - name: Install Go and dependencies
         run: |
           sudo apt-get update || true
