@@ -21,6 +21,7 @@ jobs:
           # Create a wrapper that invokes perl
           sudo tee /opt/nacre/bin > /dev/null <<'WRAPPER'
           #!/bin/bash
+          export NACRE_DEBUG=1
           exec perl /opt/nacre/nacre "$@"
           WRAPPER
           sudo chmod +x /opt/nacre/bin
@@ -35,6 +36,11 @@ jobs:
           perl -e 'use Config; print "archname=$Config{archname}\n"'
           echo "=== Nacre version ==="
           perl /opt/nacre/nacre version 2>&1 || true
+          echo "=== Syscall header check ==="
+          ls -la /usr/include/x86_64-linux-gnu/asm/unistd_64.h /usr/include/asm/unistd_64.h 2>&1 || true
+          dpkg -l linux-libc-dev 2>&1 | tail -2 || true
+          echo "=== Header parse test ==="
+          NACRE_DEBUG=1 perl -I /opt/nacre/lib -e 'use Nacre::Seccomp; Nacre::Seccomp::_init_syscall_table()' 2>&1 || true
 
       - name: Install Go and dependencies
         run: |
