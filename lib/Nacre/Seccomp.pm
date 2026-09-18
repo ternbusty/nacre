@@ -163,6 +163,9 @@ sub _init_syscall_table {
         close $fh;
         last if %_SYSCALL_NR;
     }
+    unless (%_SYSCALL_NR) {
+        warn "nacre: seccomp: could not load syscall table (arch=$arch, tried: @hdrs)\n";
+    }
     return;
 }
 
