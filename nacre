@@ -204,7 +204,7 @@ sub _init_post_start ($spec, $id, $bundle) {
 
 sub _is_named_fifo ($fd_num) {
     my $link = readlink("/proc/self/fd/$fd_num") // '';
-    return $link =~ m{^/} && $link !~ m{^/dev/};
+    return -p "/proc/self/fd/$fd_num" && $link =~ m{^/};
 }
 
 sub _init_setup_stdio ($foreground, $pts_fd, $spec, $dbg) {
