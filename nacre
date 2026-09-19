@@ -202,11 +202,20 @@ sub _init_post_start ($spec, $id, $bundle) {
     return;
 }
 
+sub _is_named_fifo ($fd_num) {
+    my $link = readlink("/proc/self/fd/$fd_num") // '';
+    return -p "/proc/self/fd/$fd_num" && $link =~ m{^/};
+}
+
 sub _init_setup_stdio ($foreground, $pts_fd, $spec, $dbg) {
     if (!$foreground && !defined $pts_fd) {
         open STDIN, '<', '/dev/null' or fatal("open /dev/null for STDIN: $!");
-        open STDOUT, '>', '/dev/null' or fatal("open /dev/null for STDOUT: $!");
-        open STDERR, '>', '/dev/null' or fatal("open /dev/null for STDERR: $!");
+        if (!_is_named_fifo(1)) {
+            open STDOUT, '>', '/dev/null' or fatal("open /dev/null for STDOUT: $!");
+        }
+        if (!_is_named_fifo(2)) {
+            open STDERR, '>', '/dev/null' or fatal("open /dev/null for STDERR: $!");
+        }
     }
 
     if (defined $pts_fd) {
@@ -392,7 +401,7 @@ sub run_main_process (%p) {
 
     # Write pid file if requested
     if ($p{pid_file}) {
-        write_file($p{pid_file}, "$init_pid\n");
+        write_file($p{pid_file}, "$init_pid");
     }
 
     # Run createRuntime hooks
@@ -719,7 +728,7 @@ sub _create_parent_finish (    ## no critic (Subroutines::ProhibitManyArgs)
     save_state($root, $state);
 
     if ($p_ref->{pid_file}) {
-        write_file($p_ref->{pid_file}, "$init_pid\n");
+        write_file($p_ref->{pid_file}, "$init_pid");
     }
 
     if ($p_ref->{pidfd_socket}) {
