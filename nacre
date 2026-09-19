@@ -203,12 +203,6 @@ sub _init_post_start ($spec, $id, $bundle) {
 }
 
 sub _init_setup_stdio ($foreground, $pts_fd, $spec, $dbg) {
-    if (!$foreground && !defined $pts_fd) {
-        open STDIN, '<', '/dev/null' or fatal("open /dev/null for STDIN: $!");
-        open STDOUT, '>', '/dev/null' or fatal("open /dev/null for STDOUT: $!");
-        open STDERR, '>', '/dev/null' or fatal("open /dev/null for STDERR: $!");
-    }
-
     if (defined $pts_fd) {
         my $uid = $spec->{process}{user}{uid} // 0;
         do_syscall(SYS_fchown, $pts_fd, $uid, 5);
@@ -392,7 +386,7 @@ sub run_main_process (%p) {
 
     # Write pid file if requested
     if ($p{pid_file}) {
-        write_file($p{pid_file}, "$init_pid\n");
+        write_file($p{pid_file}, "$init_pid");
     }
 
     # Run createRuntime hooks
@@ -719,7 +713,7 @@ sub _create_parent_finish (    ## no critic (Subroutines::ProhibitManyArgs)
     save_state($root, $state);
 
     if ($p_ref->{pid_file}) {
-        write_file($p_ref->{pid_file}, "$init_pid\n");
+        write_file($p_ref->{pid_file}, "$init_pid");
     }
 
     if ($p_ref->{pidfd_socket}) {
