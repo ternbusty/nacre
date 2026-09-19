@@ -202,7 +202,22 @@ sub _init_post_start ($spec, $id, $bundle) {
     return;
 }
 
+sub _is_named_fifo ($fd_num) {
+    my $link = readlink("/proc/self/fd/$fd_num") // '';
+    return $link =~ m{^/} && $link !~ m{^/dev/};
+}
+
 sub _init_setup_stdio ($foreground, $pts_fd, $spec, $dbg) {
+    if (!$foreground && !defined $pts_fd) {
+        open STDIN, '<', '/dev/null' or fatal("open /dev/null for STDIN: $!");
+        if (!_is_named_fifo(1)) {
+            open STDOUT, '>', '/dev/null' or fatal("open /dev/null for STDOUT: $!");
+        }
+        if (!_is_named_fifo(2)) {
+            open STDERR, '>', '/dev/null' or fatal("open /dev/null for STDERR: $!");
+        }
+    }
+
     if (defined $pts_fd) {
         my $uid = $spec->{process}{user}{uid} // 0;
         do_syscall(SYS_fchown, $pts_fd, $uid, 5);
