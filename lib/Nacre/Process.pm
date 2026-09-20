@@ -35,6 +35,12 @@ sub apply_process_security ($spec) {
         do_syscall(SYS_prctl, PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
     }
 
+    # 3a. SELinux process label — write to /proc/thread-self/attr/exec
+    # so the kernel applies this label on the next execve(2).
+    if (my $label = $proc->{selinuxLabel}) {
+        apply_selinux_exec_label($label);
+    }
+
     # 3b. Rlimits — must be applied BEFORE dropping caps, because
     #     raising hard limits beyond the current value requires
     #     CAP_SYS_RESOURCE (which may not be in the target cap sets).
@@ -577,6 +583,18 @@ sub apply_sysctls ($spec) {
     return;
 }
 
+sub selinux_enabled () {
+    return -d '/sys/fs/selinux' && -w '/sys/fs/selinux';
+}
+
+sub apply_selinux_exec_label ($label) {
+    my $path = -d '/proc/thread-self/attr' ? '/proc/thread-self/attr/exec' : '/proc/self/attr/exec';
+    open(my $fh, '>', $path) or fatal("set SELinux exec label: $!");
+    print $fh $label;
+    close $fh or fatal("set SELinux exec label (close): $!");
+    return;
+}
+
 our @EXPORT_OK = qw(
     apply_process_security
     validate_rlimits apply_rlimits
@@ -587,6 +605,8 @@ our @EXPORT_OK = qw(
     apply_cpu_affinity_reset apply_exec_cpu_affinity apply_final_cpu_affinity
     apply_exec_caps
     apply_sysctls
+    selinux_enabled
+    apply_selinux_exec_label
 );
 
 1;

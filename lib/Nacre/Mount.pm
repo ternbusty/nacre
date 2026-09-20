@@ -796,7 +796,8 @@ sub _apply_idmap ($m, $dest, $flags, $has_idmap, $has_ridmap, $mount_source_fds,
 }
 
 ## Process and apply a single OCI mount entry.
-sub _apply_single_mount ($m, $rootfs, $mount_source_fds, $chan_w, $chan_r, $dest_preexisted_ref, $dev_needs_ro_ref) {
+sub _apply_single_mount ($m, $rootfs, $mount_source_fds, $chan_w, $chan_r, $dest_preexisted_ref, $dev_needs_ro_ref,
+    $mount_label) {
     my $mount_src = $m->{source} // '';
 
     my ($dest, $type) = _resolve_mount_dest($m, $rootfs);
@@ -817,6 +818,12 @@ sub _apply_single_mount ($m, $rootfs, $mount_source_fds, $chan_w, $chan_r, $dest
         $tmpcopy_src = "$dest.tmpcopyup.$$";
         mkdir $tmpcopy_src, 0755;
         do_mount($dest, $tmpcopy_src, '', MS_BIND, '');
+    }
+
+    # Append SELinux mount label for non-bind, non-proc, non-sysfs mounts
+    if ($mount_label && !($flags & MS_BIND) && $type ne 'proc' && $type ne 'sysfs') {
+        my $ctx = "context=\"$mount_label\"";
+        $data = $data ? "$data,$ctx" : $ctx;
     }
 
     # Apply the mount (bind vs non-bind)
@@ -863,6 +870,8 @@ sub apply_mounts ($spec, $rootfs, $mount_source_fds, $chan_w, $chan_r) {
     $mount_source_fds //= {};
     log_debug("applying mounts, rootfs=$rootfs");
 
+    my $mount_label = $spec->{linux}{mountLabel} // '';
+
     # Track /dev ro remount: defer MS_RDONLY on /dev until after device creation
     my $dev_needs_ro = 0;
 
@@ -870,7 +879,8 @@ sub apply_mounts ($spec, $rootfs, $mount_source_fds, $chan_w, $chan_r) {
     my %dest_preexisted;
 
     for my $m (@{$spec->{mounts} // []}) {
-        _apply_single_mount($m, $rootfs, $mount_source_fds, $chan_w, $chan_r, \%dest_preexisted, \$dev_needs_ro);
+        _apply_single_mount($m, $rootfs, $mount_source_fds, $chan_w, $chan_r, \%dest_preexisted, \$dev_needs_ro,
+            $mount_label);
     }
 
     return $dev_needs_ro;

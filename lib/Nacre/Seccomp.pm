@@ -15,10 +15,21 @@ use Nacre::Util qw(log_debug fatal);
 my $SECCOMP_AVAILABLE = 0;
 my $LIBSECCOMP;
 
+sub _libseccomp_path {
+    require Config;
+    my $arch = $Config::Config{archname} // '';    ## no critic (ProhibitPackageVars)
+    my $multi = $arch =~ /aarch64|arm64/i ? 'aarch64-linux-gnu' : 'x86_64-linux-gnu';
+    for my $p ("/usr/lib/$multi/libseccomp.so.2", '/usr/lib/libseccomp.so.2') {
+        return $p if -e $p;
+    }
+    return;
+}
+
 sub init_libseccomp {
     eval {
         require DynaLoader;
-        $LIBSECCOMP = DynaLoader::dl_load_file('/usr/lib/x86_64-linux-gnu/libseccomp.so.2', 0);
+        my $path = _libseccomp_path() // return;
+        $LIBSECCOMP = DynaLoader::dl_load_file($path, 0);
         $SECCOMP_AVAILABLE = 1 if $LIBSECCOMP;
     };
     return;
@@ -52,7 +63,7 @@ sub _apply_seccomp_ffi ($spec) {
 
     require FFI::Platypus;
     my $ffi = FFI::Platypus->new(api => 2);
-    $ffi->lib('/usr/lib/x86_64-linux-gnu/libseccomp.so.2');
+    $ffi->lib(_libseccomp_path() // '/usr/lib/libseccomp.so.2');
 
     $ffi->attach('seccomp_init' => ['uint32'] => 'opaque');
     $ffi->attach('seccomp_arch_add' => ['opaque', 'uint32'] => 'int');

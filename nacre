@@ -55,6 +55,7 @@ use Nacre::Process qw(
     validate_memory_policy apply_memory_policy apply_timens_offsets
     apply_cpu_affinity_reset apply_exec_cpu_affinity apply_final_cpu_affinity
     apply_exec_caps apply_sysctls
+    selinux_enabled apply_selinux_exec_label
 );
 use Nacre::State qw(
     load_spec cache_spec load_cached_spec default_spec
@@ -2188,6 +2189,10 @@ sub cmd_exec (%p) {    ## no critic (Subroutines::ProhibitExcessComplexity)
         sysread($pipes->{cg_sync_r}, my $cg_sync_buf, 1);
         close $pipes->{cg_sync_r};
 
+        if (my $label = ($exec_proc && $exec_proc->{selinuxLabel}) || $spec->{process}{selinuxLabel}) {
+            apply_selinux_exec_label($label);
+        }
+
         log_debug("setns_init: about to exec");
         _exec_child_close_fds($preserve_fds, $pipes->{err_w});
         apply_final_cpu_affinity($final_affinity) if $final_affinity;
@@ -2659,7 +2664,7 @@ sub cmd_features {
                 ],
             },
             apparmor => {enabled => JSON::PP::false},
-            selinux => {enabled => JSON::PP::false},
+            selinux => {enabled => selinux_enabled() ? JSON::PP::true : JSON::PP::false},
         },
         annotations => {
             'org.opencontainers.runtime.nacre' => 'Perl OCI runtime',
