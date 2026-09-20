@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.0](https://github.com/ternbusty/nacre/compare/v0.2.0...v0.3.0) (2026-09-20)
+
+
+### Features
+
+* add SELinux support and ARM64 CI ([#12](https://github.com/ternbusty/nacre/issues/12)) ([13cdae8](https://github.com/ternbusty/nacre/commit/13cdae87390149f0fe8763ff41bb8a19f6523d62))
+
+
+### Bug Fixes
+
+* containerd compatibility — pidfile format and stdio inheritance ([#11](https://github.com/ternbusty/nacre/issues/11)) ([0524886](https://github.com/ternbusty/nacre/commit/0524886139d3d0c56a695f95bf03710a4dcfb698))
+* unskip and fix no-pivot proc exposure test ([#9](https://github.com/ternbusty/nacre/issues/9)) ([e889dc9](https://github.com/ternbusty/nacre/commit/e889dc9fe3156313e652dfb3c6af9bb770d6dcdf))
+
 ## [0.2.0](https://github.com/ternbusty/nacre/compare/v0.1.0...v0.2.0) (2026-09-17)
 
 
