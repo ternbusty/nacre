@@ -173,8 +173,8 @@ runc run [hook's argv is preserved]
 runc run [host mount ns + hooks]
 
 # --- run (selinux) ---
-[skip]runc run (custom selinux label) # selinux
-[skip]runc run (no selinux label) # selinux
+runc run (custom selinux label) # selinux
+runc run (no selinux label) # selinux
 
 # --- run (session keyring) ---
 runc run (session keyring security label)
@@ -426,7 +426,7 @@ Check mount source fds are cleaned up with idmapped mounts [userns]
 userns join external namespaces [wrong userns owner]
 userns join other container userns
 userns join other container userns [bind-mounted nsfd]
-[skip]userns join other container userns[selinux enabled] # selinux
+userns join other container userns[selinux enabled] # selinux
 userns with 2 inaccessible mounts
 userns with bind mount before a cgroupfs mount
 userns with inaccessible mount + exec

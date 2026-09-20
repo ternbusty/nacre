@@ -18,9 +18,17 @@ jobs:
         run: perl -c nacre
 
   integration:
-    name: Integration tests
-    runs-on: ubuntu-24.04
+    name: Integration tests (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
@@ -41,14 +49,34 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-logs
+          name: test-logs-${{ matrix.arch }}
           path: /tmp/test-output.log
           retention-days: 5
 
   oci-validation:
     needs: integration
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     uses: ./.github/workflows/oci-validation.yml
+    with:
+      runner: ${{ matrix.runner }}
 
   runc-bats:
     needs: integration
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     uses: ./.github/workflows/runc-compat.yml
+    with:
+      runner: ${{ matrix.runner }}

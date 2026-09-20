@@ -2,12 +2,16 @@ name: runc bats compatibility
 
 on:
   workflow_call:
+    inputs:
+      runner:
+        type: string
+        default: ubuntu-24.04
   workflow_dispatch:
 
 jobs:
   runc-bats:
     name: runc bats integration
-    runs-on: ubuntu-24.04
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
     timeout-minutes: 45
 
     steps:
@@ -102,5 +106,5 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: runc-bats-tap-output
+          name: runc-bats-tap-output-${{ inputs.runner || 'ubuntu-24.04' }}
           path: tap-output.log
