@@ -280,10 +280,10 @@ our @EXPORT_OK = qw(
     SYS_clone SYS_clone3 SYS_prctl SYS_capget SYS_capset
     SYS_mknod SYS_mknodat SYS_seccomp SYS_bpf SYS_pidfd_open
     SYS_close_range SYS_sethostname SYS_setdomainname SYS_setgroups
-    SYS_prlimit64 SYS_ioprio_set SYS_sched_setattr SYS_sched_setaffinity
+    SYS_prlimit64 SYS_ioprio_set SYS_sched_setattr SYS_sched_setaffinity SYS_personality
     SYS_set_mempolicy SYS_keyctl SYS_add_key SYS_memfd_create
     SYS_open_tree SYS_move_mount SYS_mount_setattr
-    SYS_fsopen SYS_fsconfig SYS_fsmount SYS_fchown
+    SYS_fsopen SYS_fsconfig SYS_fsmount SYS_statfs SYS_fchown
     SYS_sendmsg SYS_recvmsg SYS_epoll_create1 SYS_epoll_ctl
     SYS_epoll_wait SYS_inotify_init1 SYS_inotify_add_watch SYS_waitid
 

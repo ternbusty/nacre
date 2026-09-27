@@ -80,3 +80,7 @@ jobs:
     uses: ./.github/workflows/runc-compat.yml
     with:
       runner: ${{ matrix.runner }}
+
+  runc-bats-selinux:
+    needs: integration
+    uses: ./.github/workflows/selinux.yml

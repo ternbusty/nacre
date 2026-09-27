@@ -53,6 +53,7 @@ int main(void) {
     P(__NR_ioprio_set);
     P(__NR_sched_setattr);
     P(__NR_sched_setaffinity);
+    P(__NR_personality);
     P(__NR_set_mempolicy);
     P(__NR_keyctl);
     P(__NR_add_key);
@@ -63,6 +64,7 @@ int main(void) {
     P(__NR_fsopen);
     P(__NR_fsconfig);
     P(__NR_fsmount);
+    P(__NR_statfs);
     P(__NR_fchown);
     P(__NR_sendmsg);
     P(__NR_recvmsg);

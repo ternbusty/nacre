@@ -2,9 +2,11 @@ package Nacre::Process;
 use v5.38;
 use Exporter 'import';
 use POSIX qw(setgid setuid);
+use Errno qw(ENOSYS);
 use Nacre::Const qw(
     SYS_prctl SYS_capset SYS_setgroups SYS_prlimit64
     SYS_ioprio_set SYS_sched_setattr SYS_sched_setaffinity SYS_set_mempolicy
+    SYS_personality SYS_keyctl
     PR_SET_NO_NEW_PRIVS PR_CAPBSET_DROP PR_SET_KEEPCAPS
     PR_CAP_AMBIENT PR_CAP_AMBIENT_RAISE
     @CAP_NAMES %CAP_NUM _LINUX_CAPABILITY_VERSION_3
@@ -17,8 +19,27 @@ use Nacre::Caps qw(apply_capabilities_bounding apply_capabilities_final);
 # Process Security
 # ═══════════════════════════════════════════════════════════════════════
 
+# linux.personality. Like runc, only the execution domain is applied (flags
+# are ignored), and it must happen before seccomp, which may block the
+# personality syscall.
+my %PERSONALITY_DOMAIN = (
+    LINUX => 0x0000,    # PER_LINUX
+    LINUX32 => 0x0008,    # PER_LINUX32
+);
+
+sub apply_personality ($spec) {
+    my $p = $spec->{linux}{personality} // return;
+    my $domain = $p->{domain} // 'LINUX';
+    my $value = $PERSONALITY_DOMAIN{$domain} // fatal("invalid personality domain: $domain");
+    do_syscall(SYS_personality, $value) != -1
+        or fatal("personality($domain): $!");
+    return;
+}
+
 sub apply_process_security ($spec) {
     my $proc = $spec->{process} // {};
+
+    apply_personality($spec);
 
     # 1. OOM score adj
     if (defined $proc->{oomScoreAdj}) {
@@ -587,6 +608,54 @@ sub selinux_enabled () {
     return -d '/sys/fs/selinux' && -w '/sys/fs/selinux';
 }
 
+# Give the container its own session keyring "_ses.<id>" instead of
+# inheriting the caller's, as runc does (init creates it, exec joins it).
+# With an SELinux process label the keyring is created with that label, so
+# the container process can use it. $newperms, when given, is OR-ed into the
+# keyring permissions (search for the possessor's UID, or for "other" in a
+# user namespace) so later execs can join. Keyrings not being supported
+# (ENOSYS) is not an error.
+use constant {
+    KEYCTL_JOIN_SESSION_KEYRING => 1,
+    KEYCTL_SETPERM => 5,
+    KEYCTL_DESCRIBE => 6,
+};
+
+sub join_session_keyring ($id, $label = undef, $newperms = undef) {
+    _set_key_label($label) if $label;
+    my $name = "_ses.$id\0";
+    my $serial = syscall(SYS_keyctl + 0, KEYCTL_JOIN_SESSION_KEYRING + 0, $name);
+    my $err = $!;
+    if ($serial == -1) {
+        _set_key_label('') if $label;
+        return if $err == ENOSYS;
+        fatal("unable to join session keyring: $err");
+    }
+    if (defined $newperms) {
+
+        # Description: "type;uid;gid;perm;description", perm in hex.
+        my $buf = "\0" x 512;
+        my $n = syscall(SYS_keyctl + 0, KEYCTL_DESCRIBE + 0, $serial + 0, $buf, 512);
+        fatal("unable to describe session keyring: $!") if $n == -1;
+        my $perm = (split /;/, substr($buf, 0, $n))[3] // fatal("unexpected keyring description");
+        syscall(SYS_keyctl + 0, KEYCTL_SETPERM + 0, $serial + 0, (hex($perm) | $newperms) + 0) != -1
+            or fatal("unable to mod keyring permissions: $!");
+    }
+    _set_key_label('') if $label;
+    return;
+}
+
+sub _set_key_label ($label) {
+    if (open(my $fh, '>', '/proc/self/attr/keycreate')) {
+        my $ok = print {$fh} $label;
+        $ok = close($fh) && $ok;
+        fatal("set SELinux key label: $!") if !$ok && $label ne '';
+    } elsif ($label ne '') {
+        fatal("set SELinux key label: $!");
+    }
+    return;
+}
+
 sub apply_selinux_exec_label ($label) {
     my $path = -d '/proc/thread-self/attr' ? '/proc/thread-self/attr/exec' : '/proc/self/attr/exec';
     open(my $fh, '>', $path) or fatal("set SELinux exec label: $!");
@@ -596,7 +665,7 @@ sub apply_selinux_exec_label ($label) {
 }
 
 our @EXPORT_OK = qw(
-    apply_process_security
+    apply_process_security apply_personality
     validate_rlimits apply_rlimits
     apply_iopriority
     apply_scheduler
@@ -607,6 +676,7 @@ our @EXPORT_OK = qw(
     apply_sysctls
     selinux_enabled
     apply_selinux_exec_label
+    join_session_keyring
 );
 
 1;

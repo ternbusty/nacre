@@ -30,6 +30,19 @@ use Nacre::IPC qw(channel_send channel_recv send_fd_over_fd recv_fd_over_fd);
 # Mount / Rootfs
 # ═══════════════════════════════════════════════════════════════════════
 
+use constant {
+    MS_SYNCHRONOUS => 16,
+    MS_MANDLOCK => 64,
+    MS_NOSYMFOLLOW => 256,
+};
+
+# The atime "enum" flags (mutually exclusive), all atime flags, and the
+# flags the kernel locks (MNT_LOCK_*) on mounts inherited into another
+# user namespace. Same grouping as runc.
+use constant MNT_ATIME_ENUM_FLAGS => MS_NOATIME | MS_RELATIME | MS_STRICTATIME;
+use constant MNT_ATIME_FLAGS => MNT_ATIME_ENUM_FLAGS | MS_NODIRATIME;
+use constant MNT_LOCK_FLAGS => MS_RDONLY | MS_NODEV | MS_NOEXEC | MS_NOSUID | MNT_ATIME_FLAGS;
+
 our %MOUNT_FLAGS = (
     bind => MS_BIND,
     rbind => MS_BIND | MS_REC,
@@ -49,8 +62,10 @@ our %MOUNT_FLAGS = (
     norelatime => 0,
     strictatime => MS_STRICTATIME,
     nostrictatime => 0,
+    nosymfollow => MS_NOSYMFOLLOW,
+    symfollow => 0,
     remount => MS_REMOUNT,
-    sync => 16,    # MS_SYNCHRONOUS
+    sync => MS_SYNCHRONOUS,
     async => 0,
     dirsync => 128,    # MS_DIRSYNC
     silent => MS_SILENT,
@@ -117,6 +132,35 @@ sub do_move_mount ($from_fd, $from_path, $to_fd, $to_path, $flags) {
     my $ret;
     do {$ret = syscall($nr, $ffd, $from_path, $tfd, $to_path, $fl)} while ($ret == -1 && $! == EINTR);
     return $ret == 0;
+}
+
+# Options that explicitly clear a flag. For bind mounts these matter: a flag
+# that is cleared must not be inherited from the source mount.
+my %MOUNT_CLEAR_FLAGS = (
+    rw => MS_RDONLY,
+    suid => MS_NOSUID,
+    dev => MS_NODEV,
+    exec => MS_NOEXEC,
+    atime => MS_NOATIME,
+    diratime => MS_NODIRATIME,
+    norelatime => MS_RELATIME,
+    nostrictatime => MS_STRICTATIME,
+    symfollow => MS_NOSYMFOLLOW,
+    async => MS_SYNCHRONOUS,
+    loud => MS_SILENT,
+);
+
+# Flags explicitly cleared by the options; later options win, as in runc.
+sub mount_cleared_flags ($opts_ref) {
+    my $cleared = 0;
+    for my $opt (@{$opts_ref // []}) {
+        if (my $f = $MOUNT_CLEAR_FLAGS{$opt}) {
+            $cleared |= $f;
+        } elsif ($MOUNT_FLAGS{$opt}) {
+            $cleared &= ~$MOUNT_FLAGS{$opt};
+        }
+    }
+    return $cleared;
 }
 
 sub parse_mount_options ($opts_ref) {
@@ -599,7 +643,7 @@ sub _determine_mount_flags ($m, $type, $dest, $dest_preexisted_ref) {
 
 ## Perform a bind mount with fallbacks (pre-opened fds, parent channel).
 ## Returns 1 on success, 0 on failure (caller should skip this mount).
-sub _apply_bind_mount ($src, $dest, $flags, $mount_src, $mount_source_fds, $chan_w, $chan_r) {
+sub _apply_bind_mount ($src, $dest, $flags, $cleared, $mount_src, $mount_source_fds, $chan_w, $chan_r) {
 
     # Bind mount -- if the source is inaccessible (e.g. after
     # entering a user namespace), fall back to /proc/self/fd/N
@@ -638,13 +682,52 @@ sub _apply_bind_mount ($src, $dest, $flags, $mount_src, $mount_source_fds, $chan
         return 0;
     }
 
-    # Apply remaining flags via remount
-    if ($flags & ~(MS_BIND | MS_REC)) {
-        do_mount('', $dest, '', MS_REMOUNT | MS_BIND | ($flags & ~MS_REC), '')
-            or warn "nacre: remount $dest: $!\n";
-    }
-
+    _remount_bind_flags($mount_src, $dest, $flags, $cleared);
     return 1;
+}
+
+## The initial MS_BIND keeps the source's mount flags; apply the requested
+## ones with MS_BIND|MS_REMOUNT, following runc: emulate "mount --bind -o
+## <opts>" (only the requested flags, everything else cleared), and if that
+## fails because the kernel locked some flags (inherited into a user
+## namespace), keep the locked flags -- unless the options explicitly asked
+## to clear one of them or for a different atime mode, which is an error.
+sub _remount_bind_flags ($mount_src, $dest, $flags, $cleared) {
+    my $prop_mask = MS_PRIVATE | MS_SHARED | MS_SLAVE | MS_UNBINDABLE;
+    my $requested = $flags & ~(MS_BIND | MS_REC | MS_REMOUNT | $prop_mask);
+
+    # No flags requested at all (not even cleared ones): keep the source's.
+    return unless $requested || $cleared;
+
+    my $remount = MS_BIND | MS_REMOUNT | $requested;
+    return if do_mount('', $dest, '', $remount, '');
+    my $err = lc "$!";    # Go-style errno text, as in runc's messages
+
+    my $what = qq{error mounting "$mount_src" to rootfs at "$dest"};
+    my $src_flags = _statfs_mount_flags($dest) // fatal("$what: statfs: $!");
+    if (my $locked = $src_flags & $cleared & MNT_LOCK_FLAGS) {
+        fatal("$what: cannot clear locked flags " . _mount_flags_str($locked) . ": $err");
+    }
+    if (($requested & MNT_ATIME_FLAGS) && ($requested & MNT_ATIME_FLAGS) != ($src_flags & MNT_ATIME_FLAGS)) {
+        fatal("$what: cannot change locked atime flags " . _mount_flags_str($src_flags & MNT_ATIME_FLAGS) . ": $err");
+    }
+    $remount |= $src_flags & MNT_LOCK_FLAGS;
+    do_mount('', $dest, '', $remount, '')
+        or fatal("$what: remount with locked flags "
+            . _mount_flags_str($src_flags & MNT_LOCK_FLAGS)
+            . " re-applied: "
+            . lc "$!");
+    return;
+}
+
+sub _mount_flags_str ($flags) {
+    my @names;
+    for my $name (sort keys %MOUNT_FLAGS) {
+        my $f = $MOUNT_FLAGS{$name};
+        next if !$f || $f & (MS_BIND | MS_REC | MS_REMOUNT) || $name eq 'readonly';
+        push @names, $name if ($flags & $f) == $f;
+    }
+    return join(',', @names);
 }
 
 ## Perform a non-bind filesystem mount with propagation handling.
@@ -829,7 +912,8 @@ sub _apply_single_mount ($m, $rootfs, $mount_source_fds, $chan_w, $chan_r, $dest
     # Apply the mount (bind vs non-bind)
     my $ok;
     if ($flags & MS_BIND) {
-        $ok = _apply_bind_mount($src, $dest, $flags, $mount_src, $mount_source_fds, $chan_w, $chan_r);
+        $ok = _apply_bind_mount($src, $dest, $flags, mount_cleared_flags($m->{options}),
+            $mount_src, $mount_source_fds, $chan_w, $chan_r);
     } else {
         $ok = _apply_fs_mount($src, $dest, $type, $flags, $data);
     }
@@ -1126,6 +1210,34 @@ sub apply_readonly_paths ($paths) {
     return;
 }
 
+# The MS_* flags of the mount at $path, from statfs(2) (see
+# calculate_f_flags() in fs/statfs.c). MS_STRICTATIME is not reported by the
+# kernel: it is implied when no other atime mode is set. undef on error.
+sub _statfs_mount_flags ($path) {
+    my $buf = "\0" x 120;
+    my $nr = SYS_statfs + 0;
+    return undef if syscall($nr, $path, $buf) != 0;    ## no critic (ProhibitExplicitReturnUndef)
+    my $st = unpack('q', substr($buf, 80, 8));
+    my @map = (
+        [0x0001, MS_RDONLY],
+        [0x0002, MS_NOSUID],
+        [0x0004, MS_NODEV],
+        [0x0008, MS_NOEXEC],
+        [0x0010, MS_SYNCHRONOUS],
+        [0x0040, MS_MANDLOCK],
+        [0x0400, MS_NOATIME],
+        [0x0800, MS_NODIRATIME],
+        [0x1000, MS_RELATIME],
+        [0x2000, MS_NOSYMFOLLOW],
+    );
+    my $flags = 0;
+    for my $m (@map) {
+        $flags |= $m->[1] if $st & $m->[0];
+    }
+    $flags |= MS_STRICTATIME unless $flags & MNT_ATIME_ENUM_FLAGS;
+    return $flags;
+}
+
 sub _statfs_flags ($path) {
     my $buf = "\0" x 120;
     my $nr = SYS_statfs + 0;
@@ -1137,7 +1249,12 @@ sub _statfs_flags ($path) {
 
 sub set_rootfs_readonly ($rootfs_readonly) {
     return unless $rootfs_readonly;
-    do_mount('', '/', '', MS_REMOUNT | MS_BIND | MS_RDONLY, '')
+
+    # Keep the flags the rootfs mount already has: in a user namespace the
+    # kernel locks e.g. nodev/nosuid inherited from the host mount (a bundle
+    # under a nodev /tmp), and a remount that would clear them fails.
+    my $keep = (_statfs_mount_flags('/') // 0) & MNT_LOCK_FLAGS;
+    do_mount('', '/', '', MS_REMOUNT | MS_BIND | MS_RDONLY | $keep, '')
         or fatal("remount / readonly: $!");
     return;
 }
