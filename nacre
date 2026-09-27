@@ -159,7 +159,17 @@ sub _init_post_pivot ($spec) {
     apply_readonly_paths($spec->{linux}{readonlyPaths});
     apply_masked_paths($spec->{linux}{maskedPaths});
 
+    # As in runc: if we cannot enter cwd yet, it may be accessible only to
+    # the container user; retry after switching to it (returns true).
     my $cwd = $spec->{process}{cwd} // '/';
+    return 0 if chdir($cwd);
+    fatal("chdir to cwd '$cwd': $!") unless $! == EACCES || $! == EPERM;
+    return 1;
+}
+
+sub _init_chdir_as_user ($spec, $needed) {
+    return unless $needed;
+    my $cwd = $spec->{process}{cwd};
     chdir($cwd) or fatal("chdir to cwd '$cwd': $!");
     return;
 }
@@ -318,7 +328,7 @@ sub run_init_process (    ## no critic (RequireFinalReturn)
 
     _init_enter_rootfs($rootfs, $no_pivot, $dbg);
 
-    _init_post_pivot($spec);
+    my $chdir_as_user = _init_post_pivot($spec);
 
     _init_setup_stdio($foreground, $pts_fd, $spec, $dbg);
 
@@ -328,6 +338,7 @@ sub run_init_process (    ## no critic (RequireFinalReturn)
     # before init_ready because the parent exits the message loop on that.
     $dbg->("apply_process_security");
     my $seccomp_notify_fd = apply_process_security($spec);
+    _init_chdir_as_user($spec, $chdir_as_user);
 
     # If seccomp NOTIFY is active, send the notify fd to the parent.
     # The parent will forward it to the listener socket (listenerPath).
@@ -3044,10 +3055,12 @@ sub _dispatch_spec ($, @) {
 sub _rootless_default_root {
     return if POSIX::geteuid() == 0 || !$ENV{XDG_RUNTIME_DIR};
     my $root = "$ENV{XDG_RUNTIME_DIR}/nacre";
-    unless (-d $root) {
-        mkdir($root, 0700) or -d $root or fatal("the path in \$XDG_RUNTIME_DIR must be writable by the user: $!");
-    }
-    chmod(0700 | S_ISVTX, $root);
+
+    # Best effort: commands that never touch state (spec, --version) must
+    # not fail on an unusable $XDG_RUNTIME_DIR; the others fail later with
+    # an error about the state directory itself.
+    mkdir($root, 0700) unless -d $root;
+    chmod(0700 | S_ISVTX, $root) if -O $root;
     return $root;
 }
 
