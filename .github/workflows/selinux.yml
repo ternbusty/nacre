@@ -1,0 +1,91 @@
+name: runc bats SELinux
+
+# runc's SELinux bats tests need SELinux enforcing, which the Ubuntu runners
+# lack (those tests are [skip]ped in scripts/runc_test_pattern). Run them in
+# a Fedora VM via Lima instead.
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+jobs:
+  selinux:
+    name: runc bats SELinux (Fedora)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout nacre
+        uses: actions/checkout@v4
+
+      - name: Set up Lima
+        uses: lima-vm/lima-actions/setup@v1
+        id: lima-setup
+
+      - name: Cache Lima VM image
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/lima
+          key: lima-fedora-${{ steps.lima-setup.outputs.version }}
+
+      - name: Start Fedora VM
+        run: limactl start --plain --name=default template://fedora
+
+      - name: Provision VM
+        run: |
+          set -eux -o pipefail
+          lima sudo dnf -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
+            --exclude="kernel,kernel-core" \
+            install perl bats git-core golang jq libseccomp-devel make \
+                    container-selinux policycoreutils audit
+          # Avoid SELinux nosuid_transition denials for binaries under /tmp.
+          lima sudo mount -o remount,suid /tmp
+
+      - name: Show guest info
+        run: |
+          set -eux -o pipefail
+          lima uname -a
+          lima cat /etc/os-release
+          lima sestatus
+          lima rpm -q container-selinux
+          lima perl -e 'print "perl $^V\n"'
+
+      - name: Copy nacre into VM
+        run: |
+          set -eux -o pipefail
+          tar -czf /tmp/nacre.tar.gz nacre lib scripts
+          limactl cp /tmp/nacre.tar.gz default:/tmp/nacre.tar.gz
+          lima sudo mkdir -p /usr/local/lib/nacre
+          lima sudo tar -xzf /tmp/nacre.tar.gz -C /usr/local/lib/nacre
+          lima sudo perl -c /usr/local/lib/nacre/nacre
+
+      - name: Clone runc and build test helpers in VM
+        run: |
+          set -eux -o pipefail
+          RUNC_TAG="$(<scripts/runc-version)"
+          echo ">>> Using runc $RUNC_TAG"
+          lima sudo git clone --depth 1 --branch "$RUNC_TAG" \
+            https://github.com/opencontainers/runc /tmp/runc
+          lima sudo make -C /tmp/runc test-binaries
+          lima sudo bash /tmp/runc/tests/integration/get-images.sh > /dev/null
+
+      - name: Run runc SELinux bats tests
+        run: |
+          lima sudo TAP_OUTPUT=/tmp/selinux-tap.log \
+            /usr/local/lib/nacre/scripts/runc-selinux-test.sh \
+              --runc-dir /tmp/runc --nacre-dir /usr/local/lib/nacre
+
+      - name: Show AVC denials
+        if: always()
+        run: lima sudo ausearch -i -m avc,user_avc -ts boot 2>/dev/null || echo "No AVC denials found."
+
+      - name: Retrieve TAP output
+        if: always()
+        run: limactl cp default:/tmp/selinux-tap.log selinux-tap.log || true
+
+      - name: Upload TAP output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runc-bats-selinux-tap-output
+          path: selinux-tap.log

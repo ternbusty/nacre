@@ -1,15 +1,14 @@
-# runc bats integration test pattern for kontainer-runtime
+# runc bats integration test pattern for nacre
 #
 # Each line is either a test name to run, or prefixed with [skip] to skip.
-# Blank lines and lines starting with # are ignored.
+# Blank lines and lines starting with # are ignored; a trailing "# ..." on a
+# line is a comment. Written against the runc release in scripts/runc-version.
 #
-# Categories of skips (same as takoyaki):
+# Categories of skips:
 #   criu         checkpoint/restore not implemented
 #   systemd      systemd cgroup manager not supported
 #   cgroups_v1   test only valid on cgroups v1
-#   selinux      requires SELinux enabled
-#   sshfs        requires sshfs fuse mount
-#   arch         architecture-specific (i386/x86_64 personality)
+#   selinux      requires SELinux enabled (not available on the CI runners)
 #   runc-dmz     asserts runc-dmz debug output string
 
 # --- spec ---
@@ -17,7 +16,7 @@ spec generation cwd
 spec generation --bundle
 
 # --- version / help ---
-[skip] runc version # version string differs from runc
+runc version
 runc -h
 runc command -h
 runc foo -h
@@ -35,7 +34,7 @@ runc create (no limits + no cgrouppath + no permission) succeeds
 runc create --pid-file
 runc create --pid-file with new CWD
 runc create [terminal=false]
-[skip]runc create (limits + cgrouppath + permission on the cgroup dir) succeeds # systemd
+runc create (limits + cgrouppath + permission on the cgroup dir) succeeds
 runc create (rootless + limits + no cgrouppath + no permission) fails with informative error
 runc create (rootless + no limits + cgrouppath + no permission) fails with permission error
 runc create [ --pidfd-socket ]
@@ -68,8 +67,8 @@ runc run with unknown capability
 runc run with rootfs set to .
 runc run [execve error]
 runc run ({u,g}id != 0)
-[skip]runc run --keep # systemd
-[skip]runc run --keep (check cgroup exists) # systemd
+runc run --keep
+runc run --keep (check cgroup exists)
 runc run [ --pidfd-socket ]
 [skip]runc run [/proc/self/exe clone] # runc-dmz
 runc run [rootless with host pidns]
@@ -80,7 +79,7 @@ runc run [ambient caps not set in inheritable result in a warning]
 runc run [bind mount]
 runc run [bind mount through a dangling symlink component]
 runc run [bind mount through a trailing dangling symlink]
-[skip]runc run [bind mount {no,rel,strict}atime semantics] # sshfs
+runc run [bind mount {no,rel,strict}atime semantics]
 runc run [tmpcopyup]
 runc run with tmpfs
 runc run with tmpfs perms
@@ -96,8 +95,8 @@ runc run [ check rbind,r*atime mounts]
 runc run [rbind,ro mount is read-only but not recursively]
 runc run [rbind,ro,rro mount is recursively read-only too]
 runc run [rbind,rro mount is recursively read-only]
-[skip]runc run [mount(8)-like behaviour: --bind with no options] # sshfs
-[skip]runc run [mount(8)-unlike behaviour: --bind with clearing flag] # sshfs
+runc run [mount(8)-like behaviour: --bind with no options]
+runc run [mount(8)-unlike behaviour: --bind with clearing flag]
 runc run [mount order, container bind-mount source]
 runc run [mount order, container bind-mount source] (userns)
 runc run [mount order, container idmap source]
@@ -111,16 +110,16 @@ runc run [ro /sys/fs/cgroup mounts + cgroupns]
 runc run [setgid / + mkdirall]
 runc run (cgroupv2 mount inside container)
 runc run [startContainer hook should inherit process environment]
-[skip]runc run [dev,exec,suid,atime bind mount of a nodev,nosuid,noexec,noatime fuse sshfs mount] # sshfs
-[skip]runc run [explicit-rw bind mount of a ro fuse sshfs mount] # sshfs
-[skip]runc run [implied-rw bind mount of a ro fuse sshfs mount] # sshfs
-[skip]runc run [ro bind mount of a nodev,nosuid,noexec fuse sshfs mount] # sshfs
-[skip]runc run [ro,noexec bind mount of a nosuid,noatime fuse sshfs mount] # sshfs
-[skip]runc run [ro,symfollow bind mount of a rw,nodev,nosymfollow fuse sshfs mount] # sshfs
+runc run [dev,exec,suid,atime bind mount of a nodev,nosuid,noexec,noatime fuse sshfs mount]
+runc run [explicit-rw bind mount of a ro fuse sshfs mount]
+runc run [implied-rw bind mount of a ro fuse sshfs mount]
+runc run [ro bind mount of a nodev,nosuid,noexec fuse sshfs mount]
+runc run [ro,noexec bind mount of a nosuid,noatime fuse sshfs mount]
+runc run [ro,symfollow bind mount of a rw,nodev,nosymfollow fuse sshfs mount]
 
 # --- run (cgroups) ---
-[skip]runc run (blkio weight) # cgroups_v1
-[skip]runc run (hugetlb limits) # cgroups_v1
+runc run (blkio weight)
+runc run (hugetlb limits)
 runc run (pids.limit=-1 means unlimited)
 runc run (pids.limit=0 means 1)
 runc run (cpu.idle)
@@ -165,16 +164,17 @@ runc run [seccomp] (SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV)
 runc run [seccomp] (ignore listener path if no notify act)
 runc run [seccomp] (startContainer hook)
 runc run [seccomp] (verify syscall compatibility after seccomp enforcement)
-[skip]runc run with personality syscall blocked by seccomp # arch
+runc run with personality syscall blocked by seccomp
 
 # --- run (hooks) ---
 runc run [hook fails]
 runc run [hook's argv is preserved]
 runc run [host mount ns + hooks]
+runc run (hooks library tests)
 
 # --- run (selinux) ---
-runc run (custom selinux label) # selinux
-runc run (no selinux label) # selinux
+[skip]runc run (custom selinux label) # selinux (runner has no SELinux; needs a dedicated SELinux job)
+[skip]runc run (no selinux label) # selinux (runner has no SELinux; needs a dedicated SELinux job)
 
 # --- run (session keyring) ---
 runc run (session keyring security label)
@@ -202,10 +202,10 @@ runc run [CPU affinity should reset to cgroup cpuset]
 runc run [CPU affinity should reset]
 
 # --- run (personality) ---
-[skip]runc run personality for i686 # arch
-[skip]runc run personality for x86_64 # arch
-[skip]runc run personality with exec for i686 # arch
-[skip]runc run personality with exec for x86_64 # arch
+runc run personality for i686
+runc run personality for x86_64
+runc run personality with exec for i686
+runc run personality with exec for x86_64
 
 # --- run (memory policy) ---
 runc run empty memory policy
@@ -235,6 +235,7 @@ runc delete --force ignore not exist
 runc delete --force [paused container]
 runc delete --force [host pidns + init gone]
 [skip]runc delete --force in cgroupv1 with subcgroups # cgroups_v1
+runc delete --force in cgroupv2 with subcgroups
 runc delete [host pidns + init gone]
 [skip]runc delete removes failed systemd unit # systemd
 
@@ -281,7 +282,7 @@ runc exec (cgroup v2 + init process in non-root cgroup) succeeds
 runc exec (cgroup v2, ro cgroupfs, new cgroupns) does not chown cgroup
 runc exec (cgroup v2, rw cgroupfs, inherit cgroupns) does not chown cgroup
 runc exec (cgroup v2, rw cgroupfs, new cgroupns) does chown cgroup
-[skip]runc exec (limits + cgrouppath + permission on the cgroup dir) succeeds # systemd
+runc exec (limits + cgrouppath + permission on the cgroup dir) succeeds
 runc exec (session keyring security label)
 runc exec (session keyring security label + userns)
 runc exec [seccomp] (SCMP_ACT_NOTIFY noNewPrivileges false)
@@ -306,14 +307,7 @@ runc --debug exec
 runc --debug --log exec
 # removed in runc v1.5.1: env [runc exec -p]
 # removed in runc v1.5.1: env HOME is set for runc exec -p with no process.env
-# v1.5.1 replacements:
-non-empty HOME env is used
-empty HOME env var is overridden
-empty HOME env var is overridden with multiple overrides
-env var HOME is set only once
-env var override is set only once
-env var override
-env var with new-line is honored
+# (their v1.5.1 replacements live in env.bats, listed under "run (env)")
 
 # --- pause / resume ---
 runc pause and resume
@@ -330,7 +324,7 @@ events --interval 100ms
 events --interval 1s
 events --interval default
 events --stats
-[skip]events --stats with hugetlb # cgroups_v1
+events --stats with hugetlb
 events --stats with psi data
 events oom
 
@@ -426,7 +420,7 @@ Check mount source fds are cleaned up with idmapped mounts [userns]
 userns join external namespaces [wrong userns owner]
 userns join other container userns
 userns join other container userns [bind-mounted nsfd]
-userns join other container userns[selinux enabled] # selinux
+[skip]userns join other container userns[selinux enabled] # selinux (runner has no SELinux; needs a dedicated SELinux job)
 userns with 2 inaccessible mounts
 userns with bind mount before a cgroupfs mount
 userns with inaccessible mount + exec
