@@ -50,7 +50,7 @@ use Nacre::Cgroup qw(
     cgroup_add_process cgroup_cleanup cgroup_pids cg_read cg_write
 );
 use Nacre::Process qw(
-    apply_process_security validate_rlimits apply_rlimits
+    apply_process_security apply_personality validate_rlimits apply_rlimits
     apply_iopriority apply_scheduler
     validate_memory_policy apply_memory_policy apply_timens_offsets
     apply_cpu_affinity_reset apply_exec_cpu_affinity apply_final_cpu_affinity
@@ -237,6 +237,41 @@ sub _init_setup_stdio ($foreground, $pts_fd, $spec, $dbg) {
     return;
 }
 
+# createRuntime and createContainer hooks run once the mounts are set up but
+# before pivot_root, as in runc: the container's mount namespace still sees
+# the host paths (bundle, rootfs), which these hooks commonly bind-mount
+# from. createRuntime runs in the runtime's namespaces, so the main process
+# runs it on our request; createContainer runs here, in the container's
+# namespaces, from the rootfs directory.
+sub _init_run_create_hooks ($spec, $rootfs, $id, $bundle, $main_chan_w, $main_chan_r) {
+    my $hooks = $spec->{hooks} // return;
+
+    if (@{$hooks->{createRuntime} // []}) {
+        channel_send($main_chan_w, {type => 'create_runtime_hooks'});
+        my $resp = channel_recv($main_chan_r);
+        if (!$resp || $resp->{type} ne 'create_runtime_hooks_done') {
+            my $err = $resp ? ($resp->{error} // 'unknown error') : 'no response';
+            $err =~ s/^nacre: //;
+            fatal($err);
+        }
+    }
+
+    if (@{$hooks->{createContainer} // []}) {
+        chdir($rootfs) or fatal("chdir to rootfs: $!");
+        my $state = {
+            ociVersion => $spec->{ociVersion} // '1.2.0',
+            id => $id,
+            status => 'creating',
+            pid => $$,
+            bundle => $bundle,
+            rootfs => $rootfs,
+            annotations => $spec->{annotations} // {},
+        };
+        run_hooks($hooks->{createContainer}, $state, must_succeed => 1, type => 'createContainer');
+    }
+    return;
+}
+
 sub run_init_process (    ## no critic (RequireFinalReturn)
     $spec, $rootfs, $notify_fd, $main_chan_w, $main_chan_r,
     $cgpath, $id, $bundle, $console_socket_path, $debug_fd,
@@ -273,6 +308,8 @@ sub run_init_process (    ## no critic (RequireFinalReturn)
     if ($need_pty) {
         $pts_fd = _init_allocate_pty($spec, $rootfs, $console_socket_path, $pty_sock_fd, $console_socket_prefd, $dbg,);
     }
+
+    _init_run_create_hooks($spec, $rootfs, $id, $bundle, $main_chan_w, $main_chan_r);
 
     _init_enter_rootfs($rootfs, $no_pivot, $dbg);
 
@@ -693,8 +730,15 @@ sub _create_parent_finish (    ## no critic (Subroutines::ProhibitManyArgs)
     unless ($init_ready) {
         my $w = waitpid($init_pid, WNOHANG);
         my $exit_msg = ($w > 0) ? " (exit status " . ($? >> 8) . ")" : "";
-        my $err_detail = $init_error ? ": $init_error" : "";
-        fatal("init process died during container setup${exit_msg}${err_detail}");
+        fatal("init process died during container setup${exit_msg}") unless $init_error;
+
+        # Report init failures in runc's format, which tooling (and runc's
+        # integration tests) match on.
+        (my $err = $init_error) =~ s/^nacre: //;
+        my $cmd = $p_ref->{_command} // 'create';
+        die _binary_name()
+            . " $cmd failed: unable to start container process: "
+            . "error during container init: $err\n";
     }
 
     unless ($clone_flags & CLONE_NEWCGROUP) {
@@ -740,10 +784,10 @@ sub _create_parent_finish (    ## no critic (Subroutines::ProhibitManyArgs)
         move_net_devices($netdevs, $init_pid);
     }
 
+    # createRuntime and createContainer already ran before pivot_root (see
+    # _init_run_create_hooks).
     if (my $hooks = $spec->{hooks}) {
         try {
-            run_hooks($hooks->{createRuntime}, $state, must_succeed => 1, type => 'createRuntime');
-            run_hooks($hooks->{createContainer}, $state, must_succeed => 1, type => 'createContainer');
             run_hooks($hooks->{prestart}, $state, must_succeed => 1, type => 'prestart');
         } catch ($e) {
             kill 9, $init_pid if $init_pid;
@@ -781,6 +825,26 @@ sub _create_parent_msg_loop ($main_r_fd, $init_w_fd, $spec, $id, $bundle, $cgpat
         bind_source_request => sub ($msg) {_handle_bind_source_request($msg, $init_w_fd, $init_pid, $bundle);},
         seccomp_notify_fd =>
             sub ($msg) {_handle_seccomp_notify($main_r_fd, $init_w_fd, $spec, $id, $bundle, $init_pid);},
+        create_runtime_hooks => sub ($msg) {
+            my $rootfs = $spec->{root}{path} // 'rootfs';
+            $rootfs = "$bundle/$rootfs" unless $rootfs =~ m{^/};
+            my $state = {
+                ociVersion => $spec->{ociVersion} // '1.2.0',
+                id => $id,
+                status => 'creating',
+                pid => $init_pid,
+                bundle => $bundle,
+                rootfs => $rootfs,
+                annotations => $spec->{annotations} // {},
+            };
+            try {
+                run_hooks($spec->{hooks}{createRuntime}, $state, must_succeed => 1, type => 'createRuntime');
+                channel_send($init_w_fd, {type => 'create_runtime_hooks_done'});
+            } catch ($e) {
+                chomp $e;
+                channel_send($init_w_fd, {type => 'create_runtime_hooks_error', error => $e});
+            }
+        },
         init_ready => sub ($msg) {$init_ready = 1;},
         init_error => sub ($msg) {$init_error = $msg->{error} // 'unknown';},
     );
@@ -1219,7 +1283,7 @@ sub cmd_run (%p) {
 
         # Detached mode: create + start, then return immediately.
         # Equivalent to `runc create` + `runc start`.
-        my $state = cmd_create(%p);
+        my $state = cmd_create(%p, _command => 'run');
         cmd_start(id => $id, root => $root);
 
         # Write pid file if requested
@@ -1237,7 +1301,7 @@ sub cmd_run (%p) {
     my $sr_ret = syscall($pr_nr, $pr_opt, 1, 0, 0, 0);
 
     # Create (foreground: keep stdio so user sees container output)
-    my $state = cmd_create(%p, foreground => 1);
+    my $state = cmd_create(%p, foreground => 1, _command => 'run');
 
     # Set PTY to raw mode BEFORE sending the start signal.  The slave's
     # default ONLCR converts \n→\r\n; clearing OPOST before start ensures
@@ -1265,8 +1329,9 @@ sub cmd_run (%p) {
         $exit_code = _run_wait_init($init_pid);
     }
 
-    # Delete
-    eval {cmd_delete(id => $id, root => $root, force => 1);};
+    # Delete, unless --keep asked to leave the stopped container (and its
+    # cgroup) around for inspection and a later explicit "delete".
+    eval {cmd_delete(id => $id, root => $root, force => 1);} unless $p{keep};
 
     exit($exit_code);
 }
@@ -1928,6 +1993,7 @@ sub _exec_child_send_seccomp ($spec, $seccomp_child_fh) {
 }
 
 sub _exec_child_apply_security ($exec_proc, $spec, $seccomp_child_fh, $additional_gids, $exec_user, $cap_add) {
+    apply_personality($spec);
     _exec_child_send_seccomp($spec, $seccomp_child_fh);
 
     if ($additional_gids && @$additional_gids) {
@@ -2464,11 +2530,18 @@ sub _collect_cgroup_stats ($cgpath) {
         $s{cpu}{$k} = int($v) if defined $v;
     }
 
-    # OOM events
-    my $events = read_file("$cgpath/memory.events") // '';
-    for my $line (split /\n/, $events) {
-        my ($k, $v) = split /\s+/, $line;
-        $s{memory}{$k} = int($v) if defined $v;
+    # memory.events is deliberately left out: runc's stats schema has no such
+    # fields, and OOMs are reported as separate "oom" events by cmd_events.
+
+    # hugetlb, keyed by page size ("2MB", "1GB", ...). Like runc, prefer the
+    # reservation counter when the kernel has one.
+    for my $cur (glob "$cgpath/hugetlb.*.current") {
+        my ($size) = $cur =~ m{/hugetlb\.([^./]+)\.current$} or next;
+        my $prefix = "$cgpath/hugetlb.$size";
+        my $usage = read_file("$prefix.rsvd.current") // read_file($cur) // '0';
+        my $events = read_file("$prefix.events") // '';
+        my ($failcnt) = $events =~ /^max\s+(\d+)/m;
+        $s{hugetlb}{$size} = {usage => int($usage), failcnt => int($failcnt // 0)};
     }
 
     # PSI (pressure stall information) - io, cpu, memory
@@ -2543,6 +2616,10 @@ sub cmd_events (%p) {
         _emit_event({type => 'stats', id => $id, data => _collect_cgroup_stats($cgpath)});
         return;
     }
+
+    # Consumers tail the stream (often redirected to a file), so each event
+    # must reach them immediately rather than sit in a block buffer.
+    STDOUT->autoflush(1);
 
     # Track OOM events — check memory.events for oom counter changes
     my $last_oom_count = 0;
@@ -2718,7 +2795,7 @@ sub _dispatch_delete ($root, @) {
 }
 
 sub _dispatch_run ($root, @) {
-    my ($bundle, $pid_file, $console_socket, $pidfd_socket, $no_pivot, $detach);
+    my ($bundle, $pid_file, $console_socket, $pidfd_socket, $no_pivot, $detach, $keep);
     GetOptions(
         'bundle|b=s' => \$bundle,
         'pid-file=s' => \$pid_file,
@@ -2726,7 +2803,9 @@ sub _dispatch_run ($root, @) {
         'pidfd-socket=s' => \$pidfd_socket,
         'no-pivot' => \$no_pivot,
         'detach|d' => \$detach,
+        'keep' => \$keep,
     );
+    fatal("--detach and --keep cannot both be specified") if $detach && $keep;
     my $id = shift @ARGV // fatal("container id required");
     cmd_run(
         id => $id,
@@ -2736,6 +2815,7 @@ sub _dispatch_run ($root, @) {
         console_socket => $console_socket,
         pidfd_socket => $pidfd_socket,
         detach => $detach,
+        keep => $keep,
         no_pivot => $no_pivot,
     );
     return;

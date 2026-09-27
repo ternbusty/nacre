@@ -45,18 +45,18 @@ sub cgroup_setup ($cgpath, $spec) {
 
     ensure_dir($cgpath);
 
-    # Enable controllers up the tree
+    # Enable controllers up the tree: like runc, every controller available
+    # to each ancestor, so the container's cgroup gets all of them.
     my @parts = split m{/}, $cgpath;
     my $root_parts = scalar(split m{/}, $CGROUP_ROOT);
     for my $depth ($root_parts .. $#parts - 1) {
         my $ancestor = join('/', @parts[0 .. $depth]);
         my $sc_file = "$ancestor/cgroup.subtree_control";
         next unless -f $sc_file;
-        my $current = read_file($sc_file) // '';
-        for my $ctrl (qw(cpu memory pids io cpuset hugetlb)) {
-            if ($current !~ /\b$ctrl\b/) {
-                eval {write_file($sc_file, "+$ctrl\n");};
-            }
+        my %enabled = map {$_ => 1} split ' ', (read_file($sc_file) // '');
+        for my $ctrl (split ' ', (read_file("$ancestor/cgroup.controllers") // '')) {
+            next if $enabled{$ctrl};
+            eval {write_file($sc_file, "+$ctrl\n");};
         }
     }
 
@@ -143,9 +143,17 @@ sub _apply_pids ($cgpath, $pids) {
 }
 
 sub _apply_io ($cgpath, $io) {
-    if (defined $io->{weight}) {
+    if ($io->{weight}) {
         my $weight = $io->{weight};
-        cg_write($cgpath, 'io.weight', "default $weight");
+
+        # Like runc: BFQ takes the blkio weight (10-1000) as is; otherwise
+        # convert it to the io.weight range (1-10000).
+        if (-e "$cgpath/io.bfq.weight") {
+            cg_write($cgpath, 'io.bfq.weight', $weight);
+        } else {
+            my $converted = 1 + int(($weight - 10) * 9999 / 990);
+            cg_write($cgpath, 'io.weight', "default $converted");
+        }
     }
     if (my $tbd = $io->{throttleReadBpsDevice}) {
         for my $d (@$tbd) {
@@ -172,9 +180,16 @@ sub _apply_io ($cgpath, $io) {
 
 sub _apply_hugetlb ($cgpath, $hugetlb) {
     for my $entry (@$hugetlb) {
-        my $size = $entry->{pageSize} // next;
+
+        # runc (Go's case-insensitive JSON decoding) also accepts "pagesize"
+        my $size = $entry->{pageSize} // $entry->{pagesize} // next;
         my $limit = $entry->{limit} // next;
         cg_write($cgpath, "hugetlb.${size}.max", $limit);
+
+        # Limit reservations too (Linux 5.7+), as runc does, so that a
+        # reserved-but-unfaulted mapping cannot exceed the limit either.
+        cg_write($cgpath, "hugetlb.${size}.rsvd.max", $limit)
+            if -e "$cgpath/hugetlb.${size}.rsvd.max";
     }
     return;
 }
@@ -214,29 +229,61 @@ sub cgroup_add_process ($cgpath, $pid) {
     return;
 }
 
+# All cgroup directories under (and including) $cgpath, children first, so
+# they can be removed in order.
+sub _cgroup_subtree ($cgpath) {
+    my @dirs;
+    if (opendir(my $dh, $cgpath)) {
+        for my $name (readdir $dh) {
+            next if $name eq '.' || $name eq '..';
+            my $sub = "$cgpath/$name";
+            push @dirs, _cgroup_subtree($sub) if -d $sub && !-l $sub;
+        }
+        closedir $dh;
+    }
+    push @dirs, $cgpath;
+    return @dirs;
+}
+
+# Processes and threads anywhere in the subtree. Threaded sub-cgroups list
+# their members only in cgroup.threads, so read both files.
+sub _cgroup_subtree_tasks ($cgpath) {
+    my %tasks;
+    for my $dir (_cgroup_subtree($cgpath)) {
+        for my $file (qw(cgroup.procs cgroup.threads)) {
+            my $data = read_file("$dir/$file") // '';
+            $tasks{$_} = 1 for grep {/^\d+$/} split /\n/, $data;
+        }
+    }
+    return keys %tasks;
+}
+
 sub cgroup_cleanup ($cgpath) {
     return unless -d $cgpath;
 
-    # Kill all processes in the cgroup
-    my $procs = read_file("$cgpath/cgroup.procs") // '';
-    for my $pid (split /\n/, $procs) {
-        next unless $pid =~ /^\d+$/;
-        kill 9, $pid;
+    # Kill everything in the cgroup, including sub-cgroups the container
+    # created itself. cgroup.kill (Linux 5.14+) covers the whole subtree;
+    # fall back to signalling each task on older kernels.
+    my $killed = -e "$cgpath/cgroup.kill"
+        && eval {write_file("$cgpath/cgroup.kill", "1\n"); 1};
+    unless ($killed) {
+        kill 9, $_ for _cgroup_subtree_tasks($cgpath);
     }
 
     # Wait a bit for processes to die
     my $deadline = time + 2;
     while (time < $deadline) {
-        $procs = read_file("$cgpath/cgroup.procs") // '';
-        last unless $procs =~ /\d/;
+        last unless _cgroup_subtree_tasks($cgpath);
         usleep(50_000);
     }
 
-    # Remove cgroup directory with retry (EBUSY)
-    for my $attempt (1 .. 10) {
-        last if rmdir($cgpath);
-        last unless $! == EBUSY;
-        usleep(50_000 * $attempt);
+    # Remove cgroup directories, children first, with retry (EBUSY)
+    for my $dir (_cgroup_subtree($cgpath)) {
+        for my $attempt (1 .. 10) {
+            last if rmdir($dir);
+            last unless $! == EBUSY;
+            usleep(50_000 * $attempt);
+        }
     }
     return;
 }

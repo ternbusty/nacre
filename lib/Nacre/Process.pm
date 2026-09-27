@@ -5,6 +5,7 @@ use POSIX qw(setgid setuid);
 use Nacre::Const qw(
     SYS_prctl SYS_capset SYS_setgroups SYS_prlimit64
     SYS_ioprio_set SYS_sched_setattr SYS_sched_setaffinity SYS_set_mempolicy
+    SYS_personality
     PR_SET_NO_NEW_PRIVS PR_CAPBSET_DROP PR_SET_KEEPCAPS
     PR_CAP_AMBIENT PR_CAP_AMBIENT_RAISE
     @CAP_NAMES %CAP_NUM _LINUX_CAPABILITY_VERSION_3
@@ -17,8 +18,27 @@ use Nacre::Caps qw(apply_capabilities_bounding apply_capabilities_final);
 # Process Security
 # ═══════════════════════════════════════════════════════════════════════
 
+# linux.personality. Like runc, only the execution domain is applied (flags
+# are ignored), and it must happen before seccomp, which may block the
+# personality syscall.
+my %PERSONALITY_DOMAIN = (
+    LINUX => 0x0000,    # PER_LINUX
+    LINUX32 => 0x0008,    # PER_LINUX32
+);
+
+sub apply_personality ($spec) {
+    my $p = $spec->{linux}{personality} // return;
+    my $domain = $p->{domain} // 'LINUX';
+    my $value = $PERSONALITY_DOMAIN{$domain} // fatal("invalid personality domain: $domain");
+    do_syscall(SYS_personality, $value) != -1
+        or fatal("personality($domain): $!");
+    return;
+}
+
 sub apply_process_security ($spec) {
     my $proc = $spec->{process} // {};
+
+    apply_personality($spec);
 
     # 1. OOM score adj
     if (defined $proc->{oomScoreAdj}) {
@@ -596,7 +616,7 @@ sub apply_selinux_exec_label ($label) {
 }
 
 our @EXPORT_OK = qw(
-    apply_process_security
+    apply_process_security apply_personality
     validate_rlimits apply_rlimits
     apply_iopriority
     apply_scheduler
