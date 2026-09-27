@@ -1249,7 +1249,12 @@ sub _statfs_flags ($path) {
 
 sub set_rootfs_readonly ($rootfs_readonly) {
     return unless $rootfs_readonly;
-    do_mount('', '/', '', MS_REMOUNT | MS_BIND | MS_RDONLY, '')
+
+    # Keep the flags the rootfs mount already has: in a user namespace the
+    # kernel locks e.g. nodev/nosuid inherited from the host mount (a bundle
+    # under a nodev /tmp), and a remount that would clear them fails.
+    my $keep = (_statfs_mount_flags('/') // 0) & MNT_LOCK_FLAGS;
+    do_mount('', '/', '', MS_REMOUNT | MS_BIND | MS_RDONLY | $keep, '')
         or fatal("remount / readonly: $!");
     return;
 }

@@ -55,7 +55,10 @@ rc=0
     tests/integration/userns.bats || rc=$?
 } > "$TMPOUT" 2>&1
 cat "$TMPOUT"
-if [[ -n "$TAP_OUTPUT" ]]; then cp "$TMPOUT" "$TAP_OUTPUT"; fi
+if [[ -n "$TAP_OUTPUT" ]]; then
+  cp "$TMPOUT" "$TAP_OUTPUT"
+  chmod 644 "$TAP_OUTPUT"    # mktemp's 0600 would keep CI from fetching it
+fi
 
 pass=$(grep -Ec '^ok [0-9]+ ' "$TMPOUT" || true)
 skip=$(grep -Ec '^ok [0-9]+ .* # skip' "$TMPOUT" || true)

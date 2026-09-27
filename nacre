@@ -55,7 +55,7 @@ use Nacre::Process qw(
     validate_memory_policy apply_memory_policy apply_timens_offsets
     apply_cpu_affinity_reset apply_exec_cpu_affinity apply_final_cpu_affinity
     apply_exec_caps apply_sysctls
-    selinux_enabled apply_selinux_exec_label
+    selinux_enabled apply_selinux_exec_label join_session_keyring
 );
 use Nacre::State qw(
     load_spec cache_spec load_cached_spec default_spec
@@ -287,6 +287,9 @@ sub run_init_process (    ## no critic (RequireFinalReturn)
     $dbg->("init_process: start, console_socket=" . (defined $console_socket_path ? $console_socket_path : 'undef'));
     log_debug("nsexec container setup");
     log_debug("child process in init()");
+
+    my $has_userns = grep {($_->{type} // '') eq 'user'} @{$spec->{linux}{namespaces} // []};
+    join_session_keyring($id, $spec->{process}{selinuxLabel}, $has_userns ? 0x8 : 0x80000);
 
     # Rename network devices that were moved into our net namespace
     # by the main process.  This must happen before rootfs setup
@@ -2243,6 +2246,8 @@ sub cmd_exec (%p) {    ## no critic (Subroutines::ProhibitExcessComplexity)
             $pipes->{pty_child_fh},
             $pipes->{seccomp_child_fh},
         );
+
+        join_session_keyring($id, ($exec_proc && $exec_proc->{selinuxLabel}) || $spec->{process}{selinuxLabel});
 
         chdir('/');
         chdir($opts{cwd} // $spec->{process}{cwd} // '/');

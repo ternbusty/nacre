@@ -49,7 +49,7 @@ sub cgroup_setup ($cgpath, $spec) {
     # to each ancestor, so the container's cgroup gets all of them.
     my @parts = split m{/}, $cgpath;
     my $root_parts = scalar(split m{/}, $CGROUP_ROOT);
-    for my $depth ($root_parts .. $#parts - 1) {
+    for my $depth ($root_parts - 1 .. $#parts - 1) {
         my $ancestor = join('/', @parts[0 .. $depth]);
         my $sc_file = "$ancestor/cgroup.subtree_control";
         next unless -f $sc_file;
