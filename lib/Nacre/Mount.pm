@@ -43,6 +43,11 @@ use constant MNT_ATIME_ENUM_FLAGS => MS_NOATIME | MS_RELATIME | MS_STRICTATIME;
 use constant MNT_ATIME_FLAGS => MNT_ATIME_ENUM_FLAGS | MS_NODIRATIME;
 use constant MNT_LOCK_FLAGS => MS_RDONLY | MS_NODEV | MS_NOEXEC | MS_NOSUID | MNT_ATIME_FLAGS;
 
+# Host path of the container's cgroup when it has a cgroup namespace, set by
+# the init process. Used to emulate the namespace when cgroup2 cannot be
+# mounted (see _apply_fs_mount).
+our $CGROUP_NS_PATH;
+
 our %MOUNT_FLAGS = (
     bind => MS_BIND,
     rbind => MS_BIND | MS_REC,
@@ -748,11 +753,14 @@ sub _apply_fs_mount ($src, $dest, $type, $flags, $data) {
     }
     unless (do_mount($src, $dest, $type, $mount_flags, $data)) {
 
-        # cgroup2 mount can fail in userns that doesn't own the
-        # cgroup namespace (EBUSY/EPERM).  Fall back to bind-mounting
-        # the host cgroup2 hierarchy, matching runc behaviour.
+        # cgroup2 mount can fail in a user namespace (EBUSY/EPERM, e.g.
+        # rootless). Fall back to a bind mount, as runc does: of the
+        # container's own cgroup when it has a cgroup namespace (emulating
+        # the namespace's view), else of the whole host hierarchy.
         if ($type eq 'cgroup2' && -d '/sys/fs/cgroup') {
-            unless (do_mount('/sys/fs/cgroup', $dest, '', MS_BIND, '')) {
+            my $bind_src = ($CGROUP_NS_PATH && -d $CGROUP_NS_PATH) ? $CGROUP_NS_PATH : '/sys/fs/cgroup';
+            log_debug("mount cgroup2 on $dest failed ($!), bind-mounting $bind_src");
+            unless (do_mount($bind_src, $dest, '', MS_BIND, '')) {
                 warn "nacre: mount $type on $dest: $!\n";
                 return 0;
             }
@@ -970,12 +978,16 @@ sub apply_mounts ($spec, $rootfs, $mount_source_fds, $chan_w, $chan_r) {
     return $dev_needs_ro;
 }
 
-sub create_devices ($rootfs, $spec) {
-
+# The default devices, overridden or extended by the spec's, by path.
+sub _merge_spec_devices ($spec) {
     my @devices = @DEFAULT_DEVICES;
 
-    # Spec devices override defaults by path
+    # Spec devices override defaults by path. /dev/ptmx is always the
+    # symlink to the container's devpts (see create_symlinks), as in runc,
+    # even when listed as a device: a bind of the host's node would belong
+    # to the host's devpts.
     for my $d (@{$spec->{linux}{devices} // []}) {
+        next if ($d->{path} // '') eq '/dev/ptmx';
         my $spec_dev = {
             path => $d->{path},
             type => $d->{type} // 'c',
@@ -995,6 +1007,12 @@ sub create_devices ($rootfs, $spec) {
         }
         push @devices, $spec_dev unless $found;
     }
+    return @devices;
+}
+
+sub create_devices ($rootfs, $spec) {
+
+    my @devices = _merge_spec_devices($spec);
 
     for my $dev (@devices) {
         my $dest = "$rootfs$dev->{path}";
