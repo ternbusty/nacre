@@ -6,7 +6,6 @@ no warnings 'experimental::try', 'experimental::defer';
 use POSIX qw(setsid _exit dup2 mkfifo WNOHANG WIFEXITED WEXITSTATUS
     WIFSIGNALED WTERMSIG :sys_wait_h :signal_h :errno_h);
 use Socket qw(AF_UNIX SOCK_STREAM pack_sockaddr_un);
-use JSON::PP;
 use File::Basename qw(basename dirname);
 use Fcntl qw(:flock :mode :seek O_RDONLY O_WRONLY O_RDWR O_CREAT
     O_TRUNC O_EXCL O_NONBLOCK O_NOCTTY
@@ -35,21 +34,30 @@ use Nacre::Util qw(
     setup_logging log_debug fatal parse_size
     write_file read_file read_file_or_die ensure_dir iso8601_now do_syscall
     do_setns do_unshare wait_exit_code lookup_home_from_passwd
+    pidfd_wait wait_until
 );
-use Nacre::Seccomp qw(apply_seccomp_raw);
-use Nacre::Device qw(apply_device_cgroup);
-use Nacre::Net qw(move_net_devices rename_net_devices);
 use Nacre::IPC qw(
     create_channel channel_send channel_recv
     create_notify_listener wait_for_start notify_container_start
     send_fd_via_socket send_fd_over_fd recv_fd_over_fd pty_set_raw
 );
-use Nacre::Caps qw(validate_capabilities);
-use Nacre::Cgroup qw(
+use Nacre::State qw(
+    load_spec cache_spec load_cached_spec default_spec
+    state_dir load_state save_state delete_state refresh_state
+    get_pid_starttime oci_state_json
+);
+
+# Only container setup needs these; most other commands never load them.
+# cmd_create and cmd_exec load them all up front (see Nacre::Lazy).
+use Nacre::Lazy 'Nacre::Seccomp' => qw(apply_seccomp_raw);
+use Nacre::Lazy 'Nacre::Device' => qw(apply_device_cgroup);
+use Nacre::Lazy 'Nacre::Net' => qw(move_net_devices rename_net_devices);
+use Nacre::Lazy 'Nacre::Caps' => qw(validate_capabilities);
+use Nacre::Lazy 'Nacre::Cgroup' => qw(
     cgroup_path cgroup_rootless_path cgroup_setup cgroup_apply_resources
     cgroup_add_process cgroup_cleanup cgroup_pids cg_read cg_write
 );
-use Nacre::Process qw(
+use Nacre::Lazy 'Nacre::Process' => qw(
     apply_process_security apply_personality validate_rlimits apply_rlimits
     apply_iopriority apply_scheduler
     validate_memory_policy apply_memory_policy apply_timens_offsets
@@ -57,18 +65,12 @@ use Nacre::Process qw(
     apply_exec_caps apply_sysctls
     selinux_enabled apply_selinux_exec_label join_session_keyring
 );
-use Nacre::State qw(
-    load_spec cache_spec load_cached_spec default_spec
-    state_dir load_state save_state delete_state refresh_state
-    get_pid_starttime oci_state_json
-);
-use Nacre::Hooks qw(run_hooks);
-use Nacre::Mount qw(
+use Nacre::Lazy 'Nacre::Hooks' => qw(run_hooks);
+use Nacre::Lazy 'Nacre::Mount' => qw(
     do_mount do_mount_setattr
     prepare_rootfs apply_mounts apply_pivot_root apply_rootfs_propagation
     apply_masked_paths apply_readonly_paths set_rootfs_readonly
     _mask_host_procfs_sysfs _create_userns_from_strings
-    %MOUNT_FLAGS
 );
 
 # -- Default root path for state --
@@ -310,6 +312,7 @@ sub run_init_process (    ## no critic (RequireFinalReturn)
 
     # Setup rootfs (mounts, devices, symlinks)
     my $has_cgroupns = grep {($_->{type} // '') eq 'cgroup' && !$_->{path}} @{$spec->{linux}{namespaces} // []};
+    no warnings 'once';    # Nacre::Mount is loaded lazily
     local $Nacre::Mount::CGROUP_NS_PATH = $cgpath if $has_cgroupns;
     prepare_rootfs($spec, $rootfs, $mount_source_fds, $main_chan_w, $main_chan_r);
 
@@ -1022,6 +1025,10 @@ sub _handle_seccomp_notify ($main_r_fd, $init_w_fd, $spec, $id, $bundle, $init_p
 # ═══════════════════════════════════════════════════════════════════════
 
 sub cmd_create (%p) {
+
+    # The container's init runs module code after pivot_root, when the lib
+    # directory is gone: load everything now.
+    Nacre::Lazy::load_all();
     my $id = $p{id} // fatal("container id required");
     my $bundle = $p{bundle} // getcwd();
     my $root = $p{root} // $DEFAULT_ROOT;
@@ -1293,16 +1300,17 @@ sub cmd_delete (%p) {
 
             # Unfreeze first for paused containers so SIGKILL can be delivered
             if ($state->{status} eq 'paused' && $state->{cgroupPath}) {
-                eval {write_file("$state->{cgroupPath}/cgroup.freeze", "0\n")};
-                usleep(100_000);
+                my $cg = $state->{cgroupPath};
+                eval {write_file("$cg/cgroup.freeze", "0\n")};
+                wait_until(1, sub {(read_file("$cg/cgroup.events") // '') !~ /^frozen 1/m});
             }
 
-            # Force kill
+            # Force kill, then wait for the init to actually exit (it is not
+            # our child, so it cannot be reaped here).
             if ($state->{pid} > 0) {
-                kill 9, $state->{pid};
-
-                # Wait a bit
-                usleep(100_000);
+                my $pid = $state->{pid};
+                kill 9, $pid;
+                pidfd_wait($pid, 1) // wait_until(1, sub {!kill 0, $pid});
             }
             if ($state->{cgroupPath}) {
                 cgroup_cleanup($state->{cgroupPath});
@@ -2242,6 +2250,7 @@ sub _exec_parent_seccomp_notify ($seccomp_parent_fh, $spec, $id, $state, $init_p
 }
 
 sub cmd_exec (%p) {    ## no critic (Subroutines::ProhibitExcessComplexity)
+    Nacre::Lazy::load_all();    # the exec'd process setup runs inside the container
     my $id = $p{id} // exec_fatal("container id required");
     my $root = $p{root} // $DEFAULT_ROOT;
     my @cmd = @{$p{command} // []};
@@ -2809,19 +2818,20 @@ sub _spec_to_rootless ($spec) {
 # ═══════════════════════════════════════════════════════════════════════
 
 sub cmd_features {
+    require Nacre::Mount;
     my $features = {
         ociVersionMin => '1.0.0',
         ociVersionMax => '1.2.0',
         hooks => [qw(prestart createRuntime createContainer startContainer poststart poststop)],
-        mountOptions => [sort (keys %MOUNT_FLAGS, 'idmap', 'ridmap')],
+        mountOptions => [sort (keys %{Nacre::Mount::mount_flags()}, 'idmap', 'ridmap')],
         linux => {
             namespaces => [sort keys %NS_MAP],
             capabilities => [@CAP_NAMES],
             cgroup => {
-                v2 => JSON::PP::true,
+                v2 => \1,
             },
             seccomp => {
-                enabled => JSON::PP::true,
+                enabled => \1,
                 actions => [
                     qw(SCMP_ACT_KILL SCMP_ACT_KILL_PROCESS SCMP_ACT_TRAP
                         SCMP_ACT_ERRNO SCMP_ACT_NOTIFY SCMP_ACT_LOG SCMP_ACT_ALLOW)
@@ -2837,8 +2847,8 @@ sub cmd_features {
                         SECCOMP_FILTER_FLAG_SPEC_ALLOW)
                 ],
             },
-            apparmor => {enabled => JSON::PP::false},
-            selinux => {enabled => selinux_enabled() ? JSON::PP::true : JSON::PP::false},
+            apparmor => {enabled => \0},
+            selinux => {enabled => selinux_enabled() ? \1 : \0},
         },
         annotations => {
             'org.opencontainers.runtime.nacre' => 'Perl OCI runtime',

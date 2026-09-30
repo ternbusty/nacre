@@ -2,8 +2,7 @@ package Nacre::Hooks;
 use v5.38;
 use Exporter 'import';
 use POSIX qw(WNOHANG _exit);
-use Time::HiRes qw(usleep);
-use Nacre::Util qw($JSON_COMPACT fatal);
+use Nacre::Util qw($JSON_COMPACT fatal pidfd_wait wait_until);
 use Nacre::State qw(oci_state_json);
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -47,16 +46,18 @@ sub run_hooks ($hooks, $state, %opts) {
         print $wr $state_json;
         close $wr;
 
+        # Wait for the hook without a fixed polling delay: most hooks finish
+        # in milliseconds, and each one delays container setup.
         my $timeout = $hook->{timeout} // 30;
-        my $elapsed = 0;
-        while ($elapsed < $timeout) {
-            my $w = waitpid($pid, WNOHANG);
-            last if $w > 0;
-            usleep(100_000);
-            $elapsed += 0.1;
+        my $reaped = 0;
+        my $exited = pidfd_wait($pid, $timeout);
+        if (!defined $exited) {
+            $exited = $reaped = wait_until($timeout, sub {waitpid($pid, WNOHANG) > 0});
         }
+        waitpid($pid, 0) if $exited && !$reaped;    # sets $?
+
         my $hook_label = $hook_type ? "$hook_type hook #$hook_idx" : "hook $hook->{path}";
-        if ($elapsed >= $timeout) {
+        if (!$exited) {
             kill 9, $pid;
             waitpid($pid, 0);
             if ($must_succeed) {

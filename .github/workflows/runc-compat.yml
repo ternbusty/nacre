@@ -93,6 +93,8 @@ jobs:
           uname -m
           echo "=== Nacre version ==="
           perl nacre version 2>&1 || true
+          echo "=== JSON backend ==="
+          perl -e 'print eval { require JSON::XS; 1 } ? "JSON::XS\n" : "JSON::PP (JSON::XS not installed)\n"'
           echo "=== syscall() sanity check ==="
           perl -e '
             use Config;

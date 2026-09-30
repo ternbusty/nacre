@@ -3,10 +3,9 @@ use v5.38;
 use feature 'try';
 no warnings 'experimental::try';
 use Exporter 'import';
-use Nacre::Util qw(log_debug fatal write_file read_file ensure_dir);
+use Nacre::Util qw(log_debug fatal write_file read_file ensure_dir wait_until);
 use Errno qw(EBUSY);
 use File::Basename qw(dirname);
-use Time::HiRes qw(usleep);
 
 # ═══════════════════════════════════════════════════════════════════════
 # Cgroup v2
@@ -324,20 +323,13 @@ sub cgroup_cleanup ($cgpath) {
         kill 9, $_ for _cgroup_subtree_tasks($cgpath);
     }
 
-    # Wait a bit for processes to die
-    my $deadline = time + 2;
-    while (time < $deadline) {
-        last unless _cgroup_subtree_tasks($cgpath);
-        usleep(50_000);
-    }
+    # Wait for the processes to die
+    wait_until(2, sub {!_cgroup_subtree_tasks($cgpath)});
 
-    # Remove cgroup directories, children first, with retry (EBUSY)
+    # Remove cgroup directories, children first, retrying while busy (the
+    # kernel may still be tearing down exited tasks)
     for my $dir (_cgroup_subtree($cgpath)) {
-        for my $attempt (1 .. 10) {
-            last if rmdir($dir);
-            last unless $! == EBUSY;
-            usleep(50_000 * $attempt);
-        }
+        wait_until(3, sub {rmdir($dir) || $! != EBUSY});
     }
     return;
 }
