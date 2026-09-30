@@ -4,7 +4,14 @@
 #
 # Usage:
 #   sudo ./scripts/runc-compat-test.sh [--runc-dir DIR] [--binary PATH] \
-#                                      [--pattern FILE]
+#                                      [--pattern FILE] \
+#                                      [--rootless-user USER \
+#                                       [--rootless-features FEATURES]]
+#
+# With --rootless-user, bats runs as USER (as runc's tests/rootless.sh does)
+# and FEATURES ("", "idmap", "cgroup" or "idmap+cgroup") selects what the
+# host provides: subuid/subgid ranges usable via newuidmap/newgidmap, and a
+# cgroup delegated to USER. The script sets these up and undoes them.
 
 set -euo pipefail
 
@@ -19,12 +26,16 @@ NACRE_BIN="${NACRE_BIN:-${PROJECT_ROOT}/nacre-wrapper}"
 SUMMARY_FILE="${SUMMARY_FILE:-}"
 TAP_OUTPUT="${TAP_OUTPUT:-}"
 PATTERN_FILE="${PROJECT_ROOT}/scripts/runc_test_pattern"
+ROOTLESS_USER=""
+ROOTLESS_FEATURES=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --runc-dir)  RUNC_REPO_DIR="$2"; shift 2 ;;
     --binary)    NACRE_BIN="$2"; shift 2 ;;
     --pattern)   PATTERN_FILE="$2"; shift 2 ;;
+    --rootless-user)     ROOTLESS_USER="$2"; shift 2 ;;
+    --rootless-features) ROOTLESS_FEATURES="$2"; shift 2 ;;
     *)           echo "Unknown option: $1" >&2; exit 1 ;;
   esac
 done
@@ -164,7 +175,9 @@ dump_hang_diagnostics() {
 # (124 on timeout).
 run_bats() {
   local bats_pid watchdog rc=0
-  sudo -E PATH="$PATH" RUNC="$PWD/runc" _BATS_FF="$FILTER_FILE" \
+  local as_user=()
+  [[ -n "$ROOTLESS_USER" ]] && as_user=(-H -u "$ROOTLESS_USER")
+  sudo -E "${as_user[@]}" PATH="$PATH" RUNC="$PWD/runc" _BATS_FF="$FILTER_FILE" "${ROOTLESS_ENV[@]}" \
       timeout "$timeout_secs" script -q -e -c \
       '. "$_BATS_FF" && exec bats -f "$BATS_FILTER" -t '"$file" /dev/null > "$TMPOUT" 2>&1 &
   bats_pid=$!
@@ -179,9 +192,77 @@ run_bats() {
   return "$rc"
 }
 
+# ── rootless mode (mirrors runc's tests/rootless.sh) ──────────────────
+ROOTLESS_CGROUP="/sys/fs/cgroup/runc-cgroups-integration-test"
+ROOTLESS_ENV=()
+ROOTLESS_UNDO=()
+
+rootless_undo() {
+  local i
+  for (( i = ${#ROOTLESS_UNDO[@]} - 1; i >= 0; i-- )); do
+    eval "${ROOTLESS_UNDO[$i]}" || true
+  done
+}
+
+rootless_setup() {
+  local group
+  group="$(id -gn "$ROOTLESS_USER")"
+  ROOTLESS_ENV=(ROOTLESS_FEATURES="$ROOTLESS_FEATURES")
+  trap rootless_undo EXIT
+
+  if [[ "$ROOTLESS_FEATURES" == *idmap* ]]; then
+    local f
+    for f in newuidmap newgidmap; do
+      command -v "$f" >/dev/null || { echo "ERROR: idmap needs $f (uidmap package)" >&2; exit 1; }
+    done
+    # Same ranges as runc's tests/rootless.sh.
+    for f in /etc/subuid /etc/subgid; do
+      cp -a "$f" "$f.nacre-test.bak" 2>/dev/null || : > "$f.nacre-test.bak"
+      ROOTLESS_UNDO+=("mv '$f.nacre-test.bak' '$f'")
+      grep -v "^$ROOTLESS_USER:" "$f.nacre-test.bak" > "$f" || true
+    done
+    echo "$ROOTLESS_USER:100000:65536" >> /etc/subuid
+    echo "$ROOTLESS_USER:200000:65536" >> /etc/subgid
+    # A directory owned by container UID 1024 (containerID 1000 maps to
+    # 100000), used by a cwd.bats test.
+    local aux
+    aux="$(mktemp -d)"
+    chown "$((100000 - 1000 + 1024))" "$aux"
+    ROOTLESS_UNDO+=("rmdir '$aux'")
+    ROOTLESS_ENV+=(ROOTLESS_UIDMAP_START=100000 ROOTLESS_UIDMAP_LENGTH=65536
+      ROOTLESS_GIDMAP_START=200000 ROOTLESS_GIDMAP_LENGTH=65536
+      ROOTLESS_AUX_UID=1024 ROOTLESS_AUX_DIR="$aux")
+  fi
+
+  if [[ "$ROOTLESS_FEATURES" == *cgroup* ]]; then
+    # Delegate a cgroup to the user (cgroup v2 delegation containment: the
+    # directory, its subtree_control and cgroup.procs, and the root's
+    # cgroup.procs, which processes are moved out of).
+    local c
+    for c in $(cat /sys/fs/cgroup/cgroup.controllers); do
+      echo "+$c" > /sys/fs/cgroup/cgroup.subtree_control || true
+    done
+    mkdir -p "$ROOTLESS_CGROUP"
+    ROOTLESS_UNDO+=("rmdir '$ROOTLESS_CGROUP'")
+    chown "root:$group" "$ROOTLESS_CGROUP" "$ROOTLESS_CGROUP/cgroup.subtree_control" \
+      "$ROOTLESS_CGROUP/cgroup.procs" /sys/fs/cgroup/cgroup.procs
+    ROOTLESS_UNDO+=("chown root:root /sys/fs/cgroup/cgroup.procs")
+    chmod g+rwx "$ROOTLESS_CGROUP"
+    chmod g+rw "$ROOTLESS_CGROUP/cgroup.subtree_control" "$ROOTLESS_CGROUP/cgroup.procs" \
+      /sys/fs/cgroup/cgroup.procs
+    ROOTLESS_UNDO+=("chmod g-w /sys/fs/cgroup/cgroup.procs")
+  fi
+}
+
 escape_ere() {
   sed 's/[][\\.*^$()|+?{}]/\\&/g' <<< "$1"
 }
+
+if [[ -n "$ROOTLESS_USER" ]]; then
+  [[ $EUID -eq 0 ]] || { echo "ERROR: --rootless-user needs the script to run as root" >&2; exit 1; }
+  rootless_setup
+  echo ">>> Rootless mode: user=$ROOTLESS_USER features=${ROOTLESS_FEATURES:-none}"
+fi
 
 # Build per-file filter regexes from the pattern file
 # A few names exist in more than one file (e.g. "runc run" in run.bats and
@@ -391,7 +472,7 @@ if [[ -n "$SUMMARY_FILE" ]]; then
   {
     echo "## runc bats compatibility test results"
     echo ""
-    echo "Runtime: nacre (Perl)"
+    echo "Runtime: nacre (Perl)${ROOTLESS_USER:+, rootless (features: ${ROOTLESS_FEATURES:-none})}"
     echo "runc ref: \`${RUNC_TAG}\`"
     echo ""
     echo "| Metric | Count |"

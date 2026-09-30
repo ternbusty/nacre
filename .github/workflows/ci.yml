@@ -81,6 +81,19 @@ jobs:
     with:
       runner: ${{ matrix.runner }}
 
+  runc-bats-rootless:
+    needs: integration
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        features: ['', idmap, cgroup, idmap+cgroup]
+    uses: ./.github/workflows/runc-compat.yml
+    with:
+      runner: ${{ matrix.runner }}
+      rootless: true
+      rootless_features: ${{ matrix.features }}
+
   runc-bats-selinux:
     needs: integration
     uses: ./.github/workflows/selinux.yml

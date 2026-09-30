@@ -5,6 +5,7 @@ no warnings 'experimental::try';
 use Exporter 'import';
 use Nacre::Util qw(log_debug fatal write_file read_file ensure_dir);
 use Errno qw(EBUSY);
+use File::Basename qw(dirname);
 use Time::HiRes qw(usleep);
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -22,6 +23,46 @@ sub cgroup_path ($spec, $id) {
     } else {
         return "$CGROUP_ROOT/nacre/$id";
     }
+}
+
+# For an unprivileged (rootless) caller, decide whether the container gets a
+# cgroup, following runc's rootless cgroup manager: the cgroup is used if we
+# can create it (or it exists) and write its cgroup.procs, i.e. it was
+# delegated to us. Otherwise an explicit cgroupsPath is an error, and so are
+# resource limits; with neither, the container just runs without a cgroup
+# (returns undef).
+sub cgroup_rootless_path ($cgpath, $spec) {
+    my $err;
+    my @missing;
+    for (my $d = $cgpath; $d ne $CGROUP_ROOT && !-d $d; $d = dirname($d)) {
+        unshift @missing, $d;
+    }
+    for my $d (@missing) {
+        next if mkdir($d);
+        my $mkdir_err = lc "$!";
+        next if -d $d;
+        $err = "mkdir $d: $mkdir_err";
+        last;
+    }
+    $err //= "open $cgpath/cgroup.procs: permission denied" unless -w "$cgpath/cgroup.procs";
+    return $cgpath unless $err;
+
+    if ($spec->{linux}{cgroupsPath}) {
+        fatal("unable to apply cgroup configuration: $err");
+    }
+    my $res = $spec->{linux}{resources} // {};
+    if (grep {$_ ne 'devices' && _resource_set($res->{$_})} keys %$res) {
+        fatal("rootless needs no limits + no cgrouppath when no permission is granted for cgroups: $err");
+    }
+    log_debug("rootless: running without a cgroup ($err)");
+    return;
+}
+
+sub _resource_set ($v) {
+    return 0 unless defined $v;
+    return scalar(@$v) if ref $v eq 'ARRAY';
+    return scalar(grep {_resource_set($_)} values %$v) if ref $v eq 'HASH';
+    return 1;
 }
 
 sub cgroup_setup ($cgpath, $spec) {
@@ -153,6 +194,19 @@ sub _apply_io ($cgpath, $io) {
         } else {
             my $converted = 1 + int(($weight - 10) * 9999 / 990);
             cg_write($cgpath, 'io.weight', "default $converted");
+        }
+    }
+
+    # Per-device weights need BFQ with per-device support: its io.bfq.weight
+    # reads back "default N" plus "MAJ:MIN N" lines rather than a single
+    # number (older kernels). Like runc, silently skip them otherwise.
+    if (my $wds = $io->{weightDevice}) {
+        my $bfq = read_file("$cgpath/io.bfq.weight") // '';
+        if ($bfq =~ /\S/ && $bfq !~ /^\s*\d+\s*$/) {
+            for my $wd (@$wds) {
+                next unless defined $wd->{weight};
+                cg_write($cgpath, 'io.bfq.weight', "$wd->{major}:$wd->{minor} $wd->{weight}");
+            }
         }
     }
     if (my $tbd = $io->{throttleReadBpsDevice}) {
@@ -289,6 +343,7 @@ sub cgroup_cleanup ($cgpath) {
 }
 
 sub cgroup_pids ($cgpath) {
+    return unless defined $cgpath;
     my $data = read_file("$cgpath/cgroup.procs") // '';
     return grep {/^\d+$/} split /\n/, $data;
 }
@@ -325,7 +380,7 @@ sub convert_cpu_shares ($shares) {
 }
 
 our @EXPORT_OK = qw(
-    cgroup_path cgroup_setup cgroup_apply_resources
+    cgroup_path cgroup_rootless_path cgroup_setup cgroup_apply_resources
     cgroup_add_process cgroup_cleanup cgroup_pids
     cg_read cg_write
 );

@@ -6,11 +6,19 @@ on:
       runner:
         type: string
         default: ubuntu-24.04
+      # Run the suite as an unprivileged user (like runc's tests/rootless.sh)
+      # with the given host features: "", "idmap", "cgroup", "idmap+cgroup".
+      rootless:
+        type: boolean
+        default: false
+      rootless_features:
+        type: string
+        default: ''
   workflow_dispatch:
 
 jobs:
   runc-bats:
-    name: runc bats integration
+    name: runc bats integration${{ inputs.rootless && format(' (rootless, {0})', inputs.rootless_features || 'no features') || '' }}
     runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
     timeout-minutes: 45
 
@@ -27,6 +35,15 @@ jobs:
         run: |
           sudo apt-get update || true
           sudo apt-get install -y libseccomp-dev jq busybox-static
+          # BFQ lets "per-device io weight for bfq" run instead of skipping.
+          sudo modprobe bfq || echo "bfq module not available"
+
+      - name: Set up rootless user
+        if: inputs.rootless
+        run: |
+          # newuidmap/newgidmap for the "idmap" feature.
+          sudo apt-get install -y uidmap
+          sudo useradd -u 2000 -m -d /home/rootless -s /bin/bash rootless
 
       - name: Install bats-core
         run: |
@@ -38,21 +55,22 @@ jobs:
         run: |
           RUNC_TAG="$(<scripts/runc-version)"
           echo ">>> Using runc $RUNC_TAG"
+          # Under /tmp so that the rootless user can reach it too.
           git clone --depth 1 --branch "$RUNC_TAG" \
-            https://github.com/opencontainers/runc "$HOME/runc"
-          echo "RUNC_REPO_DIR=$HOME/runc" >> "$GITHUB_ENV"
+            https://github.com/opencontainers/runc /tmp/runc
+          echo "RUNC_REPO_DIR=/tmp/runc" >> "$GITHUB_ENV"
           echo "RUNC_TAG=$RUNC_TAG" >> "$GITHUB_ENV"
 
       - name: Build runc test helpers
         run: |
-          cd "$HOME/runc"
+          cd "$RUNC_REPO_DIR"
           make test-binaries || true
           ls -la tests/cmd/_bin/ 2>/dev/null || echo "no test binaries"
 
       - name: Fetch rootfs images
         run: |
-          chmod +x "$HOME/runc/tests/integration/get-images.sh"
-          "$HOME/runc/tests/integration/get-images.sh" > /dev/null
+          chmod +x "$RUNC_REPO_DIR/tests/integration/get-images.sh"
+          "$RUNC_REPO_DIR/tests/integration/get-images.sh" > /dev/null
 
       - name: Prepare nacre
         run: |
@@ -86,7 +104,14 @@ jobs:
 
       - name: Run runc bats integration tests
         id: bats
+        env:
+          ROOTLESS: ${{ inputs.rootless }}
+          ROOTLESS_FEATURES: ${{ inputs.rootless_features }}
         run: |
+          rootless_args=()
+          if [ "$ROOTLESS" = true ]; then
+            rootless_args=(--rootless-user rootless --rootless-features "$ROOTLESS_FEATURES")
+          fi
           sudo aa-exec -p nacre -- env \
             NACRE_BIN="$NACRE_BIN" \
             RUNC_TAG="$RUNC_TAG" \
@@ -94,7 +119,8 @@ jobs:
             TAP_OUTPUT="$PWD/tap-output.log" \
             scripts/runc-compat-test.sh \
               --runc-dir "$RUNC_REPO_DIR" \
-              --binary "$NACRE_BIN"
+              --binary "$NACRE_BIN" \
+              "${rootless_args[@]}"
 
       - name: Show TAP output
         if: always()
@@ -104,5 +130,5 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: runc-bats-tap-output-${{ inputs.runner || 'ubuntu-24.04' }}
+          name: runc-bats-tap-output-${{ inputs.runner || 'ubuntu-24.04' }}${{ inputs.rootless && format('-rootless-{0}', inputs.rootless_features || 'none') || '' }}
           path: tap-output.log

@@ -25,6 +25,23 @@ nacre start mycontainer
 nacre run --bundle /path/to/bundle mycontainer
 ```
 
+## Rootless
+
+nacre runs as an unprivileged user, like runc:
+
+```bash
+# A spec with a user namespace mapping your own IDs, no network namespace
+# and no cgroup limits
+nacre spec --rootless
+
+nacre run --bundle /path/to/bundle mycontainer
+```
+
+- State goes under `$XDG_RUNTIME_DIR/nacre` unless `--root` is given.
+- Mapping more than your own UID/GID needs `newuidmap`/`newgidmap` (the `uidmap` package) and ranges in `/etc/subuid` and `/etc/subgid`.
+- Resource limits need a cgroup delegated to you (set `linux.cgroupsPath` to it). Without one, a container with no limits and no `cgroupsPath` runs without a cgroup.
+- On Ubuntu 23.10+, unprivileged user namespaces need an AppArmor profile granting `userns` for `perl` (see `/etc/apparmor.d/runc` for the pattern).
+
 ## OCI Commands
 
 create, start, state, kill, delete, list, run, spec, features,

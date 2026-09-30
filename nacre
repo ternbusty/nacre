@@ -46,7 +46,7 @@ use Nacre::IPC qw(
 );
 use Nacre::Caps qw(validate_capabilities);
 use Nacre::Cgroup qw(
-    cgroup_path cgroup_setup cgroup_apply_resources
+    cgroup_path cgroup_rootless_path cgroup_setup cgroup_apply_resources
     cgroup_add_process cgroup_cleanup cgroup_pids cg_read cg_write
 );
 use Nacre::Process qw(
@@ -159,7 +159,17 @@ sub _init_post_pivot ($spec) {
     apply_readonly_paths($spec->{linux}{readonlyPaths});
     apply_masked_paths($spec->{linux}{maskedPaths});
 
+    # As in runc: if we cannot enter cwd yet, it may be accessible only to
+    # the container user; retry after switching to it (returns true).
     my $cwd = $spec->{process}{cwd} // '/';
+    return 0 if chdir($cwd);
+    fatal("chdir to cwd '$cwd': $!") unless $! == EACCES || $! == EPERM;
+    return 1;
+}
+
+sub _init_chdir_as_user ($spec, $needed) {
+    return unless $needed;
+    my $cwd = $spec->{process}{cwd};
     chdir($cwd) or fatal("chdir to cwd '$cwd': $!");
     return;
 }
@@ -299,6 +309,8 @@ sub run_init_process (    ## no critic (RequireFinalReturn)
     }
 
     # Setup rootfs (mounts, devices, symlinks)
+    my $has_cgroupns = grep {($_->{type} // '') eq 'cgroup' && !$_->{path}} @{$spec->{linux}{namespaces} // []};
+    local $Nacre::Mount::CGROUP_NS_PATH = $cgpath if $has_cgroupns;
     prepare_rootfs($spec, $rootfs, $mount_source_fds, $main_chan_w, $main_chan_r);
 
     # Allocate PTY from the container's devpts (set up by prepare_rootfs).
@@ -316,7 +328,7 @@ sub run_init_process (    ## no critic (RequireFinalReturn)
 
     _init_enter_rootfs($rootfs, $no_pivot, $dbg);
 
-    _init_post_pivot($spec);
+    my $chdir_as_user = _init_post_pivot($spec);
 
     _init_setup_stdio($foreground, $pts_fd, $spec, $dbg);
 
@@ -326,6 +338,7 @@ sub run_init_process (    ## no critic (RequireFinalReturn)
     # before init_ready because the parent exits the message loop on that.
     $dbg->("apply_process_security");
     my $seccomp_notify_fd = apply_process_security($spec);
+    _init_chdir_as_user($spec, $chdir_as_user);
 
     # If seccomp NOTIFY is active, send the notify fd to the parent.
     # The parent will forward it to the listener socket (listenerPath).
@@ -465,18 +478,46 @@ sub write_id_mappings ($pid, $spec) {
     my $gid_maps = $linux->{gidMappings};
     return unless $uid_maps || $gid_maps;
 
-    # Write "deny" to setgroups before gid_map
-    eval {write_file("/proc/$pid/setgroups", "deny");};
+    # An unprivileged caller may only map its own ID, once; anything else
+    # goes through the setuid newuidmap/newgidmap helpers, which check the
+    # ranges against /etc/subuid and /etc/subgid (as runc does).
+    my $rootless = POSIX::geteuid() != 0;
+    my $egid = POSIX::getegid();
+    my $uid_helper = $rootless && $uid_maps && !_is_own_id_mapping($uid_maps, POSIX::geteuid());
+    my $gid_helper = $rootless && $gid_maps && !_is_own_id_mapping($gid_maps, $egid);
+
+    # Without the helper, setgroups must be denied before writing gid_map
+    # (mandatory for unprivileged writers). newgidmap handles it itself.
+    eval {write_file("/proc/$pid/setgroups", "deny");} unless $gid_helper;
 
     if ($uid_maps) {
-        my $content = join("\n", map {"$_->{containerID} $_->{hostID} $_->{size}"} @$uid_maps) . "\n";
-        write_file("/proc/$pid/uid_map", $content);
+        $uid_helper
+            ? _run_idmap_helper('newuidmap', $pid, $uid_maps)
+            : write_file("/proc/$pid/uid_map", _id_map_content($uid_maps));
     }
-
     if ($gid_maps) {
-        my $content = join("\n", map {"$_->{containerID} $_->{hostID} $_->{size}"} @$gid_maps) . "\n";
-        write_file("/proc/$pid/gid_map", $content);
+        $gid_helper
+            ? _run_idmap_helper('newgidmap', $pid, $gid_maps)
+            : write_file("/proc/$pid/gid_map", _id_map_content($gid_maps));
     }
+    return;
+}
+
+sub _id_map_content ($maps) {
+    return join("\n", map {"$_->{containerID} $_->{hostID} $_->{size}"} @$maps) . "\n";
+}
+
+sub _is_own_id_mapping ($maps, $id) {
+    return @$maps == 1 && $maps->[0]{hostID} == $id && $maps->[0]{size} == 1;
+}
+
+sub _run_idmap_helper ($helper, $pid, $maps) {
+    my @args = map {($_->{containerID}, $_->{hostID}, $_->{size})} @$maps;
+    system($helper, $pid, @args) == 0
+        or fatal("$helper failed"
+            . ($? == -1 ? ": $!" : " (exit status " . ($? >> 8) . ")")
+            . "; mapping IDs other than your own needs it and /etc/sub"
+            . ($helper =~ /uid/ ? 'uid' : 'gid'));
     return;
 }
 
@@ -611,7 +652,11 @@ sub _create_join_namespaces ($join_ns_ref) {
 sub _create_unshare_ns ($clone_flags, $spec, $main_w_fd, $init_r_fd) {
     my $unshare_flags = $clone_flags & ~CLONE_NEWPID & ~CLONE_NEWCGROUP;
 
-    if (($clone_flags & CLONE_NEWTIME) && ($clone_flags & CLONE_NEWUSER)) {
+    # As root, the time namespace is created before the user namespace. An
+    # unprivileged caller cannot do that (it needs CAP_SYS_ADMIN in the
+    # initial user namespace); it creates it afterwards, inside the new user
+    # namespace, together with the other namespaces below.
+    if (($clone_flags & CLONE_NEWTIME) && ($clone_flags & CLONE_NEWUSER) && POSIX::geteuid() == 0) {
         do_unshare(CLONE_NEWTIME) or fatal("unshare NEWTIME: $!");
         $unshare_flags &= ~CLONE_NEWTIME;
         apply_timens_offsets($spec);
@@ -747,7 +792,7 @@ sub _create_parent_finish (    ## no critic (Subroutines::ProhibitManyArgs)
     unless ($clone_flags & CLONE_NEWCGROUP) {
         cgroup_setup($cgpath, $spec) if $cgpath;
         eval {cgroup_add_process($cgpath, $init_pid);} if $cgpath;
-        eval {apply_device_cgroup($cgpath, $spec);};
+        eval {apply_device_cgroup($cgpath, $spec);} if $cgpath;
     }
 
     my $pty_master_fd;
@@ -817,10 +862,14 @@ sub _create_parent_msg_loop ($main_r_fd, $init_w_fd, $spec, $id, $bundle, $cgpat
         init_pid => sub ($msg) {
             $init_pid = $msg->{pid};
             if ($clone_flags & CLONE_NEWCGROUP) {
-                cgroup_setup($cgpath, $spec) if $cgpath;
-                try {cgroup_add_process($cgpath, $init_pid);}
-                catch ($e) {log_debug("cgroup_add_process in NEWCGROUP path: $e");}
-                eval {apply_device_cgroup($cgpath, $spec);};
+
+                # No $cgpath: a rootless container without a cgroup.
+                if ($cgpath) {
+                    cgroup_setup($cgpath, $spec);
+                    try {cgroup_add_process($cgpath, $init_pid);}
+                    catch ($e) {log_debug("cgroup_add_process in NEWCGROUP path: $e");}
+                    eval {apply_device_cgroup($cgpath, $spec);};
+                }
                 channel_send($init_w_fd, {type => 'cgroup_done'});
             }
         },
@@ -1000,6 +1049,16 @@ sub cmd_create (%p) {
 
     _validate_create_spec($spec);
 
+    my $cgpath = cgroup_path($spec, $id);
+    if (POSIX::geteuid() != 0) {
+        $cgpath = cgroup_rootless_path($cgpath, $spec);
+        if (!$cgpath && !grep {($_->{type} // '') eq 'pid' && !$_->{path}} @{$spec->{linux}{namespaces} // []}) {
+            warn "nacre: Creating a rootless container with no cgroup and no private pid namespace. "
+                . "Such configuration is strongly discouraged (as it is impossible to properly kill "
+                . "all container's processes).\n";
+        }
+    }
+
     # Snapshot config.json — OCI spec: "Any updates to config.json
     # after this step MUST NOT affect the container."
     cache_spec($root, $id, $spec);
@@ -1007,8 +1066,6 @@ sub cmd_create (%p) {
     my $rootfs = $spec->{root}{path} // 'rootfs';
     $rootfs = "$bundle/$rootfs" unless $rootfs =~ m{^/};
     fatal("rootfs '$rootfs' does not exist") unless -d $rootfs;
-
-    my $cgpath = cgroup_path($spec, $id);
 
     my ($clone_flags, $join_ns_ref, $has_userns) = _create_parse_namespaces($spec);
     my @join_ns = @$join_ns_ref;
@@ -2516,7 +2573,10 @@ sub cmd_update (%p) {
 # ─── helpers for cmd_events ──────────────────────────────────────────
 
 sub _collect_cgroup_stats ($cgpath) {
-    my %s;
+
+    # runc always reports the hugetlb map, even when empty.
+    my %s = (hugetlb => {});
+    return \%s unless defined $cgpath;
     $s{pids}{current} = scalar(cgroup_pids($cgpath));
     my $pids_max = read_file("$cgpath/pids.max") // 'max';
     chomp $pids_max;
@@ -2615,7 +2675,9 @@ sub cmd_events (%p) {
     my $stats = $p{stats};
 
     my $state = load_state($root, $id);
-    my $cgpath = $state->{cgroupPath} // fatal("no cgroup path");
+
+    # A rootless container may have no cgroup; like runc, report empty stats.
+    my $cgpath = $state->{cgroupPath};
 
     if ($stats) {
         _emit_event({type => 'stats', id => $id, data => _collect_cgroup_stats($cgpath)});
@@ -2628,7 +2690,7 @@ sub cmd_events (%p) {
 
     # Track OOM events — check memory.events for oom counter changes
     my $last_oom_count = 0;
-    my $mem_events = read_file("$cgpath/memory.events");
+    my $mem_events = defined $cgpath ? read_file("$cgpath/memory.events") : undef;
     if (defined $mem_events && $mem_events =~ /^oom\s+(\d+)/m) {
         $last_oom_count = $1;
     }
@@ -2637,7 +2699,7 @@ sub cmd_events (%p) {
         _emit_event({type => 'stats', id => $id, data => _collect_cgroup_stats($cgpath)});
 
         # Check for OOM events
-        $mem_events = read_file("$cgpath/memory.events");
+        $mem_events = defined $cgpath ? read_file("$cgpath/memory.events") : undef;
         if (defined $mem_events && $mem_events =~ /^oom\s+(\d+)/m) {
             my $oom_count = $1;
             if ($oom_count > $last_oom_count) {
@@ -2677,7 +2739,7 @@ sub cmd_ps (%p) {
     my @pids = cgroup_pids($cgpath);
 
     if ($format eq 'json') {
-        print $JSON->encode(\@pids);
+        print $JSON->encode([map {$_ + 0} @pids]);
         return;
     }
 
@@ -2707,8 +2769,38 @@ sub cmd_spec (%p) {
         fatal("$path already exists. Use --force to overwrite.");
     }
 
-    write_file($path, $JSON->encode(default_spec()));
+    my $spec = default_spec();
+    _spec_to_rootless($spec) if $p{rootless};
+    write_file($path, $JSON->encode($spec));
     print "Generated $path\n" unless $p{quiet};
+    return;
+}
+
+# Adjust a spec for running as an unprivileged user, as "runc spec
+# --rootless" does: a user namespace mapping only the caller's own IDs, no
+# network namespace (it could not be configured), /sys bind-mounted instead
+# of a fresh sysfs, no uid=/gid= mount options that could not be mapped, and
+# no cgroup resources.
+sub _spec_to_rootless ($spec) {
+    my $linux = $spec->{linux} //= {};
+    $linux->{namespaces}
+        = [(grep {($_->{type} // '') !~ /^(?:network|user)$/} @{$linux->{namespaces} // []}), {type => 'user'},];
+    $linux->{uidMappings} = [{hostID => POSIX::geteuid(), containerID => 0, size => 1}];
+    $linux->{gidMappings} = [{hostID => POSIX::getegid(), containerID => 0, size => 1}];
+
+    for my $m (@{$spec->{mounts} // []}) {
+        if (($m->{destination} // '') =~ m{^/sys/?$}) {
+            %$m = (
+                destination => '/sys',
+                type => 'none',
+                source => '/sys',
+                options => [qw(rbind nosuid noexec nodev ro)],
+            );
+            next;
+        }
+        $m->{options} = [grep {!/^[ug]id=/} @{$m->{options} // []}] if $m->{options};
+    }
+    delete $linux->{resources};
     return;
 }
 
@@ -2951,10 +3043,25 @@ sub _dispatch_ps ($root, @) {
 }
 
 sub _dispatch_spec ($, @) {
-    my ($bundle, $force);
-    GetOptions('bundle|b=s' => \$bundle, 'force' => \$force);
-    cmd_spec(bundle => $bundle, force => $force);
+    my ($bundle, $force, $rootless);
+    GetOptions('bundle|b=s' => \$bundle, 'force' => \$force, 'rootless' => \$rootless);
+    cmd_spec(bundle => $bundle, force => $force, rootless => $rootless);
     return;
+}
+
+# Like runc, an unprivileged caller keeps state under $XDG_RUNTIME_DIR (it
+# cannot write /run). The sticky bit keeps the XDG runtime-dir cleaner from
+# pruning it. undef when the default /run/nacre applies.
+sub _rootless_default_root {
+    return if POSIX::geteuid() == 0 || !$ENV{XDG_RUNTIME_DIR};
+    my $root = "$ENV{XDG_RUNTIME_DIR}/nacre";
+
+    # Best effort: commands that never touch state (spec, --version) must
+    # not fail on an unusable $XDG_RUNTIME_DIR; the others fail later with
+    # an error about the state directory itself.
+    mkdir($root, 0700) unless -d $root;
+    chmod(0700 | S_ISVTX, $root) if -O $root;
+    return $root;
 }
 
 sub main {
@@ -2974,6 +3081,8 @@ sub main {
         'debug' => \$debug,
         'systemd-cgroup' => \$systemd_cgroup,
     );
+
+    $root = _rootless_default_root() // $root unless $root_explicit;
 
     # Initialize logging subsystem
     setup_logging(
@@ -3073,7 +3182,7 @@ GLOBAL OPTIONS:
    --debug             enable debug output for logging
    --log value         set the log file path where internal debug information is written
    --log-format value  set the format used by logs ('text' (default), or 'json') (default: "text")
-   --root value        root directory for storage of container state (default: "/run/nacre")
+   --root value        root directory for storage of container state (default: "/run/nacre", or "\$XDG_RUNTIME_DIR/nacre" for non-root users)
    --help, -h          show help
    --version, -v       print the version
 USAGE
