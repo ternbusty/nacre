@@ -1277,6 +1277,9 @@ sub set_rootfs_readonly ($rootfs_readonly) {
     return;
 }
 
+# The mount option table, for "features".
+sub mount_flags () {return \%MOUNT_FLAGS}
+
 our @EXPORT_OK = qw(
     do_mount do_umount do_pivot_root do_mount_setattr
     parse_mount_options

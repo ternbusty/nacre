@@ -6,7 +6,8 @@ use File::Basename qw(dirname);
 use POSIX qw(WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG);
 use Fcntl qw(:mode);
 use Errno qw(EINTR);
-use Nacre::Const qw(SYS_setns SYS_unshare);
+use Time::HiRes qw(usleep);
+use Nacre::Const qw(SYS_setns SYS_unshare SYS_pidfd_open);
 
 # ═══════════════════════════════════════════════════════════════════════
 # JSON encoders (shared across the runtime)
@@ -198,6 +199,47 @@ sub do_syscall (@args) {
 # ═══════════════════════════════════════════════════════════════════════
 # Exports
 # ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
+# Waiting for processes
+# ═══════════════════════════════════════════════════════════════════════
+
+# Wait up to $timeout seconds for process $pid to exit, without reaping it.
+# Uses a pidfd (Linux 5.3+), which becomes readable when the process exits
+# and works for non-children too. Returns 1 if it exited, 0 on timeout, and
+# undef if pidfds are unavailable (the caller should poll instead).
+sub pidfd_wait ($pid, $timeout) {
+    my $pidfd = syscall(SYS_pidfd_open + 0, $pid + 0, 0);
+    return if $pidfd < 0;
+    my $deadline = Time::HiRes::time() + $timeout;
+    my $exited = 0;
+    while (1) {
+        my $remaining = $deadline - Time::HiRes::time();
+        last if $remaining <= 0;
+        my $rin = '';
+        vec($rin, $pidfd, 1) = 1;
+        my $n = select(my $rout = $rin, undef, undef, $remaining);
+        next if $n < 0 && $! == EINTR;
+        $exited = 1 if $n > 0;
+        last;
+    }
+    POSIX::close($pidfd);
+    return $exited;
+}
+
+# Poll $done->() until it returns true or $timeout seconds pass, sleeping
+# 1ms at first and backing off to 50ms: fast for quick events, cheap for
+# slow ones. Returns whether $done->() became true.
+sub wait_until ($timeout, $done) {
+    my $deadline = Time::HiRes::time() + $timeout;
+    my $delay = 1_000;
+    until ($done->()) {
+        return 0 if Time::HiRes::time() >= $deadline;
+        usleep($delay);
+        $delay *= 2 if $delay < 50_000;
+    }
+    return 1;
+}
+
 our @EXPORT_OK = qw(
     $JSON $JSON_COMPACT
     $LOG_FH $LOG_DEBUG
@@ -207,6 +249,7 @@ our @EXPORT_OK = qw(
     write_file read_file read_file_or_die write_file_atomic
     ensure_dir iso8601_now do_syscall
     wait_exit_code do_setns do_unshare lookup_home_from_passwd
+    pidfd_wait wait_until
 );
 
 1;

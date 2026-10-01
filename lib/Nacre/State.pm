@@ -2,7 +2,6 @@ package Nacre::State;
 use v5.38;
 use Exporter 'import';
 use JSON::PP;
-use File::Path qw(remove_tree);
 use Nacre::Util qw($JSON fatal read_file read_file_or_die write_file_atomic ensure_dir);
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -157,7 +156,10 @@ sub save_state ($root, $state) {
 
 sub delete_state ($root, $id) {
     my $dir = state_dir($root, $id);
-    remove_tree($dir) if -d $dir;
+    if (-d $dir) {
+        require File::Path;    # only delete needs it
+        File::Path::remove_tree($dir);
+    }
     return;
 }
 
