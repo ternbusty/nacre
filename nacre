@@ -9,7 +9,7 @@ use Socket qw(AF_UNIX SOCK_STREAM pack_sockaddr_un);
 use JSON::PP;
 use File::Basename qw(basename dirname);
 use Fcntl qw(:flock :mode :seek O_RDONLY O_WRONLY O_RDWR O_CREAT
-    O_TRUNC O_EXCL O_NONBLOCK O_NOCTTY
+    O_TRUNC O_EXCL O_NONBLOCK O_NOCTTY O_DIRECTORY
     F_GETFD F_SETFD FD_CLOEXEC);
 use Getopt::Long qw(:config pass_through no_auto_abbrev);
 use Time::HiRes qw(usleep);
@@ -19,7 +19,7 @@ use FindBin;
 use lib "$FindBin::RealBin/lib";
 use Nacre::Const qw(
     O_CLOEXEC O_PATH
-    SYS_unshare SYS_setns SYS_prctl SYS_pidfd_open SYS_close_range
+    SYS_unshare SYS_setns SYS_prctl SYS_pidfd_open SYS_close_range SYS_clone3
     SYS_sethostname SYS_setdomainname SYS_setgroups SYS_fchown SYS_waitid
     CLONE_NEWNS CLONE_NEWUSER CLONE_NEWPID CLONE_NEWCGROUP CLONE_NEWTIME
     SIGCHLD MS_MOVE
@@ -55,7 +55,7 @@ use Nacre::Lazy 'Nacre::Device' => qw(apply_device_cgroup);
 use Nacre::Lazy 'Nacre::Net' => qw(move_net_devices rename_net_devices);
 use Nacre::Lazy 'Nacre::Caps' => qw(validate_capabilities);
 use Nacre::Lazy 'Nacre::Cgroup' => qw(
-    cgroup_path cgroup_rootless_path cgroup_setup cgroup_apply_resources
+    cgroup_path cgroup_rootless_path cgroup_setup cgroup_apply_resources cgroup_apply_pids
     cgroup_add_process cgroup_cleanup cgroup_pids cg_read cg_write
 );
 use Nacre::Lazy 'Nacre::Process' => qw(
@@ -774,7 +774,7 @@ sub _create_child_process (    ## no critic (Subroutines::ProhibitManyArgs Requi
 
 sub _create_parent_finish (    ## no critic (Subroutines::ProhibitManyArgs)
     $init_pid, $init_ready, $init_error, $clone_flags,
-    $cgpath, $spec, $pty_parent_sock, $id, $bundle,
+    $cgpath, $in_cgroup, $spec, $pty_parent_sock, $id, $bundle,
     $rootfs, $root, $p_ref,
 ) {
     fatal("init process failed to start") unless $init_pid;
@@ -793,10 +793,12 @@ sub _create_parent_finish (    ## no critic (Subroutines::ProhibitManyArgs)
             . "error during container init: $err\n";
     }
 
-    unless ($clone_flags & CLONE_NEWCGROUP) {
-        cgroup_setup($cgpath, $spec) if $cgpath;
-        eval {cgroup_add_process($cgpath, $init_pid);} if $cgpath;
-        eval {apply_device_cgroup($cgpath, $spec);} if $cgpath;
+    if ($cgpath) {
+
+        # Set up before forking (cmd_create); move the init in unless it
+        # was born there or the NEWCGROUP path already moved it.
+        eval {cgroup_add_process($cgpath, $init_pid);} unless $in_cgroup || ($clone_flags & CLONE_NEWCGROUP);
+        eval {cgroup_apply_pids($cgpath, $spec);};
     }
 
     my $pty_master_fd;
@@ -867,12 +869,12 @@ sub _create_parent_msg_loop ($main_r_fd, $init_w_fd, $spec, $id, $bundle, $cgpat
             $init_pid = $msg->{pid};
             if ($clone_flags & CLONE_NEWCGROUP) {
 
-                # No $cgpath: a rootless container without a cgroup.
+                # The cgroup is set up already (cmd_create). $cgpath is
+                # only passed when the init still has to be moved into it:
+                # not born there, and not a rootless container without one.
                 if ($cgpath) {
-                    cgroup_setup($cgpath, $spec);
                     try {cgroup_add_process($cgpath, $init_pid);}
                     catch ($e) {log_debug("cgroup_add_process in NEWCGROUP path: $e");}
-                    eval {apply_device_cgroup($cgpath, $spec);};
                 }
                 channel_send($init_w_fd, {type => 'cgroup_done'});
             }
@@ -1025,6 +1027,34 @@ sub _handle_seccomp_notify ($main_r_fd, $init_w_fd, $spec, $id, $bundle, $init_p
 # Container Lifecycle: create
 # ═══════════════════════════════════════════════════════════════════════
 
+# Fork the container's first process straight into its cgroup with
+# clone3(CLONE_INTO_CGROUP); the init it forks inherits the cgroup. Moving a
+# process in later through cgroup.procs costs several milliseconds (the
+# kernel waits for an RCU grace period on the first migration), being born
+# there costs nothing. Falls back to fork() when there is no cgroup or
+# clone3 fails (Linux < 5.7, no permission); returns ($pid, $in_cgroup).
+use constant CLONE_INTO_CGROUP => 1 << 33;
+
+sub _fork_into_cgroup ($cgpath) {
+    if ($cgpath && sysopen(my $cg_fh, $cgpath, O_RDONLY | O_DIRECTORY | O_CLOEXEC)) {
+
+        # Unlike fork(), a raw clone3 does not flush Perl's output buffers:
+        # do it now so buffered output is not written twice.
+        STDOUT->flush;
+        STDERR->flush;
+        my $args = pack('Q11', CLONE_INTO_CGROUP, 0, 0, 0, SIGCHLD, 0, 0, 0, 0, 0, fileno($cg_fh));
+        my $pid = syscall(SYS_clone3 + 0, $args, length $args);
+        if ($pid >= 0) {
+            close $cg_fh;
+            return ($pid, 1);
+        }
+        log_debug("clone3(CLONE_INTO_CGROUP): $!; falling back to fork");
+        close $cg_fh;
+    }
+    my $pid = fork() // fatal("fork: $!");
+    return ($pid, 0);
+}
+
 sub cmd_create (%p) {
 
     # The container's init runs module code after pivot_root, when the lib
@@ -1109,9 +1139,20 @@ sub cmd_create (%p) {
         close $dfh;
     };
 
+    # Set the cgroup up before forking so that the container's processes
+    # can be born in it. pids.max waits until setup is done (setup forks).
+    if ($cgpath) {
+        try {
+            cgroup_setup($cgpath, $spec, defer_pids => 1);
+        } catch ($e) {
+            delete_state($root, $id);
+            die $e;    ## no critic (ErrorHandling::RequireCarping)
+        }
+        eval {apply_device_cgroup($cgpath, $spec);};
+    }
+
     # Fork: child will become the init process
-    my $child_pid = fork();
-    fatal("fork: $!") unless defined $child_pid;
+    my ($child_pid, $in_cgroup) = _fork_into_cgroup($cgpath);
 
     if ($child_pid == 0) {
         _create_child_process(    ## no critic (Subroutines::ProhibitManyArgs)
@@ -1131,12 +1172,13 @@ sub cmd_create (%p) {
     POSIX::close($init_debug_fd_pre) if defined $init_debug_fd_pre;
 
     my ($init_pid, $init_ready, $init_error)
-        = _create_parent_msg_loop($main_r_fd, $init_w_fd, $spec, $id, $bundle, $cgpath, $clone_flags,);
+        = _create_parent_msg_loop($main_r_fd, $init_w_fd, $spec, $id, $bundle, $in_cgroup ? undef : $cgpath,
+        $clone_flags,);
 
     waitpid($child_pid, 0);
 
     my $state = _create_parent_finish(
-        $init_pid, $init_ready, $init_error, $clone_flags, $cgpath, $spec,
+        $init_pid, $init_ready, $init_error, $clone_flags, $cgpath, $in_cgroup, $spec,
         $pty_parent_sock, $id, $bundle, $rootfs, $root, \%p,
     );
 
