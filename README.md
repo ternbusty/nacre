@@ -11,6 +11,10 @@ Implements the [OCI Runtime Specification](https://github.com/opencontainers/run
 - libseccomp (libseccomp-dev)
 - FFI::Platypus (cpan)
 
+Optional:
+
+- JSON::XS (`libjson-xs-perl` on Debian/Ubuntu): used instead of the core JSON::PP when installed, saving a few milliseconds on every command
+
 ## Usage
 
 ```bash

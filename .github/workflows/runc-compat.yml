@@ -14,11 +14,15 @@ on:
       rootless_features:
         type: string
         default: ''
+      # Hide JSON::XS so nacre runs on its JSON::PP fallback.
+      json_pp:
+        type: boolean
+        default: false
   workflow_dispatch:
 
 jobs:
   runc-bats:
-    name: runc bats integration${{ inputs.rootless && format(' (rootless, {0})', inputs.rootless_features || 'no features') || '' }}
+    name: runc bats integration${{ inputs.rootless && format(' (rootless, {0})', inputs.rootless_features || 'no features') || '' }}${{ inputs.json_pp && ' (JSON::PP)' || '' }}
     runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
     timeout-minutes: 45
 
@@ -37,6 +41,19 @@ jobs:
           sudo apt-get install -y libseccomp-dev jq busybox-static
           # BFQ lets "per-device io weight for bfq" run instead of skipping.
           sudo modprobe bfq || echo "bfq module not available"
+
+      - name: Hide JSON::XS (exercise the JSON::PP fallback)
+        if: inputs.json_pp
+        # The runner image ships JSON::XS, but most systems running nacre
+        # have only the core JSON::PP. Make it unloadable without removing
+        # the package (its reverse dependencies would go with it).
+        run: |
+          f="$(perl -MJSON::XS -e 'print $INC{"JSON/XS.pm"}')"
+          sudo mv "$f" "$f.disabled"
+          if perl -MJSON::XS -e 1 2>/dev/null; then
+            echo "JSON::XS is still loadable" >&2
+            exit 1
+          fi
 
       - name: Set up rootless user
         if: inputs.rootless
@@ -132,5 +149,5 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: runc-bats-tap-output-${{ inputs.runner || 'ubuntu-24.04' }}${{ inputs.rootless && format('-rootless-{0}', inputs.rootless_features || 'none') || '' }}
+          name: runc-bats-tap-output-${{ inputs.runner || 'ubuntu-24.04' }}${{ inputs.rootless && format('-rootless-{0}', inputs.rootless_features || 'none') || '' }}${{ inputs.json_pp && '-json-pp' || '' }}
           path: tap-output.log
