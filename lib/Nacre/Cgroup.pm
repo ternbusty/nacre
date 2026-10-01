@@ -64,7 +64,10 @@ sub _resource_set ($v) {
     return 1;
 }
 
-sub cgroup_setup ($cgpath, $spec) {
+# Create the container's cgroup, enable controllers and apply resources.
+# defer_pids leaves pids.max for cgroup_apply_pids(): when the container's
+# processes are born in the cgroup, setup itself forks inside it.
+sub cgroup_setup ($cgpath, $spec, %opts) {
 
     # Check if cgroup already exists and has processes (non-empty cgroup)
     if (-d $cgpath) {
@@ -101,7 +104,13 @@ sub cgroup_setup ($cgpath, $spec) {
     }
 
     # Apply resources
-    cgroup_apply_resources($cgpath, $spec);
+    cgroup_apply_resources($cgpath, $spec, defer_pids => $opts{defer_pids});
+    return;
+}
+
+sub cgroup_apply_pids ($cgpath, $spec) {
+    my $pids = $spec->{linux}{resources}{pids} // return;
+    _apply_pids($cgpath, $pids);
     return;
 }
 
@@ -372,7 +381,7 @@ sub convert_cpu_shares ($shares) {
 }
 
 our @EXPORT_OK = qw(
-    cgroup_path cgroup_rootless_path cgroup_setup cgroup_apply_resources
+    cgroup_path cgroup_rootless_path cgroup_setup cgroup_apply_resources cgroup_apply_pids
     cgroup_add_process cgroup_cleanup cgroup_pids
     cg_read cg_write
 );
