@@ -6,7 +6,6 @@ no warnings 'experimental::try', 'experimental::defer';
 use POSIX qw(setsid _exit dup2 mkfifo WNOHANG WIFEXITED WEXITSTATUS
     WIFSIGNALED WTERMSIG :sys_wait_h :signal_h :errno_h);
 use Socket qw(AF_UNIX SOCK_STREAM pack_sockaddr_un);
-use JSON::PP;
 use File::Basename qw(basename dirname);
 use Fcntl qw(:flock :mode :seek O_RDONLY O_WRONLY O_RDWR O_CREAT
     O_TRUNC O_EXCL O_NONBLOCK O_NOCTTY
@@ -2829,10 +2828,10 @@ sub cmd_features {
             namespaces => [sort keys %NS_MAP],
             capabilities => [@CAP_NAMES],
             cgroup => {
-                v2 => JSON::PP::true,
+                v2 => \1,
             },
             seccomp => {
-                enabled => JSON::PP::true,
+                enabled => \1,
                 actions => [
                     qw(SCMP_ACT_KILL SCMP_ACT_KILL_PROCESS SCMP_ACT_TRAP
                         SCMP_ACT_ERRNO SCMP_ACT_NOTIFY SCMP_ACT_LOG SCMP_ACT_ALLOW)
@@ -2848,8 +2847,8 @@ sub cmd_features {
                         SECCOMP_FILTER_FLAG_SPEC_ALLOW)
                 ],
             },
-            apparmor => {enabled => JSON::PP::false},
-            selinux => {enabled => selinux_enabled() ? JSON::PP::true : JSON::PP::false},
+            apparmor => {enabled => \0},
+            selinux => {enabled => selinux_enabled() ? \1 : \0},
         },
         annotations => {
             'org.opencontainers.runtime.nacre' => 'Perl OCI runtime',
