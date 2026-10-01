@@ -1,6 +1,7 @@
 package Nacre::State;
 use v5.38;
 use Exporter 'import';
+use JSON::PP;
 use Nacre::Util qw($JSON fatal read_file read_file_or_die write_file_atomic ensure_dir);
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -40,9 +41,9 @@ sub load_cached_spec ($root, $id, $bundle) {
 sub default_spec {
     return {
         ociVersion => '1.2.0',
-        root => {path => 'rootfs', readonly => \1},
+        root => {path => 'rootfs', readonly => JSON::PP::true},
         process => {
-            terminal => \1,
+            terminal => JSON::PP::true,
             user => {uid => 0, gid => 0},
             args => ['sh'],
             env => ['PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'TERM=xterm',],
@@ -53,7 +54,7 @@ sub default_spec {
                 permitted => [qw(CAP_AUDIT_WRITE CAP_KILL CAP_NET_BIND_SERVICE)],
             },
             rlimits => [{type => 'RLIMIT_NOFILE', hard => 1024, soft => 1024},],
-            noNewPrivileges => \1,
+            noNewPrivileges => JSON::PP::true,
         },
         hostname => 'nacre',
         mounts => [
@@ -102,7 +103,7 @@ sub default_spec {
         ],
         linux => {
             resources => {
-                devices => [{allow => \0, access => 'rwm'}],
+                devices => [{allow => JSON::PP::false, access => 'rwm'}],
             },
             namespaces => [
                 {type => 'pid'},

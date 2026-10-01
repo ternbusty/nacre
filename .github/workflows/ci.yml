@@ -18,7 +18,7 @@ jobs:
         run: perl -c nacre
 
   integration:
-    name: Integration tests (${{ matrix.arch }}${{ matrix.json_pp && ', JSON::PP' || '' }})
+    name: Integration tests (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     strategy:
@@ -29,9 +29,6 @@ jobs:
             runner: ubuntu-24.04
           - arch: arm64
             runner: ubuntu-24.04-arm
-          - arch: x86_64
-            runner: ubuntu-24.04
-            json_pp: true
     steps:
       - uses: actions/checkout@v4
 
@@ -39,19 +36,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y busybox-static jq python3
-
-      - name: Hide JSON::XS (exercise the JSON::PP fallback)
-        if: matrix.json_pp
-        # The runner image ships JSON::XS, but most systems running nacre
-        # have only the core JSON::PP. Make it unloadable without removing
-        # the package (its reverse dependencies would go with it).
-        run: |
-          f="$(perl -MJSON::XS -e 'print $INC{"JSON/XS.pm"}')"
-          sudo mv "$f" "$f.disabled"
-          if perl -MJSON::XS -e 1 2>/dev/null; then
-            echo "JSON::XS is still loadable" >&2
-            exit 1
-          fi
 
       - name: Syntax check
         run: perl -c nacre
@@ -65,7 +49,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-logs-${{ matrix.arch }}${{ matrix.json_pp && '-json-pp' || '' }}
+          name: test-logs-${{ matrix.arch }}
           path: /tmp/test-output.log
           retention-days: 5
 
@@ -96,13 +80,6 @@ jobs:
     uses: ./.github/workflows/runc-compat.yml
     with:
       runner: ${{ matrix.runner }}
-
-  runc-bats-json-pp:
-    needs: integration
-    uses: ./.github/workflows/runc-compat.yml
-    with:
-      runner: ubuntu-24.04
-      json_pp: true
 
   runc-bats-rootless:
     needs: integration

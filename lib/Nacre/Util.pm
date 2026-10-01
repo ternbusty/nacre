@@ -1,6 +1,7 @@
 package Nacre::Util;
 use v5.38;
 use Exporter 'import';
+use JSON::PP;
 use File::Basename qw(dirname);
 use POSIX qw(WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG);
 use Fcntl qw(:mode);
@@ -11,12 +12,8 @@ use Nacre::Const qw(SYS_setns SYS_unshare SYS_pidfd_open);
 # ═══════════════════════════════════════════════════════════════════════
 # JSON encoders (shared across the runtime)
 # ═══════════════════════════════════════════════════════════════════════
-# JSON::XS when installed (it loads in ~1ms against JSON::PP's ~6ms, and
-# every command pays that), else the core JSON::PP. Same API and output.
-# Booleans are written as \1 / \0, which both encode as true / false.
-my $JSON_CLASS = eval {require JSON::XS; 'JSON::XS'} // do {require JSON::PP; 'JSON::PP'};
-our $JSON = $JSON_CLASS->new->utf8->canonical->pretty->allow_nonref;
-our $JSON_COMPACT = $JSON_CLASS->new->utf8->canonical->allow_nonref;
+our $JSON = JSON::PP->new->utf8->canonical->pretty->allow_nonref;
+our $JSON_COMPACT = JSON::PP->new->utf8->canonical->allow_nonref;
 
 # ═══════════════════════════════════════════════════════════════════════
 # Debug logging (--debug / --log / --log-format)
