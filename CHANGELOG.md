@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.3.0](https://github.com/ternbusty/nacre/compare/v0.2.0...v0.3.0) (2026-10-03)
+
+
+### Features
+
+* add SELinux support and ARM64 CI ([#12](https://github.com/ternbusty/nacre/issues/12)) ([13cdae8](https://github.com/ternbusty/nacre/commit/13cdae87390149f0fe8763ff41bb8a19f6523d62))
+* rootless containers and per-device io weight ([#14](https://github.com/ternbusty/nacre/issues/14)) ([3b5d7a4](https://github.com/ternbusty/nacre/commit/3b5d7a43d0c33e28061c7274a87a020fcca70b93))
+
+
+### Bug Fixes
+
+* containerd compatibility — pidfile format and stdio inheritance ([#11](https://github.com/ternbusty/nacre/issues/11)) ([0524886](https://github.com/ternbusty/nacre/commit/0524886139d3d0c56a695f95bf03710a4dcfb698))
+* exec -d no longer loses errors from a slow start ([#21](https://github.com/ternbusty/nacre/issues/21)) ([98d526d](https://github.com/ternbusty/nacre/commit/98d526d5998aaa43340f233bf08120c05a5e5f9a))
+* trustworthy runc bats results, wider coverage and the fixes it surfaced ([#13](https://github.com/ternbusty/nacre/issues/13)) ([8df706f](https://github.com/ternbusty/nacre/commit/8df706f8924c370ec4a39846b4b0d9f1ea37f3af))
+* unskip and fix no-pivot proc exposure test ([#9](https://github.com/ternbusty/nacre/issues/9)) ([e889dc9](https://github.com/ternbusty/nacre/commit/e889dc9fe3156313e652dfb3c6af9bb770d6dcdf))
+
+
+### Performance Improvements
+
+* answer state and list before compiling the rest of nacre ([#22](https://github.com/ternbusty/nacre/issues/22)) ([732dce6](https://github.com/ternbusty/nacre/commit/732dce6fc60d12338267ab4685ff46d380eed8cb))
+* create the container's processes inside their cgroup ([#17](https://github.com/ternbusty/nacre/issues/17)) ([39112e0](https://github.com/ternbusty/nacre/commit/39112e0d6644be7ed3434ca35d2506cd18e0338f))
+* drop fixed sleeps and cut per-command startup ([#15](https://github.com/ternbusty/nacre/issues/15)) ([1860a32](https://github.com/ternbusty/nacre/commit/1860a32dc615114e82661d47b26a627d30afe7dc))
+* make exec cheaper ([#20](https://github.com/ternbusty/nacre/issues/20)) ([c2dfa52](https://github.com/ternbusty/nacre/commit/c2dfa52e9449506a21ed5f6d07fb6be6a57b5e8d))
+* replace Getopt::Long with a small option parser ([#18](https://github.com/ternbusty/nacre/issues/18)) ([1286e16](https://github.com/ternbusty/nacre/commit/1286e16c7dd11c255cfec3a4d4e595b51917b499))
+* replace JSON::PP with a small JSON codec ([#19](https://github.com/ternbusty/nacre/issues/19)) ([ba96e4f](https://github.com/ternbusty/nacre/commit/ba96e4f351ca4ba5a620648adc13b5c6074bf5a1))
+
 ## [0.2.0](https://github.com/ternbusty/nacre/compare/v0.1.0...v0.2.0) (2026-09-17)
 
 
