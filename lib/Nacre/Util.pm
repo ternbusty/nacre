@@ -1,7 +1,7 @@
 package Nacre::Util;
 use v5.38;
 use Exporter 'import';
-use JSON::PP;
+use Nacre::JSON;
 use File::Basename qw(dirname);
 use POSIX qw(WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG);
 use Fcntl qw(:mode);
@@ -12,8 +12,8 @@ use Nacre::Const qw(SYS_setns SYS_unshare SYS_pidfd_open);
 # ═══════════════════════════════════════════════════════════════════════
 # JSON encoders (shared across the runtime)
 # ═══════════════════════════════════════════════════════════════════════
-our $JSON = JSON::PP->new->utf8->canonical->pretty->allow_nonref;
-our $JSON_COMPACT = JSON::PP->new->utf8->canonical->allow_nonref;
+our $JSON = Nacre::JSON->new(pretty => 1);
+our $JSON_COMPACT = Nacre::JSON->new;
 
 # ═══════════════════════════════════════════════════════════════════════
 # Debug logging (--debug / --log / --log-format)
