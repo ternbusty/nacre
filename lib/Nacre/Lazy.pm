@@ -42,4 +42,13 @@ sub load_all () {
     return;
 }
 
+# Load just these modules (names as given to the lazy import).
+sub load (@modules) {
+    for my $module (@modules) {
+        my $file = $MODULES{$module} // die "Nacre::Lazy: $module is not lazily imported\n";
+        require $file;
+    }
+    return;
+}
+
 1;
