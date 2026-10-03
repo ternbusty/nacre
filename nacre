@@ -2447,11 +2447,16 @@ sub cmd_exec (%p) {    ## no critic (Subroutines::ProhibitExcessComplexity)
     for my $ns (@ns_fds) {close $ns->{fd};}
 
     if ($p{detach}) {
+
+        # Wait until the process has been exec'd -- err_w is close-on-exec,
+        # so that is EOF -- or the child reported why it could not be. No
+        # timeout: a slow start must not turn a failure into a success.
         my $err_msg = '';
-        my $rin = '';
-        vec($rin, fileno($pipes->{err_r}), 1) = 1;
-        if (select($rin, undef, undef, 0.1)) {
-            sysread($pipes->{err_r}, $err_msg, 4096);
+        while (1) {
+            my $n = sysread($pipes->{err_r}, my $buf, 4096);
+            next if !defined $n && $! == EINTR;
+            last unless $n;
+            $err_msg .= $buf;
         }
         close $pipes->{err_r};
         if ($err_msg ne '') {
