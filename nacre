@@ -1037,22 +1037,34 @@ use constant CLONE_INTO_CGROUP => 1 << 33;
 
 sub _fork_into_cgroup ($cgpath) {
     if ($cgpath && sysopen(my $cg_fh, $cgpath, O_RDONLY | O_DIRECTORY | O_CLOEXEC)) {
-
-        # Unlike fork(), a raw clone3 does not flush Perl's output buffers:
-        # do it now so buffered output is not written twice.
-        STDOUT->flush;
-        STDERR->flush;
-        my $args = pack('Q11', CLONE_INTO_CGROUP, 0, 0, 0, SIGCHLD, 0, 0, 0, 0, 0, fileno($cg_fh));
-        my $pid = syscall(SYS_clone3 + 0, $args, length $args);
-        if ($pid >= 0) {
-            close $cg_fh;
-            return ($pid, 1);
-        }
-        log_debug("clone3(CLONE_INTO_CGROUP): $!; falling back to fork");
+        my $pid = _clone_into_cgroup_fd(fileno $cg_fh);
         close $cg_fh;
+        return ($pid, 1) if defined $pid;
     }
     my $pid = fork() // fatal("fork: $!");
     return ($pid, 0);
+}
+
+# clone3(CLONE_INTO_CGROUP) into the cgroup open as $cg_fd: the pid (0 in
+# the child), or undef if clone3 failed (no child then).
+sub _clone_into_cgroup_fd ($cg_fd) {
+
+    # Unlike fork(), a raw clone3 does not flush Perl's output buffers: do
+    # it now so buffered output is not written twice. (Setting $| flushes;
+    # no IO::Handle methods, which may need loading a module, impossible
+    # once inside the container's mount namespace.)
+    for my $fh (\*STDOUT, \*STDERR) {
+        my $previous = select $fh;    ## no critic (InputOutput::ProhibitOneArgSelect)
+        my $autoflush = $|;
+        $| = 1;
+        $| = $autoflush;
+        select $previous;    ## no critic (InputOutput::ProhibitOneArgSelect)
+    }
+    my $args = pack('Q11', CLONE_INTO_CGROUP, 0, 0, 0, SIGCHLD, 0, 0, 0, 0, 0, $cg_fd);
+    my $pid = syscall(SYS_clone3 + 0, $args, length $args);
+    return $pid if $pid >= 0;
+    log_debug("clone3(CLONE_INTO_CGROUP): $!; falling back to fork");
+    return;
 }
 
 sub cmd_create (%p) {
@@ -2003,17 +2015,23 @@ sub _exec_child_join_ns ($ns_fds_ref, $err_w) {
     return;
 }
 
-sub _exec_child_pid_fork ($ns_fds_ref, $gc_pid_w, $err_w, $cg_sync_r, $pty_child_fh, $seccomp_child_fh) {
+sub _exec_child_pid_fork (    ## no critic (Subroutines::ProhibitManyArgs)
+    $ns_fds_ref, $gc_pid_w, $err_w, $cg_sync_r, $pty_child_fh, $seccomp_child_fh, $cg_fh,
+) {
     my $joined_pid_ns = grep {$_->{name} eq 'pid'} @$ns_fds_ref;
     return unless $joined_pid_ns;
 
-    my $pid2 = fork();
+    # Clone the grandchild (the exec'd process) straight into its cgroup.
+    my $pid2 = $cg_fh ? _clone_into_cgroup_fd(fileno $cg_fh) : undef;
+    my $in_cgroup = defined $pid2 ? 1 : 0;
+    $pid2 //= fork();
     if (!defined $pid2) {
         syswrite($err_w, "fork for PID ns: $!");
         _exit(255);
     }
+    close $cg_fh if $cg_fh;
     if ($pid2 > 0) {
-        syswrite($gc_pid_w, pack("L", $pid2));
+        syswrite($gc_pid_w, pack("LC", $pid2, $in_cgroup));
         close $gc_pid_w;
         close $err_w;
         close $cg_sync_r;
@@ -2293,7 +2311,11 @@ sub _exec_parent_seccomp_notify ($seccomp_parent_fh, $spec, $id, $state, $init_p
 }
 
 sub cmd_exec (%p) {    ## no critic (Subroutines::ProhibitExcessComplexity)
-    Nacre::Lazy::load_all();    # the exec'd process setup runs inside the container
+
+    # The child sets the process up after entering the container's mount
+    # namespace, where lib/ is gone: load what it uses (and only that --
+    # exec is frequent, e.g. for health checks; see test/unit/exec-modules.t).
+    Nacre::Lazy::load('Nacre::Process', 'Nacre::Seccomp');
     my $id = $p{id} // exec_fatal("container id required");
     my $root = $p{root} // $DEFAULT_ROOT;
     my @cmd = @{$p{command} // []};
@@ -2330,8 +2352,19 @@ sub cmd_exec (%p) {    ## no critic (Subroutines::ProhibitExcessComplexity)
     my $pipes = _exec_setup_pipes($opts{tty}, $spec);
     _exec_relocate_fds($preserve_fds, $pipes);
 
-    my $child = fork();
-    fatal("fork for exec: $!") unless defined $child;
+    # The exec'd process is born in the target cgroup (clone3), so that no
+    # cgroup.procs write is needed. When it joins a pid namespace, it is the
+    # grandchild: the child stays outside the container's cgroup (it only
+    # waits for it) and clones the grandchild into the cgroup itself.
+    my ($exec_target_cgpath, $init_actual_cgpath)
+        = _exec_resolve_cgroup($p{exec_cgroup}, $state->{cgroupPath}, $init_pid);
+    my ($child, $in_cgroup, $cg_fh);
+    if ($has_pid_ns_in_exec) {
+        sysopen($cg_fh, $exec_target_cgpath, O_RDONLY | O_DIRECTORY | O_CLOEXEC) if $exec_target_cgpath;
+        $child = fork() // fatal("fork for exec: $!");
+    } else {
+        ($child, $in_cgroup) = _fork_into_cgroup($exec_target_cgpath);
+    }
 
     if ($child == 0) {    ## no critic (RequireFinalReturn)
         close $pipes->{err_r};
@@ -2353,7 +2386,7 @@ sub cmd_exec (%p) {    ## no critic (Subroutines::ProhibitExcessComplexity)
         _exec_child_pid_fork(
             \@ns_fds, $pipes->{gc_pid_w}, $pipes->{err_w}, $pipes->{cg_sync_r},
             $pipes->{pty_child_fh},
-            $pipes->{seccomp_child_fh},
+            $pipes->{seccomp_child_fh}, $cg_fh,
         );
 
         join_session_keyring($id, ($exec_proc && $exec_proc->{selinuxLabel}) || $spec->{process}{selinuxLabel});
@@ -2391,10 +2424,12 @@ sub cmd_exec (%p) {    ## no critic (Subroutines::ProhibitExcessComplexity)
     close $pipes->{cg_sync_r};
     close $pipes->{seccomp_child_fh} if $pipes->{seccomp_child_fh};
 
-    my ($exec_target_cgpath, $init_actual_cgpath)
-        = _exec_resolve_cgroup($p{exec_cgroup}, $state->{cgroupPath}, $init_pid);
+    close $cg_fh if $cg_fh;
 
-    my $deferred_exec_cg_path = _exec_parent_write_cgroup($exec_target_cgpath, $init_actual_cgpath, $p{exec_cgroup},
+    my $deferred_exec_cg_path
+        = $in_cgroup
+        ? undef
+        : _exec_parent_write_cgroup($exec_target_cgpath, $init_actual_cgpath, $p{exec_cgroup},
         $child, $has_pid_ns_in_exec,);
 
     syswrite($pipes->{sync_w}, "x", 1);
@@ -2402,9 +2437,12 @@ sub cmd_exec (%p) {    ## no critic (Subroutines::ProhibitExcessComplexity)
 
     my $final_pid = $child;
     if ($has_pid_ns_in_exec) {
-        sysread($pipes->{gc_pid_r}, my $gc_pid_buf, 4);
-        if (defined $gc_pid_buf && length($gc_pid_buf) == 4) {
-            $final_pid = unpack("L", $gc_pid_buf);
+
+        # The grandchild's pid, and whether it was born in the cgroup.
+        sysread($pipes->{gc_pid_r}, my $gc_pid_buf, 5);
+        if (defined $gc_pid_buf && length($gc_pid_buf) == 5) {
+            ($final_pid, my $gc_in_cgroup) = unpack("LC", $gc_pid_buf);
+            $deferred_exec_cg_path = undef if $gc_in_cgroup;
         }
     }
     close $pipes->{gc_pid_r};
