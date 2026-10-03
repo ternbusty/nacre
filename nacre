@@ -3,6 +3,19 @@
 use v5.38;
 use feature 'try', 'defer';
 no warnings 'experimental::try', 'experimental::defer';
+
+# "state" and "list" are called often (container managers poll them) and
+# only read state.json: answer them here, before the rest of this file --
+# most of the start-up time -- is compiled. Nacre::FastPath returns for
+# anything it does not handle exactly like the regular path.
+BEGIN {
+    if (grep {$_ eq 'state' || $_ eq 'list'} @ARGV) {
+        require FindBin;
+        unshift @INC, "$FindBin::RealBin/lib";
+        require Nacre::FastPath;
+        Nacre::FastPath::try_fast(\@ARGV);
+    }
+}
 use POSIX qw(setsid _exit dup2 mkfifo WNOHANG WIFEXITED WEXITSTATUS
     WIFSIGNALED WTERMSIG :sys_wait_h :signal_h :errno_h);
 use Socket qw(AF_UNIX SOCK_STREAM pack_sockaddr_un);
@@ -42,13 +55,14 @@ use Nacre::IPC qw(
     send_fd_via_socket send_fd_over_fd recv_fd_over_fd pty_set_raw
 );
 use Nacre::State qw(
-    load_spec cache_spec load_cached_spec default_spec
+    load_spec cache_spec load_cached_spec default_spec rootless_default_root
     state_dir load_state save_state delete_state refresh_state
     get_pid_starttime oci_state_json
 );
 
 # Only container setup needs these; most other commands never load them.
 # cmd_create and cmd_exec load them all up front (see Nacre::Lazy).
+use Nacre::FastPath qw(cmd_state cmd_list);
 use Nacre::Lazy 'Nacre::Seccomp' => qw(apply_seccomp_raw);
 use Nacre::Lazy 'Nacre::Device' => qw(apply_device_cgroup);
 use Nacre::Lazy 'Nacre::Net' => qw(move_net_devices rename_net_devices);
@@ -1246,15 +1260,6 @@ sub cmd_start (%p) {
 # Container Lifecycle: state
 # ═══════════════════════════════════════════════════════════════════════
 
-sub cmd_state (%p) {
-    my $id = $p{id} // fatal("container id required");
-    my $root = $p{root} // $DEFAULT_ROOT;
-
-    my $state = load_state($root, $id);
-    print $JSON->encode(oci_state_json($state));
-    return;
-}
-
 # ═══════════════════════════════════════════════════════════════════════
 # Container Lifecycle: kill
 # ═══════════════════════════════════════════════════════════════════════
@@ -1575,63 +1580,6 @@ sub _run_wait_init ($init_pid) {
 # ═══════════════════════════════════════════════════════════════════════
 # Container: list
 # ═══════════════════════════════════════════════════════════════════════
-
-sub cmd_list (%p) {
-    my $root = $p{root} // $DEFAULT_ROOT;
-    my $format = $p{format} // 'table';
-    my $quiet = $p{quiet} // 0;
-
-    my @containers;
-    if (opendir(my $dh, $root)) {
-        while (my $id = readdir($dh)) {
-            next if $id =~ /^\./;
-            my $st = eval {load_state($root, $id)};
-            next unless $st;
-            push @containers, $st;
-        }
-        closedir($dh);
-    } elsif ($p{root_explicit}) {
-
-        # Explicit --root with non-existent directory is an error
-        fatal("root directory '$root' does not exist");
-    }
-
-    # Default root that doesn't exist is fine — just show empty list
-
-    if ($quiet) {
-        print "$_->{id}\n" for sort {$a->{id} cmp $b->{id}} @containers;
-        return;
-    }
-
-    if ($format eq 'json') {
-
-        # JSON list output: compact, field order matches runc
-        # (ociVersion, id, pid, status, bundle, rootfs, created)
-        my @entries;
-        for my $c (sort {$a->{id} cmp $b->{id}} @containers) {
-            my $s = oci_state_json($c);
-            my @pairs;
-            for my $key (qw(ociVersion id pid status bundle rootfs created)) {
-                next unless defined $s->{$key};
-                push @pairs, $JSON_COMPACT->encode($key) . ':' . $JSON_COMPACT->encode($s->{$key});
-            }
-            push @entries, '{' . join(',', @pairs) . '}';
-        }
-        print '[' . join(',', @entries) . "]\n";
-        return;
-    }
-
-    # Table format (runc column order: ID PID STATUS BUNDLE CREATED OWNER)
-    printf "%-20s %-10s %-10s %-40s %-30s %s\n", 'ID', 'PID', 'STATUS', 'BUNDLE', 'CREATED', 'OWNER';
-    for my $c (sort {$a->{id} cmp $b->{id}} @containers) {
-        printf "%-20s %-10s %-10s %-40s %-30s %s\n",
-            $c->{id}, $c->{pid}, $c->{status},
-            $c->{bundle} // '',
-            $c->{created} // '',
-            '';
-    }
-    return;
-}
 
 # ═══════════════════════════════════════════════════════════════════════
 # Container: pause / resume
@@ -3144,21 +3092,6 @@ sub _dispatch_spec ($, @) {
     return;
 }
 
-# Like runc, an unprivileged caller keeps state under $XDG_RUNTIME_DIR (it
-# cannot write /run). The sticky bit keeps the XDG runtime-dir cleaner from
-# pruning it. undef when the default /run/nacre applies.
-sub _rootless_default_root {
-    return if POSIX::geteuid() == 0 || !$ENV{XDG_RUNTIME_DIR};
-    my $root = "$ENV{XDG_RUNTIME_DIR}/nacre";
-
-    # Best effort: commands that never touch state (spec, --version) must
-    # not fail on an unusable $XDG_RUNTIME_DIR; the others fail later with
-    # an error about the state directory itself.
-    mkdir($root, 0700) unless -d $root;
-    chmod(0700 | S_ISVTX, $root) if -O $root;
-    return $root;
-}
-
 sub main {
     my $root = $DEFAULT_ROOT;
     my $root_explicit = 0;
@@ -3177,7 +3110,7 @@ sub main {
         'systemd-cgroup' => \$systemd_cgroup,
     );
 
-    $root = _rootless_default_root() // $root unless $root_explicit;
+    $root = rootless_default_root() // $root unless $root_explicit;
 
     # Initialize logging subsystem
     setup_logging(
