@@ -16,6 +16,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Syntax check
         run: perl -c nacre
+      - name: Unit tests
+        run: prove test/unit
 
   integration:
     name: Integration tests (${{ matrix.arch }})

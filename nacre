@@ -11,12 +11,12 @@ use File::Basename qw(basename dirname);
 use Fcntl qw(:flock :mode :seek O_RDONLY O_WRONLY O_RDWR O_CREAT
     O_TRUNC O_EXCL O_NONBLOCK O_NOCTTY O_DIRECTORY
     F_GETFD F_SETFD FD_CLOEXEC);
-use Getopt::Long qw(:config pass_through no_auto_abbrev);
 use Time::HiRes qw(usleep);
 use Cwd qw(abs_path getcwd);
 use Errno qw(EINTR EAGAIN EWOULDBLOCK ENOENT EEXIST EBUSY EPERM ENOSYS EACCES EOVERFLOW);
 use FindBin;
 use lib "$FindBin::RealBin/lib";
+use Nacre::Getopt qw(GetOptions);
 use Nacre::Const qw(
     O_CLOEXEC O_PATH
     SYS_unshare SYS_setns SYS_prctl SYS_pidfd_open SYS_close_range SYS_clone3
@@ -2998,7 +2998,7 @@ sub _dispatch_exec ($root, @) {
     }
     @ARGV = @before;
 
-    Getopt::Long::Configure('require_order');
+    Nacre::Getopt::Configure('require_order');
     GetOptions(
         'cwd=s' => \$exec_cwd,
         'env|e=s' => \@exec_env,
@@ -3015,7 +3015,7 @@ sub _dispatch_exec ($root, @) {
         'cap=s' => \@cap_add,
         'cgroup=s' => \$exec_cgroup,
     );
-    Getopt::Long::Configure('permute');
+    Nacre::Getopt::Configure('permute');
     my $id = shift @ARGV // fatal("container id required");
     @exec_cmd = @ARGV unless @exec_cmd;
     cmd_exec(
@@ -3126,7 +3126,7 @@ sub main {
     my $systemd_cgroup = 0;
 
     # Parse global options (before command)
-    Getopt::Long::Configure('pass_through', 'no_auto_abbrev');
+    Nacre::Getopt::Configure('pass_through', 'no_auto_abbrev');
     GetOptions(
         'root=s' => sub {$root = $_[1]; $root_explicit = 1;},
         'log=s' => \my $log_file,
