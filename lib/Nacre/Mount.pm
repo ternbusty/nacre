@@ -187,10 +187,10 @@ sub do_mount ($src, $target, $fstype, $flags, $data) {
     # The kernel's mount(2) expects NULL pointers for unused args, not
     # pointers to empty strings (which it tries to resolve as paths → ENOENT).
     #
-    # IMPORTANT: we call syscall() directly here instead of going through
-    # do_syscall(), because Perl's @_ aliasing chain corrupts the argument
-    # types when mixing integer 0 (NULL pointer) and string arguments.
-    # Fresh lexical scalars with + 0 coercion guarantee clean IOK-only SVs.
+    # syscall() is called directly: do_syscall() passes every argument
+    # through + 0, which would turn the path strings into numbers. The
+    # number, the flags and each NULL go in as + 0 or 0 so that they are
+    # passed as integers, the strings as pointers to their buffers.
     my $nr = SYS_mount + 0;
     my $src_arg = (defined $src && $src ne '') ? ($src . "\0") : 0;
     my $tgt_arg = $target . "\0";
