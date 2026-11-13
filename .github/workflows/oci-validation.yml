@@ -86,7 +86,43 @@ jobs:
           PASS=0; FAIL=0; ERROR=0; TIMEOUT=0
 
           SKIP_V1='^(linux_cgroups_(network|blkio|hugetlb|devices|pids|relative_(blkio|network|hugetlb|devices|pids))|linux_cgroups_relative_cpus|linux_cgroups_relative_memory|linux_cgroups_cpus|linux_cgroups_memory|delete_(only_create_)?resources)$'
-          SKIP_BROKEN='^(pidfile|process_rlimits|linux_ns_itype|process_capabilities_fail|linux_uid_mappings)$'
+          # Tests that no runtime can pass or that contradict runc, which nacre
+          # follows (runc's bats suite runs in CI). runc 1.3.4 fails each of
+          # them too.
+          #   pidfile          kills the container after its process exited and
+          #                    fails on the error the spec requires (runtime-
+          #                    tools issue #805).
+          #   hooks            expects "post-start1" where its hook writes
+          #                    "post-start1 called".
+          #   prestart         expects prestart hooks at start; the spec runs
+          #                    them during create.
+          #   poststart        orders the hook's and the process's writes to
+          #                    one file, which race.
+          #   poststart_fail   wants start to succeed after a failed poststart
+          #                    hook; runc's bats "runc run [hook fails]" wants it
+          #                    to fail.
+          #   process_capabilities_fail  wants an unknown capability refused;
+          #                    runc ignores it and its bats "runc run with
+          #                    unknown capability" requires that.
+          SKIP_BROKEN='^(pidfile|hooks|prestart|poststart|poststart_fail|process_capabilities_fail)$'
+          # process_rlimits on arm64: the test sets a 1 GiB RLIMIT_AS, and under
+          # it runtimetest crashes with SIGSEGV on its own, outside any
+          # container (prlimit --as=1073741824 ./runtimetest --help), so no
+          # runtime gets its checks there. x86_64 still runs it.
+          if [ "$(uname -m)" = aarch64 ]; then
+            SKIP_BROKEN='^(pidfile|hooks|prestart|poststart|poststart_fail|process_capabilities_fail|process_rlimits)$'
+          fi
+          # Single assertions no runtime passes, not counted as failures.
+          # process_rlimits: runtimetest is a Go program, and Go raises its
+          # soft RLIMIT_NOFILE to the hard limit at startup, before the check
+          # (runtime-tools issue #806; runc and crun fail it too).
+          BROKEN_ASSERTIONS='^not ok [0-9]+ - has expected soft RLIMIT_NOFILE$'
+          # Lifecycle tests that print no ok/not ok lines and report only a
+          # failure, as an "error" diagnostic or a nonzero exit.
+          NO_ASSERTIONS='^(poststop|poststop_fail|prestart_fail|process_rlimits_fail)$'
+          # linux_seccomp blocks getcwd, so runtimetest stops at its working
+          # directory check; that it stops there is what shows the filter works.
+          RT_STOPS_AT_GETCWD='^linux_seccomp$'
           SKIP_V1_N=0; SKIP_BROKEN_N=0
 
           for t in validation/*/*.t; do
@@ -130,27 +166,85 @@ jobs:
               continue
             fi
 
-            n_ok=0; n_notok=0
+            # runtimetest's own TAP is how a test that runs it inside the
+            # container reports: printed as is, or embedded as the "stdout"
+            # of a diagnostic when the test passes its TAP along.
+            src="${t%.t}.go"
+            inside=0; tap_is_nil=0
+            while IFS= read -r line; do
+              case "$line" in
+                *"RuntimeInsideValidate(g, nil"*) inside=1; tap_is_nil=1 ;;
+                *"RuntimeInsideValidate("*)       inside=1 ;;
+              esac
+            done < "$src"
+
+            n_ok=0; n_notok=0; n_broken=0; n_error=0; rt_header=0; rt_embedded=0; rt_empty=0
+            rt_plan=0; rt_embedded_planned=0; rt_getcwd_blocked=0
             if [ -f "$out" ]; then
               while IFS= read -r line; do
                 case "$line" in
-                  "not ok "*)  n_notok=$((n_notok+1)) ;;
+                  "not ok "*)
+                    if [[ "$line" =~ $BROKEN_ASSERTIONS ]]; then n_broken=$((n_broken+1)); else n_notok=$((n_notok+1)); fi ;;
                   "ok "*)      n_ok=$((n_ok+1)) ;;
+                  "TAP version 13") rt_header=$((rt_header+1)) ;;
+                esac
+                [[ "$line" =~ ^1\.\.([0-9]+)$ ]] && rt_plan=${BASH_REMATCH[1]}
+                case "$line" in
+                  '    "error": '*)                 n_error=$((n_error+1)) ;;
+                  *'"stdout": "TAP version 13'*'\n1..'[0-9]*)
+                    rt_embedded=$((rt_embedded+1)); rt_embedded_planned=$((rt_embedded_planned+1)) ;;
+                  *'"stdout": "TAP version 13'*)  rt_embedded=$((rt_embedded+1)) ;;
+                  *'"stdout": ""'*)               rt_empty=$((rt_empty+1)) ;;
+                esac
+                case "$line" in
+                  *'getwd: operation not permitted'*) rt_getcwd_blocked=1 ;;
                 esac
               done < "$out"
+            fi
+
+            # A test that runs runtimetest but got none of its output has
+            # checked nothing inside the container, and one whose runtimetest
+            # TAP has no plan line (1..N) stopped part way.
+            rt_missing=0; rt_partial=0
+            if [ "$inside" -eq 1 ] && ! [[ "$name" =~ $NO_ASSERTIONS ]]; then
+              if [ "$tap_is_nil" -eq 1 ]; then
+                [ "$rt_header" -gt 0 ] || rt_missing=1
+                [ "$rt_missing" -eq 0 ] && [ "$((n_ok + n_notok + n_broken))" -ne "$rt_plan" ] && rt_partial=1
+              else
+                { [ "$rt_embedded" -gt 0 ] && [ "$rt_empty" -eq 0 ]; } || rt_missing=1
+                [ "$rt_missing" -eq 0 ] && [ "$rt_embedded_planned" -ne "$rt_embedded" ] && rt_partial=1
+              fi
+              if [[ "$name" =~ $RT_STOPS_AT_GETCWD ]]; then
+                rt_partial=$((1 - rt_getcwd_blocked))
+              fi
             fi
 
             if [ "$n_notok" -gt 0 ]; then
               FAIL=$((FAIL+1))
               echo "FAIL     $name  ok=$n_ok notok=$n_notok"
-            elif [ "$n_ok" -gt 0 ]; then
-              PASS=$((PASS+1))
-              echo "PASS     $name  ok=$n_ok"
+            elif [ "$rt_missing" -eq 1 ]; then
+              FAIL=$((FAIL+1))
+              echo "FAIL     $name  ok=$n_ok (no runtimetest output)"
+            elif [ "$rt_partial" -eq 1 ]; then
+              FAIL=$((FAIL+1))
+              echo "FAIL     $name  ok=$n_ok (runtimetest output incomplete)"
             elif [ "$rc" -ne 0 ]; then
               ERROR=$((ERROR+1))
-              echo "ERROR    $name  rc=$rc"
+              echo "ERROR    $name  rc=$rc ok=$n_ok"
+            elif [ "$n_ok" -gt 0 ]; then
+              PASS=$((PASS+1))
+              extra=""
+              [ "$n_broken" -gt 0 ] && extra="  known-broken=$n_broken"
+              echo "PASS     $name  ok=$n_ok$extra"
+            elif [ "$n_error" -gt 0 ]; then
+              FAIL=$((FAIL+1))
+              echo "FAIL     $name  (error diagnostic)"
+            elif [[ "$name" =~ $NO_ASSERTIONS ]]; then
+              PASS=$((PASS+1))
+              echo "PASS     $name  (no assertions; no error)"
             else
-              echo "SKIP     $name"
+              FAIL=$((FAIL+1))
+              echo "FAIL     $name  (no results)"
             fi
           done
 
@@ -177,10 +271,9 @@ jobs:
 
           # Show failing test logs
           echo "::group::Failing test details"
-          for f in "$OUTDIR"/*.log; do
-            [ -f "$f" ] || continue
-            n_notok=$(grep -c "^not ok " "$f" 2>/dev/null || true)
-            if [ "${n_notok:-0}" -gt 0 ]; then
+          grep -E "^FAIL " /tmp/validation-main.log 2>/dev/null | awk '{print $2}' | while IFS= read -r tname; do
+            f="$OUTDIR/$tname.log"
+            if [ -f "$f" ]; then
               echo "=== $(basename "$f") ==="
               head -100 "$f"
               lines=$(wc -l < "$f")

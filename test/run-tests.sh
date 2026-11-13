@@ -588,6 +588,46 @@ run_test "mountLabel does not break mounts" bash -c '
     echo "$output" | grep -qF "DEV-MOUNTED"
 '
 
+# ── 21. what needs a namespace the spec does not give ──
+echo ""
+echo "Namespaces the spec leaves out:"
+
+# As runc: setting the hostname or masking paths without the namespace for
+# it would change the runtime's own, so create refuses.
+BUNDLE_NOUTS=$(mktemp -d /tmp/nacre-test-bundle-XXXX)
+make_bundle "$BUNDLE_NOUTS" '"true"'
+python3 -c "
+import json
+p = '$BUNDLE_NOUTS/config.json'
+c = json.load(open(p))
+c['linux']['namespaces'] = [n for n in c['linux']['namespaces'] if n['type'] != 'uts']
+json.dump(c, open(p, 'w'))
+"
+
+run_test "hostname without a UTS namespace is refused" bash -c '
+    before=$(hostname)
+    output=$(perl '"$NACRE"' --root '"$ROOT"' run --bundle '"$BUNDLE_NOUTS"' test-nouts 2>&1)
+    rc=$?
+    [ $rc -ne 0 ] && echo "$output" | grep -qF "without a private UTS namespace" && [ "$(hostname)" = "$before" ]
+'
+
+BUNDLE_NOMNT=$(mktemp -d /tmp/nacre-test-bundle-XXXX)
+make_bundle "$BUNDLE_NOMNT" '"true"'
+python3 -c "
+import json
+p = '$BUNDLE_NOMNT/config.json'
+c = json.load(open(p))
+c['linux']['namespaces'] = [n for n in c['linux']['namespaces'] if n['type'] != 'mount']
+c['linux']['maskedPaths'] = ['/proc/kcore']
+json.dump(c, open(p, 'w'))
+"
+
+run_test "masked paths without a mount namespace are refused" bash -c '
+    output=$(perl '"$NACRE"' --root '"$ROOT"' run --bundle '"$BUNDLE_NOMNT"' test-nomnt 2>&1)
+    rc=$?
+    [ $rc -ne 0 ] && echo "$output" | grep -qF "without a private MNT namespace"
+'
+
 # ── Summary ──
 echo ""
 echo "═══════════════════════════════════════════"
