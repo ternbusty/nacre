@@ -139,8 +139,16 @@ sub _init_allocate_pty ($spec, $rootfs, $console_socket_path, $pty_sock_fd, $con
     return $pts_fd;
 }
 
-sub _init_enter_rootfs ($rootfs, $no_pivot, $dbg) {
-    if ($no_pivot) {
+sub _init_enter_rootfs ($rootfs, $no_pivot, $own_mnt, $dbg) {
+    if (!$own_mnt) {
+
+        # No mount namespace of its own (none in the spec): pivot_root would
+        # move the runtime's root, so chroot instead, as runc does.
+        $dbg->("no mount namespace: chroot");
+        chdir($rootfs) or fatal("chdir to rootfs: $!");
+        chroot('.') or fatal("chroot(.): $!");
+        chdir('/') or fatal("chdir /: $!");
+    } elsif ($no_pivot) {
         $dbg->("no-pivot: using MS_MOVE + chroot (masking host procfs/sysfs)");
         _mask_host_procfs_sysfs($rootfs);
         chdir($rootfs) or fatal("chdir to rootfs: $!");
@@ -154,8 +162,8 @@ sub _init_enter_rootfs ($rootfs, $no_pivot, $dbg) {
     return;
 }
 
-sub _init_post_pivot ($spec) {
-    apply_rootfs_propagation($spec);
+sub _init_post_pivot ($spec, $own_mnt) {
+    apply_rootfs_propagation($spec) if $own_mnt;
 
     if (my $hostname = $spec->{hostname}) {
         my $nr = SYS_sethostname + 0;
@@ -171,7 +179,11 @@ sub _init_post_pivot ($spec) {
     }
 
     apply_sysctls($spec);
-    set_rootfs_readonly($spec->{root}{readonly});
+
+    # Without a mount namespace of its own these would remount the runtime's
+    # mounts; as in runc they are skipped (masked and readonly paths are then
+    # refused by _validate_namespaces).
+    set_rootfs_readonly($spec->{root}{readonly}) if $own_mnt;
     apply_readonly_paths($spec->{linux}{readonlyPaths});
     apply_masked_paths($spec->{linux}{maskedPaths});
 
@@ -333,9 +345,10 @@ sub run_init_process (    ## no critic (RequireFinalReturn)
 
     _init_run_create_hooks($spec, $rootfs, $id, $bundle, $main_chan_w, $main_chan_r);
 
-    _init_enter_rootfs($rootfs, $no_pivot, $dbg);
+    my $own_mnt = grep {($_->{type} // '') eq 'mount'} @{$spec->{linux}{namespaces} // []};
+    _init_enter_rootfs($rootfs, $no_pivot, $own_mnt, $dbg);
 
-    my $chdir_as_user = _init_post_pivot($spec);
+    my $chdir_as_user = _init_post_pivot($spec, $own_mnt);
 
     _init_setup_stdio($pts_fd, $spec, $dbg);
 
@@ -530,7 +543,21 @@ sub _run_idmap_helper ($helper, $pid, $maps) {
 
 # ── cmd_create helpers ────────────────────────────────────────────────
 
+# As runc's validator: what needs a namespace the spec does not give the
+# container would otherwise change the runtime's own.
+sub _validate_namespaces ($spec) {
+    my %ns = map {(($_->{type} // '') => 1)} @{$spec->{linux}{namespaces} // []};
+    fatal("unable to set hostname without a private UTS namespace")
+        if ($spec->{hostname} // '') ne '' && !$ns{uts};
+    fatal("unable to set domainname without a private UTS namespace")
+        if ($spec->{domainname} // '') ne '' && !$ns{uts};
+    fatal("unable to restrict sys entries without a private MNT namespace")
+        if (@{$spec->{linux}{maskedPaths} // []} || @{$spec->{linux}{readonlyPaths} // []}) && !$ns{mount};
+    return;
+}
+
 sub _validate_create_spec ($spec) {
+    _validate_namespaces($spec);
     if (my $seccomp = $spec->{linux}{seccomp}) {
         my $has_notify = 0;
         for my $rule (@{$seccomp->{syscalls} // []}) {
@@ -712,9 +739,6 @@ sub _create_parse_namespaces ($spec) {
         $has_userns = 1 if $ns->{type} eq 'user';
     }
 
-    unless (grep {$_->{type} eq 'mount'} @$namespaces) {
-        $clone_flags |= CLONE_NEWNS;
-    }
     return ($clone_flags, \@join_ns, $has_userns);
 }
 
