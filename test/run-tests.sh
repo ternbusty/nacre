@@ -559,6 +559,35 @@ run_test "detached container writes to the pipes create was given" bash -c '
     echo "$out" | grep -qx PASSED-THROUGH && echo "$out" | grep -qx TO-STDERR
 '
 
+# ── 20. linux.devices and linux.mountLabel ──
+echo ""
+echo "Devices and mount label:"
+
+BUNDLE_DEV=$(mktemp -d /tmp/nacre-test-bundle-XXXX)
+make_bundle "$BUNDLE_DEV" '"sh", "-c", "stat -c \"%n %t %T %F\" /dev/test1 /dev/test2 /dev/test3"' ', "devices": [
+      { "path": "/dev/test1", "type": "c", "major": 10, "minor": 666, "fileMode": 432 },
+      { "path": "/dev/test2", "type": "b", "major": 8, "minor": 666, "fileMode": 432 },
+      { "path": "/dev/test3", "type": "p", "fileMode": 432 }
+    ]'
+
+# A minor above 255 must keep its high bits, and type "p" is a FIFO.
+run_test "devices get their major, minor and type" bash -c '
+    output=$(perl '"$NACRE"' --root '"$ROOT"' run --bundle '"$BUNDLE_DEV"' test-devices 2>&1)
+    echo "$output" | grep -qx "/dev/test1 a 29a character special file" &&
+    echo "$output" | grep -qx "/dev/test2 8 29a block special file" &&
+    echo "$output" | grep -qx "/dev/test3 0 0 fifo"
+'
+
+BUNDLE_LABEL=$(mktemp -d /tmp/nacre-test-bundle-XXXX)
+make_bundle "$BUNDLE_LABEL" '"sh", "-c", "grep -q \" /dev \" /proc/self/mountinfo && echo DEV-MOUNTED"' \
+    ', "mountLabel": "system_u:object_r:svirt_sandbox_file_t:s0:c715,c811"'
+
+# Where SELinux is not in use the label is ignored, as in runc.
+run_test "mountLabel does not break mounts" bash -c '
+    output=$(perl '"$NACRE"' --root '"$ROOT"' run --bundle '"$BUNDLE_LABEL"' test-label 2>&1)
+    echo "$output" | grep -qF "DEV-MOUNTED"
+'
+
 # ── Summary ──
 echo ""
 echo "═══════════════════════════════════════════"

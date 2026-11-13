@@ -11,7 +11,7 @@ use Nacre::Const qw(
     PR_CAP_AMBIENT PR_CAP_AMBIENT_RAISE
     @CAP_NAMES %CAP_NUM _LINUX_CAPABILITY_VERSION_3
 );
-use Nacre::Util qw(fatal write_file do_syscall);
+use Nacre::Util qw(fatal write_file do_syscall selinux_enabled);
 use Nacre::Seccomp qw(apply_seccomp_raw);
 use Nacre::Caps qw(apply_capabilities_bounding apply_capabilities_final);
 
@@ -602,10 +602,6 @@ sub apply_sysctls ($spec) {
         eval {write_file($path, $sysctls->{$key});};
     }
     return;
-}
-
-sub selinux_enabled () {
-    return -d '/sys/fs/selinux' && -w '/sys/fs/selinux';
 }
 
 # Give the container its own session keyring "_ses.<id>" instead of
