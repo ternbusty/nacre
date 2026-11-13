@@ -53,14 +53,52 @@ sub _init_syscall_table {
     for my $hdr (@hdrs) {
         my $ok = open my $fh, '<', $hdr;
         next unless $ok;
-        while (<$fh>) {
-            $_SYSCALL_NR{$1} = $2 + 0
-                if /^\s*#\s*define\s+__NR(?:3264)?_(\w+)\s+(\d+)/;
-        }
+        %_SYSCALL_NR = _parse_unistd($fh);
         close $fh;
         last if %_SYSCALL_NR;
     }
     return;
+}
+
+# asm-generic/unistd.h (aarch64) numbers some syscalls as __NR3264_<base>
+# and names them through aliases, one set for 64-bit and one for 32-bit:
+#   #if __BITS_PER_LONG == 64 && !defined(__SYSCALL_COMPAT)
+#   #define __NR_newfstatat __NR3264_fstatat
+#   #else
+#   #define __NR_fstatat64 __NR3264_fstatat
+#   #endif
+# Take the 64-bit names; without them a profile's newfstatat, fstat, fcntl,
+# lseek or mmap is unknown and left out of the filter.
+sub _parse_unistd ($fh) {
+    my (%nr, %nr3264, @aliases);
+    my ($depth, $bits64_depth, $in_bits32) = (0, undef, 0);
+    while (my $line = <$fh>) {
+        if ($line =~ /^\s*#\s*if/) {
+            $depth++;
+            $bits64_depth = $depth if $line =~ /__BITS_PER_LONG\s*==\s*64/;
+            next;
+        }
+        if ($line =~ /^\s*#\s*else/) {
+            $in_bits32 = 1 if defined $bits64_depth && $depth == $bits64_depth;
+            next;
+        }
+        if ($line =~ /^\s*#\s*endif/) {
+            ($bits64_depth, $in_bits32) = (undef, 0) if defined $bits64_depth && $depth == $bits64_depth;
+            $depth--;
+            next;
+        }
+        next unless $line =~ /^\s*#\s*define\s+__NR(3264)?_(\w+)\s+(\w+)/;
+        my ($is3264, $name, $value) = ($1, $2, $3);
+        if ($value =~ /^\d+$/) {
+            ($is3264 ? $nr3264{$name} : $nr{$name}) = $value + 0;
+        } elsif (!$is3264 && !$in_bits32 && $value =~ /^__NR3264_(\w+)$/) {
+            push @aliases, [$name, $1];
+        }
+    }
+    for my $a (@aliases) {
+        $nr{$a->[0]} = $nr3264{$a->[1]} if defined $nr3264{$a->[1]};
+    }
+    return %nr;
 }
 
 # The table is filled when this module loads, from the host's headers. Never
