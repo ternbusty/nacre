@@ -86,7 +86,14 @@ jobs:
           PASS=0; FAIL=0; ERROR=0; TIMEOUT=0
 
           SKIP_V1='^(linux_cgroups_(network|blkio|hugetlb|devices|pids|relative_(blkio|network|hugetlb|devices|pids))|linux_cgroups_relative_cpus|linux_cgroups_relative_memory|linux_cgroups_cpus|linux_cgroups_memory|delete_(only_create_)?resources)$'
-          SKIP_BROKEN='^(pidfile|process_rlimits|linux_ns_itype|process_capabilities_fail|linux_uid_mappings)$'
+          # hooks, prestart, poststart and poststart_fail report the same
+          # errors with runc 1.3.4: hooks expects "post-start1" where its hook
+          # writes "post-start1 called", and prestart expects prestart hooks
+          # after start, which runtime-spec now runs during create.
+          SKIP_BROKEN='^(pidfile|process_rlimits|linux_ns_itype|process_capabilities_fail|linux_uid_mappings|hooks|prestart|poststart|poststart_fail)$'
+          # Lifecycle tests that print no ok/not ok lines and report only a
+          # failure, as an "error" diagnostic or a nonzero exit.
+          NO_ASSERTIONS='^(poststop|poststop_fail|prestart_fail|process_rlimits_fail)$'
           SKIP_V1_N=0; SKIP_BROKEN_N=0
 
           for t in validation/*/*.t; do
@@ -130,27 +137,66 @@ jobs:
               continue
             fi
 
-            n_ok=0; n_notok=0
+            # runtimetest's own TAP is how a test that runs it inside the
+            # container reports: printed as is, or embedded as the "stdout"
+            # of a diagnostic when the test passes its TAP along.
+            src="${t%.t}.go"
+            inside=0; tap_is_nil=0
+            while IFS= read -r line; do
+              case "$line" in
+                *"RuntimeInsideValidate(g, nil"*) inside=1; tap_is_nil=1 ;;
+                *"RuntimeInsideValidate("*)       inside=1 ;;
+              esac
+            done < "$src"
+
+            n_ok=0; n_notok=0; n_error=0; rt_header=0; rt_embedded=0; rt_empty=0
             if [ -f "$out" ]; then
               while IFS= read -r line; do
                 case "$line" in
                   "not ok "*)  n_notok=$((n_notok+1)) ;;
                   "ok "*)      n_ok=$((n_ok+1)) ;;
+                  "TAP version 13") rt_header=$((rt_header+1)) ;;
+                esac
+                case "$line" in
+                  '    "error": '*)                 n_error=$((n_error+1)) ;;
+                  *'"stdout": "TAP version 13'*)  rt_embedded=$((rt_embedded+1)) ;;
+                  *'"stdout": ""'*)               rt_empty=$((rt_empty+1)) ;;
                 esac
               done < "$out"
+            fi
+
+            # A test that runs runtimetest but got none of its output has
+            # checked nothing inside the container.
+            rt_missing=0
+            if [ "$inside" -eq 1 ] && ! [[ "$name" =~ $NO_ASSERTIONS ]]; then
+              if [ "$tap_is_nil" -eq 1 ]; then
+                [ "$rt_header" -gt 0 ] || rt_missing=1
+              else
+                { [ "$rt_embedded" -gt 0 ] && [ "$rt_empty" -eq 0 ]; } || rt_missing=1
+              fi
             fi
 
             if [ "$n_notok" -gt 0 ]; then
               FAIL=$((FAIL+1))
               echo "FAIL     $name  ok=$n_ok notok=$n_notok"
+            elif [ "$rt_missing" -eq 1 ]; then
+              FAIL=$((FAIL+1))
+              echo "FAIL     $name  ok=$n_ok (no runtimetest output)"
             elif [ "$n_ok" -gt 0 ]; then
               PASS=$((PASS+1))
               echo "PASS     $name  ok=$n_ok"
             elif [ "$rc" -ne 0 ]; then
               ERROR=$((ERROR+1))
               echo "ERROR    $name  rc=$rc"
+            elif [ "$n_error" -gt 0 ]; then
+              FAIL=$((FAIL+1))
+              echo "FAIL     $name  (error diagnostic)"
+            elif [[ "$name" =~ $NO_ASSERTIONS ]]; then
+              PASS=$((PASS+1))
+              echo "PASS     $name  (no assertions; no error)"
             else
-              echo "SKIP     $name"
+              FAIL=$((FAIL+1))
+              echo "FAIL     $name  (no results)"
             fi
           done
 
@@ -177,10 +223,9 @@ jobs:
 
           # Show failing test logs
           echo "::group::Failing test details"
-          for f in "$OUTDIR"/*.log; do
-            [ -f "$f" ] || continue
-            n_notok=$(grep -c "^not ok " "$f" 2>/dev/null || true)
-            if [ "${n_notok:-0}" -gt 0 ]; then
+          grep -E "^FAIL " /tmp/validation-main.log 2>/dev/null | awk '{print $2}' | while IFS= read -r tname; do
+            f="$OUTDIR/$tname.log"
+            if [ -f "$f" ]; then
               echo "=== $(basename "$f") ==="
               head -100 "$f"
               lines=$(wc -l < "$f")
