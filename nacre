@@ -229,22 +229,12 @@ sub _init_post_start ($spec, $id, $bundle) {
     return;
 }
 
-sub _is_named_fifo ($fd_num) {
-    my $link = readlink("/proc/self/fd/$fd_num") // '';
-    return -p "/proc/self/fd/$fd_num" && $link =~ m{^/};
-}
-
-sub _init_setup_stdio ($foreground, $pts_fd, $spec, $dbg) {
-    if (!$foreground && !defined $pts_fd) {
-        open STDIN, '<', '/dev/null' or fatal("open /dev/null for STDIN: $!");
-        if (!_is_named_fifo(1)) {
-            open STDOUT, '>', '/dev/null' or fatal("open /dev/null for STDOUT: $!");
-        }
-        if (!_is_named_fifo(2)) {
-            open STDERR, '>', '/dev/null' or fatal("open /dev/null for STDERR: $!");
-        }
-    }
-
+# Without a terminal the container gets nacre's stdin, stdout and stderr as
+# they are, detached or not, as runc does: a container manager passes the
+# pipes it reads the container's output from (containerd's shim passes
+# anonymous pipes). A caller that must not wait for the container, such as
+# output=$(nacre create ...), redirects them itself.
+sub _init_setup_stdio ($pts_fd, $spec, $dbg) {
     if (defined $pts_fd) {
         my $uid = $spec->{process}{user}{uid} // 0;
         do_syscall(SYS_fchown, $pts_fd, $uid, 5);
@@ -301,7 +291,7 @@ sub _init_run_create_hooks ($spec, $rootfs, $id, $bundle, $main_chan_w, $main_ch
 sub run_init_process (    ## no critic (RequireFinalReturn)
     $spec, $rootfs, $notify_fd, $main_chan_w, $main_chan_r,
     $cgpath, $id, $bundle, $console_socket_path, $debug_fd,
-    $no_pivot, $foreground, $pty_sock_fd, $mount_source_fds, $console_socket_prefd,
+    $no_pivot, $pty_sock_fd, $mount_source_fds, $console_socket_prefd,
 ) {
 
     my $dbg = sub {
@@ -347,7 +337,7 @@ sub run_init_process (    ## no critic (RequireFinalReturn)
 
     my $chdir_as_user = _init_post_pivot($spec);
 
-    _init_setup_stdio($foreground, $pts_fd, $spec, $dbg);
+    _init_setup_stdio($pts_fd, $spec, $dbg);
 
     # Apply process security (NNP, seccomp, caps, setuid/setgid) BEFORE
     # signalling init_ready.  This matches runc: all security is applied
@@ -733,7 +723,7 @@ sub _create_child_process (    ## no critic (Subroutines::ProhibitManyArgs Requi
     $spec, $p_bundle, $has_userns, $clone_flags,
     $main_w_fd, $init_r_fd, $pty_child_sock,
     $init_debug_fd_pre, $notify_srv, $rootfs,
-    $cgpath, $id, $bundle, $no_pivot, $foreground,
+    $cgpath, $id, $bundle, $no_pivot,
     $console_socket, $join_ns_ref,
 ) {
     close $main_r_fh;
@@ -770,7 +760,7 @@ sub _create_child_process (    ## no critic (Subroutines::ProhibitManyArgs Requi
 
     try {
         run_init_process($spec, $rootfs, $notify_srv, $main_w_fd, $init_r_fd, $cgpath,
-            $id, $bundle, $console_socket_path, $init_debug_fd, $no_pivot, $foreground,
+            $id, $bundle, $console_socket_path, $init_debug_fd, $no_pivot,
             $pty_sock_fd, \%mount_source_fds, $console_socket_preconnected_fd);
     } catch ($e) {
         my $err = "$e";
@@ -1185,7 +1175,7 @@ sub cmd_create (%p) {
             $spec, $p{bundle}, $has_userns, $clone_flags,
             $main_w_fd, $init_r_fd, $pty_child_sock,
             $init_debug_fd_pre, $notify_srv, $rootfs,
-            $cgpath, $id, $bundle, $no_pivot, $p{foreground},
+            $cgpath, $id, $bundle, $no_pivot,
             $p{console_socket}, \@join_ns,
         );
     }
@@ -1427,7 +1417,7 @@ sub cmd_run (%p) {
     my $pr_opt = PR_SET_CHILD_SUBREAPER + 0;
     my $sr_ret = syscall($pr_nr, $pr_opt, 1, 0, 0, 0);
 
-    # Create (foreground: keep stdio so user sees container output)
+    # Create (foreground: with a terminal and no console socket, run holds the pty)
     my $state = cmd_create(%p, foreground => 1, _command => 'run');
 
     # Set PTY to raw mode BEFORE sending the start signal.  The slave's

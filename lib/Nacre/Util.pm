@@ -240,7 +240,13 @@ sub wait_until ($timeout, $done) {
     return 1;
 }
 
+# SELinux is in use when selinuxfs is mounted and writable.
+sub selinux_enabled () {
+    return -d '/sys/fs/selinux' && -w '/sys/fs/selinux';
+}
+
 our @EXPORT_OK = qw(
+    selinux_enabled
     $JSON $JSON_COMPACT
     $LOG_FH $LOG_DEBUG
 

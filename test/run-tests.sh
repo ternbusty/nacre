@@ -128,6 +128,23 @@ assert_output_matches() {
 
 nacre() { perl "$NACRE" --root "$ROOT" "$@"; }
 
+# A container without a terminal keeps the stdio it was created with, as
+# with runc. Give create its own so that run_test, which reads the test's
+# output from a pipe, does not wait for the container to exit.
+nacre_create() {
+    local err
+    err=$(mktemp /tmp/nacre-test-create-XXXX)
+    if perl "$NACRE" --root "$ROOT" create "$@" </dev/null >/dev/null 2>"$err"; then
+        rm -f "$err"
+        return 0
+    fi
+    cat "$err" >&2
+    rm -f "$err"
+    return 1
+}
+export NACRE ROOT
+export -f nacre_create
+
 delete_container() {
     nacre delete --force "$1" 2>/dev/null || true
 }
@@ -171,7 +188,7 @@ make_bundle "$BUNDLE" '"sh", "-c", "sleep 30"'
 
 run_test "create" bash -c '
     nacre() { perl '"$NACRE"' --root '"$ROOT"' "$@"; }
-    nacre create --bundle '"$BUNDLE"' test-lifecycle
+    nacre_create --bundle '"$BUNDLE"' test-lifecycle
 '
 
 run_test "state shows created" bash -c '
@@ -281,7 +298,7 @@ make_bundle "$BUNDLE_LIST" '"sleep", "30"'
 
 run_test "list shows created container" bash -c '
     nacre() { perl '"$NACRE"' --root '"$ROOT"' "$@"; }
-    nacre create --bundle '"$BUNDLE_LIST"' test-list
+    nacre_create --bundle '"$BUNDLE_LIST"' test-list
     output=$(nacre list)
     echo "$output" | grep -qF "test-list"
     nacre delete --force test-list
@@ -289,7 +306,7 @@ run_test "list shows created container" bash -c '
 
 run_test "list --quiet shows only IDs" bash -c '
     nacre() { perl '"$NACRE"' --root '"$ROOT"' "$@"; }
-    nacre create --bundle '"$BUNDLE_LIST"' test-list-q
+    nacre_create --bundle '"$BUNDLE_LIST"' test-list-q
     output=$(nacre list --quiet)
     [ "$output" = "test-list-q" ]
     nacre delete --force test-list-q
@@ -297,7 +314,7 @@ run_test "list --quiet shows only IDs" bash -c '
 
 run_test "list --format json" bash -c '
     nacre() { perl '"$NACRE"' --root '"$ROOT"' "$@"; }
-    nacre create --bundle '"$BUNDLE_LIST"' test-list-j
+    nacre_create --bundle '"$BUNDLE_LIST"' test-list-j
     output=$(nacre list --format json)
     echo "$output" | python3 -m json.tool > /dev/null
     nacre delete --force test-list-j
@@ -312,7 +329,7 @@ make_bundle "$BUNDLE_FD" '"sleep", "30"'
 
 run_test "force delete running container" bash -c '
     nacre() { perl '"$NACRE"' --root '"$ROOT"' "$@"; }
-    nacre create --bundle '"$BUNDLE_FD"' test-force
+    nacre_create --bundle '"$BUNDLE_FD"' test-force
     nacre start test-force
     nacre delete --force test-force
     ! nacre state test-force 2>/dev/null
@@ -343,7 +360,7 @@ make_bundle "$BUNDLE_SIG" '"sleep", "30"'
 
 run_test "kill with signal name TERM" bash -c '
     nacre() { perl '"$NACRE"' --root '"$ROOT"' "$@"; }
-    nacre create --bundle '"$BUNDLE_SIG"' test-sig1
+    nacre_create --bundle '"$BUNDLE_SIG"' test-sig1
     nacre start test-sig1
     sleep 0.2
     nacre kill test-sig1 KILL
@@ -355,7 +372,7 @@ run_test "kill with signal name TERM" bash -c '
 
 run_test "kill with signal number 9" bash -c '
     nacre() { perl '"$NACRE"' --root '"$ROOT"' "$@"; }
-    nacre create --bundle '"$BUNDLE_SIG"' test-sig2
+    nacre_create --bundle '"$BUNDLE_SIG"' test-sig2
     nacre start test-sig2
     sleep 0.2
     nacre kill test-sig2 9
@@ -374,7 +391,7 @@ make_bundle "$BUNDLE_PR" '"sleep", "30"'
 
 run_test "pause and resume" bash -c '
     nacre() { perl '"$NACRE"' --root '"$ROOT"' "$@"; }
-    nacre create --bundle '"$BUNDLE_PR"' test-pause
+    nacre_create --bundle '"$BUNDLE_PR"' test-pause
     nacre start test-pause
     sleep 0.2
     nacre pause test-pause
@@ -395,7 +412,7 @@ make_bundle "$BUNDLE_EXEC" '"sleep", "30"'
 
 run_test "exec in running container" bash -c '
     nacre() { perl '"$NACRE"' --root '"$ROOT"' "$@"; }
-    nacre create --bundle '"$BUNDLE_EXEC"' test-exec
+    nacre_create --bundle '"$BUNDLE_EXEC"' test-exec
     nacre start test-exec
     sleep 0.3
     output=$(nacre exec test-exec -- echo exec-works 2>&1)
@@ -412,7 +429,7 @@ make_bundle "$BUNDLE_EV" '"sleep", "30"'
 
 run_test "events --stats" bash -c '
     nacre() { perl '"$NACRE"' --root '"$ROOT"' "$@"; }
-    nacre create --bundle '"$BUNDLE_EV"' test-events
+    nacre_create --bundle '"$BUNDLE_EV"' test-events
     nacre start test-events
     sleep 0.3
     output=$(nacre events --stats test-events 2>&1)
@@ -429,7 +446,7 @@ make_bundle "$BUNDLE_PS" '"sleep", "30"'
 
 run_test "ps lists container processes" bash -c '
     nacre() { perl '"$NACRE"' --root '"$ROOT"' "$@"; }
-    nacre create --bundle '"$BUNDLE_PS"' test-ps
+    nacre_create --bundle '"$BUNDLE_PS"' test-ps
     nacre start test-ps
     sleep 0.3
     output=$(nacre ps test-ps 2>&1)
@@ -450,7 +467,7 @@ make_bundle "$BUNDLE_CG" '"sleep", "30"' ',
 
 run_test "memory limit applied" bash -c '
     nacre() { perl '"$NACRE"' --root '"$ROOT"' "$@"; }
-    nacre create --bundle '"$BUNDLE_CG"' test-cg
+    nacre_create --bundle '"$BUNDLE_CG"' test-cg
     nacre start test-cg
     sleep 0.2
     cgpath=$(python3 -c "import json; print(json.load(open('"$ROOT"/test-cg/state.json'))[\"cgroupPath\"])" 2>/dev/null) || cgpath="/sys/fs/cgroup/nacre/test-cg"
@@ -461,7 +478,7 @@ run_test "memory limit applied" bash -c '
 
 run_test "pids limit applied" bash -c '
     nacre() { perl '"$NACRE"' --root '"$ROOT"' "$@"; }
-    nacre create --bundle '"$BUNDLE_CG"' test-cg-pid
+    nacre_create --bundle '"$BUNDLE_CG"' test-cg-pid
     nacre start test-cg-pid
     sleep 0.2
     cgpath=$(python3 -c "import json; print(json.load(open('"$ROOT"/test-cg-pid/state.json'))[\"cgroupPath\"])" 2>/dev/null) || cgpath="/sys/fs/cgroup/nacre/test-cg-pid"
@@ -479,7 +496,7 @@ make_bundle "$BUNDLE_UP" '"sleep", "30"'
 
 run_test "update memory limit" bash -c '
     nacre() { perl '"$NACRE"' --root '"$ROOT"' "$@"; }
-    nacre create --bundle '"$BUNDLE_UP"' test-update
+    nacre_create --bundle '"$BUNDLE_UP"' test-update
     nacre start test-update
     sleep 0.2
     echo "{\"memory\":{\"limit\":268435456}}" | nacre update test-update
@@ -523,6 +540,52 @@ done
 run_test "image perl modules are not loaded by the runtime" bash -c '
     output=$(perl '"$NACRE"' --root '"$ROOT"' run --bundle '"$BUNDLE_PLANT"' test-seccomp-plant 2>&1)
     echo "$output" | grep -qF "CONTAINER-RAN" && [ ! -e '"$BUNDLE_PLANT"'/rootfs/tmp/image-code-ran ]
+'
+
+# ── 19. stdio of a container without a terminal ──
+echo ""
+echo "Detached stdio:"
+
+BUNDLE_STDIO=$(mktemp -d /tmp/nacre-test-bundle-XXXX)
+make_bundle "$BUNDLE_STDIO" '"sh", "-c", "echo PASSED-THROUGH; echo TO-STDERR >&2"'
+
+# containerd's shim hands create anonymous pipes and reads the container's
+# output from them, as here.
+run_test "detached container writes to the pipes create was given" bash -c '
+    nacre() { perl '"$NACRE"' --root '"$ROOT"' "$@"; }
+    out=$( { nacre create --bundle '"$BUNDLE_STDIO"' test-stdio </dev/null 2>&1
+             nacre start test-stdio </dev/null >/dev/null 2>&1; } | cat )
+    nacre delete --force test-stdio
+    echo "$out" | grep -qx PASSED-THROUGH && echo "$out" | grep -qx TO-STDERR
+'
+
+# ── 20. linux.devices and linux.mountLabel ──
+echo ""
+echo "Devices and mount label:"
+
+BUNDLE_DEV=$(mktemp -d /tmp/nacre-test-bundle-XXXX)
+make_bundle "$BUNDLE_DEV" '"sh", "-c", "stat -c \"%n %t %T %F\" /dev/test1 /dev/test2 /dev/test3"' ', "devices": [
+      { "path": "/dev/test1", "type": "c", "major": 10, "minor": 666, "fileMode": 432 },
+      { "path": "/dev/test2", "type": "b", "major": 8, "minor": 666, "fileMode": 432 },
+      { "path": "/dev/test3", "type": "p", "fileMode": 432 }
+    ]'
+
+# A minor above 255 must keep its high bits, and type "p" is a FIFO.
+run_test "devices get their major, minor and type" bash -c '
+    output=$(perl '"$NACRE"' --root '"$ROOT"' run --bundle '"$BUNDLE_DEV"' test-devices 2>&1)
+    echo "$output" | grep -qx "/dev/test1 a 29a character special file" &&
+    echo "$output" | grep -qx "/dev/test2 8 29a block special file" &&
+    echo "$output" | grep -qx "/dev/test3 0 0 fifo"
+'
+
+BUNDLE_LABEL=$(mktemp -d /tmp/nacre-test-bundle-XXXX)
+make_bundle "$BUNDLE_LABEL" '"sh", "-c", "grep -q \" /dev \" /proc/self/mountinfo && echo DEV-MOUNTED"' \
+    ', "mountLabel": "system_u:object_r:svirt_sandbox_file_t:s0:c715,c811"'
+
+# Where SELinux is not in use the label is ignored, as in runc.
+run_test "mountLabel does not break mounts" bash -c '
+    output=$(perl '"$NACRE"' --root '"$ROOT"' run --bundle '"$BUNDLE_LABEL"' test-label 2>&1)
+    echo "$output" | grep -qF "DEV-MOUNTED"
 '
 
 # ── Summary ──

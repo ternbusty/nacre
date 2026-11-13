@@ -23,7 +23,7 @@ use Nacre::Const qw(
     MOUNT_ATTR__ATIME MOUNT_ATTR_IDMAP
     OPEN_TREE_CLONE OPEN_TREE_CLOEXEC MOVE_MOUNT_F_EMPTY_PATH
 );
-use Nacre::Util qw(log_debug fatal write_file ensure_dir do_syscall do_unshare);
+use Nacre::Util qw(log_debug fatal write_file ensure_dir do_syscall do_unshare selinux_enabled);
 use Nacre::IPC qw(channel_send channel_recv send_fd_over_fd recv_fd_over_fd);
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -962,7 +962,9 @@ sub apply_mounts ($spec, $rootfs, $mount_source_fds, $chan_w, $chan_r) {
     $mount_source_fds //= {};
     log_debug("applying mounts, rootfs=$rootfs");
 
-    my $mount_label = $spec->{linux}{mountLabel} // '';
+    # As in runc, the label is applied only where SELinux is in use: without
+    # it the kernel rejects the context= option and the mount fails.
+    my $mount_label = selinux_enabled() ? $spec->{linux}{mountLabel} // '' : '';
 
     # Track /dev ro remount: defer MS_RDONLY on /dev until after device creation
     my $dev_needs_ro = 0;
@@ -1010,6 +1012,15 @@ sub _merge_spec_devices ($spec) {
     return @devices;
 }
 
+# linux.devices[].type: "c" and "u" (unbuffered) are character devices.
+my %DEVICE_TYPES = (c => S_IFCHR, u => S_IFCHR, b => S_IFBLK, p => S_IFIFO);
+
+# The dev_t layout mknod(2) takes (the kernel's new_encode_dev): the low 8
+# bits of minor, then 12 bits of major, then the rest of minor.
+sub _encode_dev ($major, $minor) {
+    return (($minor & 0xff) | (($major & 0xfff) << 8) | (($minor & ~0xff) << 12)) + 0;
+}
+
 sub create_devices ($rootfs, $spec) {
 
     my @devices = _merge_spec_devices($spec);
@@ -1021,8 +1032,8 @@ sub create_devices ($rootfs, $spec) {
 
         # Try mknod first (gives us correct ownership/mode)
         unlink $dest if -e $dest;
-        my $dev_num = (($dev->{major} << 8) | $dev->{minor}) + 0;
-        my $ftype = $dev->{type} eq 'b' ? S_IFBLK : S_IFCHR;
+        my $dev_num = _encode_dev($dev->{major} // 0, $dev->{minor} // 0);
+        my $ftype = $DEVICE_TYPES{$dev->{type}} // S_IFCHR;
 
         # OCI spec default fileMode is 0666 when not specified
         my $file_mode = defined $dev->{mode} ? ($dev->{mode} & 0o7777) : 0o666;
