@@ -41,16 +41,6 @@ jobs:
           cd runtime-tools
           make runtimetest validation-executables
 
-      - name: Diagnose runtimetest under RLIMIT_AS (temporary)
-        run: |
-          cd $HOME/runtime-tools
-          for as in 1073741824 2147483648 4294967296; do
-            echo "== RLIMIT_AS soft=$as"
-            prlimit --as=$as:$((as * 2)) ./runtimetest --help > /tmp/rt-diag.out 2>&1
-            echo "rc=$?"; head -5 /tmp/rt-diag.out
-          done
-          ulimit -a
-
       - name: Build busybox rootfs tarball
         run: |
           set -eux
@@ -115,6 +105,13 @@ jobs:
           #                    runc ignores it and its bats "runc run with
           #                    unknown capability" requires that.
           SKIP_BROKEN='^(pidfile|hooks|prestart|poststart|poststart_fail|process_capabilities_fail)$'
+          # process_rlimits on arm64: the test sets a 1 GiB RLIMIT_AS, and under
+          # it runtimetest crashes with SIGSEGV on its own, outside any
+          # container (prlimit --as=1073741824 ./runtimetest --help), so no
+          # runtime gets its checks there. x86_64 still runs it.
+          if [ "$(uname -m)" = aarch64 ]; then
+            SKIP_BROKEN='^(pidfile|hooks|prestart|poststart|poststart_fail|process_capabilities_fail|process_rlimits)$'
+          fi
           # Single assertions no runtime passes, not counted as failures.
           # process_rlimits: runtimetest is a Go program, and Go raises its
           # soft RLIMIT_NOFILE to the hard limit at startup, before the check
