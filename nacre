@@ -3,23 +3,35 @@
 use v5.38;
 use feature 'try', 'defer';
 no warnings 'experimental::try', 'experimental::defer';
+
+# "state" and "list" are called often (container managers poll them) and
+# only read state.json: answer them here, before the rest of this file --
+# most of the start-up time -- is compiled. Nacre::FastPath returns for
+# anything it does not handle exactly like the regular path.
+BEGIN {
+    if (grep {$_ eq 'state' || $_ eq 'list'} @ARGV) {
+        require FindBin;
+        unshift @INC, "$FindBin::RealBin/lib";
+        require Nacre::FastPath;
+        Nacre::FastPath::try_fast(\@ARGV);
+    }
+}
 use POSIX qw(setsid _exit dup2 mkfifo WNOHANG WIFEXITED WEXITSTATUS
     WIFSIGNALED WTERMSIG :sys_wait_h :signal_h :errno_h);
 use Socket qw(AF_UNIX SOCK_STREAM pack_sockaddr_un);
-use JSON::PP;
 use File::Basename qw(basename dirname);
 use Fcntl qw(:flock :mode :seek O_RDONLY O_WRONLY O_RDWR O_CREAT
-    O_TRUNC O_EXCL O_NONBLOCK O_NOCTTY
+    O_TRUNC O_EXCL O_NONBLOCK O_NOCTTY O_DIRECTORY
     F_GETFD F_SETFD FD_CLOEXEC);
-use Getopt::Long qw(:config pass_through no_auto_abbrev);
 use Time::HiRes qw(usleep);
 use Cwd qw(abs_path getcwd);
 use Errno qw(EINTR EAGAIN EWOULDBLOCK ENOENT EEXIST EBUSY EPERM ENOSYS EACCES EOVERFLOW);
 use FindBin;
 use lib "$FindBin::RealBin/lib";
+use Nacre::Getopt qw(GetOptions);
 use Nacre::Const qw(
     O_CLOEXEC O_PATH
-    SYS_unshare SYS_setns SYS_prctl SYS_pidfd_open SYS_close_range
+    SYS_unshare SYS_setns SYS_prctl SYS_pidfd_open SYS_close_range SYS_clone3
     SYS_sethostname SYS_setdomainname SYS_setgroups SYS_fchown SYS_waitid
     CLONE_NEWNS CLONE_NEWUSER CLONE_NEWPID CLONE_NEWCGROUP CLONE_NEWTIME
     SIGCHLD MS_MOVE
@@ -35,39 +47,44 @@ use Nacre::Util qw(
     setup_logging log_debug fatal parse_size
     write_file read_file read_file_or_die ensure_dir iso8601_now do_syscall
     do_setns do_unshare wait_exit_code lookup_home_from_passwd
+    pidfd_wait wait_until
 );
-use Nacre::Seccomp qw(apply_seccomp_raw);
-use Nacre::Device qw(apply_device_cgroup);
-use Nacre::Net qw(move_net_devices rename_net_devices);
 use Nacre::IPC qw(
     create_channel channel_send channel_recv
     create_notify_listener wait_for_start notify_container_start
     send_fd_via_socket send_fd_over_fd recv_fd_over_fd pty_set_raw
 );
-use Nacre::Caps qw(validate_capabilities);
-use Nacre::Cgroup qw(
-    cgroup_path cgroup_setup cgroup_apply_resources
+use Nacre::State qw(
+    load_spec cache_spec load_cached_spec default_spec rootless_default_root
+    state_dir load_state save_state delete_state refresh_state
+    get_pid_starttime oci_state_json
+);
+
+# Only container setup needs these; most other commands never load them.
+# cmd_create and cmd_exec load them all up front (see Nacre::Lazy).
+use Nacre::FastPath qw(cmd_state cmd_list);
+use Nacre::Lazy 'Nacre::Seccomp' => qw(apply_seccomp_raw);
+use Nacre::Lazy 'Nacre::Device' => qw(apply_device_cgroup);
+use Nacre::Lazy 'Nacre::Net' => qw(move_net_devices rename_net_devices);
+use Nacre::Lazy 'Nacre::Caps' => qw(validate_capabilities);
+use Nacre::Lazy 'Nacre::Cgroup' => qw(
+    cgroup_path cgroup_rootless_path cgroup_setup cgroup_apply_resources cgroup_apply_pids
     cgroup_add_process cgroup_cleanup cgroup_pids cg_read cg_write
 );
-use Nacre::Process qw(
-    apply_process_security validate_rlimits apply_rlimits
+use Nacre::Lazy 'Nacre::Process' => qw(
+    apply_process_security apply_personality validate_rlimits apply_rlimits
     apply_iopriority apply_scheduler
     validate_memory_policy apply_memory_policy apply_timens_offsets
     apply_cpu_affinity_reset apply_exec_cpu_affinity apply_final_cpu_affinity
     apply_exec_caps apply_sysctls
+    selinux_enabled apply_selinux_exec_label join_session_keyring
 );
-use Nacre::State qw(
-    load_spec cache_spec load_cached_spec default_spec
-    state_dir load_state save_state delete_state refresh_state
-    get_pid_starttime oci_state_json
-);
-use Nacre::Hooks qw(run_hooks);
-use Nacre::Mount qw(
+use Nacre::Lazy 'Nacre::Hooks' => qw(run_hooks);
+use Nacre::Lazy 'Nacre::Mount' => qw(
     do_mount do_mount_setattr
     prepare_rootfs apply_mounts apply_pivot_root apply_rootfs_propagation
     apply_masked_paths apply_readonly_paths set_rootfs_readonly
     _mask_host_procfs_sysfs _create_userns_from_strings
-    %MOUNT_FLAGS
 );
 
 # -- Default root path for state --
@@ -158,7 +175,17 @@ sub _init_post_pivot ($spec) {
     apply_readonly_paths($spec->{linux}{readonlyPaths});
     apply_masked_paths($spec->{linux}{maskedPaths});
 
+    # As in runc: if we cannot enter cwd yet, it may be accessible only to
+    # the container user; retry after switching to it (returns true).
     my $cwd = $spec->{process}{cwd} // '/';
+    return 0 if chdir($cwd);
+    fatal("chdir to cwd '$cwd': $!") unless $! == EACCES || $! == EPERM;
+    return 1;
+}
+
+sub _init_chdir_as_user ($spec, $needed) {
+    return unless $needed;
+    my $cwd = $spec->{process}{cwd};
     chdir($cwd) or fatal("chdir to cwd '$cwd': $!");
     return;
 }
@@ -202,11 +229,20 @@ sub _init_post_start ($spec, $id, $bundle) {
     return;
 }
 
+sub _is_named_fifo ($fd_num) {
+    my $link = readlink("/proc/self/fd/$fd_num") // '';
+    return -p "/proc/self/fd/$fd_num" && $link =~ m{^/};
+}
+
 sub _init_setup_stdio ($foreground, $pts_fd, $spec, $dbg) {
     if (!$foreground && !defined $pts_fd) {
         open STDIN, '<', '/dev/null' or fatal("open /dev/null for STDIN: $!");
-        open STDOUT, '>', '/dev/null' or fatal("open /dev/null for STDOUT: $!");
-        open STDERR, '>', '/dev/null' or fatal("open /dev/null for STDERR: $!");
+        if (!_is_named_fifo(1)) {
+            open STDOUT, '>', '/dev/null' or fatal("open /dev/null for STDOUT: $!");
+        }
+        if (!_is_named_fifo(2)) {
+            open STDERR, '>', '/dev/null' or fatal("open /dev/null for STDERR: $!");
+        }
     }
 
     if (defined $pts_fd) {
@@ -227,6 +263,41 @@ sub _init_setup_stdio ($foreground, $pts_fd, $spec, $dbg) {
     return;
 }
 
+# createRuntime and createContainer hooks run once the mounts are set up but
+# before pivot_root, as in runc: the container's mount namespace still sees
+# the host paths (bundle, rootfs), which these hooks commonly bind-mount
+# from. createRuntime runs in the runtime's namespaces, so the main process
+# runs it on our request; createContainer runs here, in the container's
+# namespaces, from the rootfs directory.
+sub _init_run_create_hooks ($spec, $rootfs, $id, $bundle, $main_chan_w, $main_chan_r) {
+    my $hooks = $spec->{hooks} // return;
+
+    if (@{$hooks->{createRuntime} // []}) {
+        channel_send($main_chan_w, {type => 'create_runtime_hooks'});
+        my $resp = channel_recv($main_chan_r);
+        if (!$resp || $resp->{type} ne 'create_runtime_hooks_done') {
+            my $err = $resp ? ($resp->{error} // 'unknown error') : 'no response';
+            $err =~ s/^nacre: //;
+            fatal($err);
+        }
+    }
+
+    if (@{$hooks->{createContainer} // []}) {
+        chdir($rootfs) or fatal("chdir to rootfs: $!");
+        my $state = {
+            ociVersion => $spec->{ociVersion} // '1.2.0',
+            id => $id,
+            status => 'creating',
+            pid => $$,
+            bundle => $bundle,
+            rootfs => $rootfs,
+            annotations => $spec->{annotations} // {},
+        };
+        run_hooks($hooks->{createContainer}, $state, must_succeed => 1, type => 'createContainer');
+    }
+    return;
+}
+
 sub run_init_process (    ## no critic (RequireFinalReturn)
     $spec, $rootfs, $notify_fd, $main_chan_w, $main_chan_r,
     $cgpath, $id, $bundle, $console_socket_path, $debug_fd,
@@ -243,6 +314,9 @@ sub run_init_process (    ## no critic (RequireFinalReturn)
     log_debug("nsexec container setup");
     log_debug("child process in init()");
 
+    my $has_userns = grep {($_->{type} // '') eq 'user'} @{$spec->{linux}{namespaces} // []};
+    join_session_keyring($id, $spec->{process}{selinuxLabel}, $has_userns ? 0x8 : 0x80000);
+
     # Rename network devices that were moved into our net namespace
     # by the main process.  This must happen before rootfs setup
     # (before pivot_root changes our filesystem view).
@@ -251,6 +325,9 @@ sub run_init_process (    ## no critic (RequireFinalReturn)
     }
 
     # Setup rootfs (mounts, devices, symlinks)
+    my $has_cgroupns = grep {($_->{type} // '') eq 'cgroup' && !$_->{path}} @{$spec->{linux}{namespaces} // []};
+    no warnings 'once';    # Nacre::Mount is loaded lazily
+    local $Nacre::Mount::CGROUP_NS_PATH = $cgpath if $has_cgroupns;
     prepare_rootfs($spec, $rootfs, $mount_source_fds, $main_chan_w, $main_chan_r);
 
     # Allocate PTY from the container's devpts (set up by prepare_rootfs).
@@ -264,9 +341,11 @@ sub run_init_process (    ## no critic (RequireFinalReturn)
         $pts_fd = _init_allocate_pty($spec, $rootfs, $console_socket_path, $pty_sock_fd, $console_socket_prefd, $dbg,);
     }
 
+    _init_run_create_hooks($spec, $rootfs, $id, $bundle, $main_chan_w, $main_chan_r);
+
     _init_enter_rootfs($rootfs, $no_pivot, $dbg);
 
-    _init_post_pivot($spec);
+    my $chdir_as_user = _init_post_pivot($spec);
 
     _init_setup_stdio($foreground, $pts_fd, $spec, $dbg);
 
@@ -276,6 +355,7 @@ sub run_init_process (    ## no critic (RequireFinalReturn)
     # before init_ready because the parent exits the message loop on that.
     $dbg->("apply_process_security");
     my $seccomp_notify_fd = apply_process_security($spec);
+    _init_chdir_as_user($spec, $chdir_as_user);
 
     # If seccomp NOTIFY is active, send the notify fd to the parent.
     # The parent will forward it to the listener socket (listenerPath).
@@ -392,7 +472,7 @@ sub run_main_process (%p) {
 
     # Write pid file if requested
     if ($p{pid_file}) {
-        write_file($p{pid_file}, "$init_pid\n");
+        write_file($p{pid_file}, "$init_pid");
     }
 
     # Run createRuntime hooks
@@ -415,18 +495,46 @@ sub write_id_mappings ($pid, $spec) {
     my $gid_maps = $linux->{gidMappings};
     return unless $uid_maps || $gid_maps;
 
-    # Write "deny" to setgroups before gid_map
-    eval {write_file("/proc/$pid/setgroups", "deny");};
+    # An unprivileged caller may only map its own ID, once; anything else
+    # goes through the setuid newuidmap/newgidmap helpers, which check the
+    # ranges against /etc/subuid and /etc/subgid (as runc does).
+    my $rootless = POSIX::geteuid() != 0;
+    my $egid = POSIX::getegid();
+    my $uid_helper = $rootless && $uid_maps && !_is_own_id_mapping($uid_maps, POSIX::geteuid());
+    my $gid_helper = $rootless && $gid_maps && !_is_own_id_mapping($gid_maps, $egid);
+
+    # Without the helper, setgroups must be denied before writing gid_map
+    # (mandatory for unprivileged writers). newgidmap handles it itself.
+    eval {write_file("/proc/$pid/setgroups", "deny");} unless $gid_helper;
 
     if ($uid_maps) {
-        my $content = join("\n", map {"$_->{containerID} $_->{hostID} $_->{size}"} @$uid_maps) . "\n";
-        write_file("/proc/$pid/uid_map", $content);
+        $uid_helper
+            ? _run_idmap_helper('newuidmap', $pid, $uid_maps)
+            : write_file("/proc/$pid/uid_map", _id_map_content($uid_maps));
     }
-
     if ($gid_maps) {
-        my $content = join("\n", map {"$_->{containerID} $_->{hostID} $_->{size}"} @$gid_maps) . "\n";
-        write_file("/proc/$pid/gid_map", $content);
+        $gid_helper
+            ? _run_idmap_helper('newgidmap', $pid, $gid_maps)
+            : write_file("/proc/$pid/gid_map", _id_map_content($gid_maps));
     }
+    return;
+}
+
+sub _id_map_content ($maps) {
+    return join("\n", map {"$_->{containerID} $_->{hostID} $_->{size}"} @$maps) . "\n";
+}
+
+sub _is_own_id_mapping ($maps, $id) {
+    return @$maps == 1 && $maps->[0]{hostID} == $id && $maps->[0]{size} == 1;
+}
+
+sub _run_idmap_helper ($helper, $pid, $maps) {
+    my @args = map {($_->{containerID}, $_->{hostID}, $_->{size})} @$maps;
+    system($helper, $pid, @args) == 0
+        or fatal("$helper failed"
+            . ($? == -1 ? ": $!" : " (exit status " . ($? >> 8) . ")")
+            . "; mapping IDs other than your own needs it and /etc/sub"
+            . ($helper =~ /uid/ ? 'uid' : 'gid'));
     return;
 }
 
@@ -561,7 +669,11 @@ sub _create_join_namespaces ($join_ns_ref) {
 sub _create_unshare_ns ($clone_flags, $spec, $main_w_fd, $init_r_fd) {
     my $unshare_flags = $clone_flags & ~CLONE_NEWPID & ~CLONE_NEWCGROUP;
 
-    if (($clone_flags & CLONE_NEWTIME) && ($clone_flags & CLONE_NEWUSER)) {
+    # As root, the time namespace is created before the user namespace. An
+    # unprivileged caller cannot do that (it needs CAP_SYS_ADMIN in the
+    # initial user namespace); it creates it afterwards, inside the new user
+    # namespace, together with the other namespaces below.
+    if (($clone_flags & CLONE_NEWTIME) && ($clone_flags & CLONE_NEWUSER) && POSIX::geteuid() == 0) {
         do_unshare(CLONE_NEWTIME) or fatal("unshare NEWTIME: $!");
         $unshare_flags &= ~CLONE_NEWTIME;
         apply_timens_offsets($spec);
@@ -675,7 +787,7 @@ sub _create_child_process (    ## no critic (Subroutines::ProhibitManyArgs Requi
 
 sub _create_parent_finish (    ## no critic (Subroutines::ProhibitManyArgs)
     $init_pid, $init_ready, $init_error, $clone_flags,
-    $cgpath, $spec, $pty_parent_sock, $id, $bundle,
+    $cgpath, $in_cgroup, $spec, $pty_parent_sock, $id, $bundle,
     $rootfs, $root, $p_ref,
 ) {
     fatal("init process failed to start") unless $init_pid;
@@ -683,14 +795,23 @@ sub _create_parent_finish (    ## no critic (Subroutines::ProhibitManyArgs)
     unless ($init_ready) {
         my $w = waitpid($init_pid, WNOHANG);
         my $exit_msg = ($w > 0) ? " (exit status " . ($? >> 8) . ")" : "";
-        my $err_detail = $init_error ? ": $init_error" : "";
-        fatal("init process died during container setup${exit_msg}${err_detail}");
+        fatal("init process died during container setup${exit_msg}") unless $init_error;
+
+        # Report init failures in runc's format, which tooling (and runc's
+        # integration tests) match on.
+        (my $err = $init_error) =~ s/^nacre: //;
+        my $cmd = $p_ref->{_command} // 'create';
+        die _binary_name()
+            . " $cmd failed: unable to start container process: "
+            . "error during container init: $err\n";
     }
 
-    unless ($clone_flags & CLONE_NEWCGROUP) {
-        cgroup_setup($cgpath, $spec) if $cgpath;
-        eval {cgroup_add_process($cgpath, $init_pid);} if $cgpath;
-        eval {apply_device_cgroup($cgpath, $spec);};
+    if ($cgpath) {
+
+        # Set up before forking (cmd_create); move the init in unless it
+        # was born there or the NEWCGROUP path already moved it.
+        eval {cgroup_add_process($cgpath, $init_pid);} unless $in_cgroup || ($clone_flags & CLONE_NEWCGROUP);
+        eval {cgroup_apply_pids($cgpath, $spec);};
     }
 
     my $pty_master_fd;
@@ -719,7 +840,7 @@ sub _create_parent_finish (    ## no critic (Subroutines::ProhibitManyArgs)
     save_state($root, $state);
 
     if ($p_ref->{pid_file}) {
-        write_file($p_ref->{pid_file}, "$init_pid\n");
+        write_file($p_ref->{pid_file}, "$init_pid");
     }
 
     if ($p_ref->{pidfd_socket}) {
@@ -730,10 +851,10 @@ sub _create_parent_finish (    ## no critic (Subroutines::ProhibitManyArgs)
         move_net_devices($netdevs, $init_pid);
     }
 
+    # createRuntime and createContainer already ran before pivot_root (see
+    # _init_run_create_hooks).
     if (my $hooks = $spec->{hooks}) {
         try {
-            run_hooks($hooks->{createRuntime}, $state, must_succeed => 1, type => 'createRuntime');
-            run_hooks($hooks->{createContainer}, $state, must_succeed => 1, type => 'createContainer');
             run_hooks($hooks->{prestart}, $state, must_succeed => 1, type => 'prestart');
         } catch ($e) {
             kill 9, $init_pid if $init_pid;
@@ -760,10 +881,14 @@ sub _create_parent_msg_loop ($main_r_fd, $init_w_fd, $spec, $id, $bundle, $cgpat
         init_pid => sub ($msg) {
             $init_pid = $msg->{pid};
             if ($clone_flags & CLONE_NEWCGROUP) {
-                cgroup_setup($cgpath, $spec) if $cgpath;
-                try {cgroup_add_process($cgpath, $init_pid);}
-                catch ($e) {log_debug("cgroup_add_process in NEWCGROUP path: $e");}
-                eval {apply_device_cgroup($cgpath, $spec);};
+
+                # The cgroup is set up already (cmd_create). $cgpath is
+                # only passed when the init still has to be moved into it:
+                # not born there, and not a rootless container without one.
+                if ($cgpath) {
+                    try {cgroup_add_process($cgpath, $init_pid);}
+                    catch ($e) {log_debug("cgroup_add_process in NEWCGROUP path: $e");}
+                }
                 channel_send($init_w_fd, {type => 'cgroup_done'});
             }
         },
@@ -771,6 +896,26 @@ sub _create_parent_msg_loop ($main_r_fd, $init_w_fd, $spec, $id, $bundle, $cgpat
         bind_source_request => sub ($msg) {_handle_bind_source_request($msg, $init_w_fd, $init_pid, $bundle);},
         seccomp_notify_fd =>
             sub ($msg) {_handle_seccomp_notify($main_r_fd, $init_w_fd, $spec, $id, $bundle, $init_pid);},
+        create_runtime_hooks => sub ($msg) {
+            my $rootfs = $spec->{root}{path} // 'rootfs';
+            $rootfs = "$bundle/$rootfs" unless $rootfs =~ m{^/};
+            my $state = {
+                ociVersion => $spec->{ociVersion} // '1.2.0',
+                id => $id,
+                status => 'creating',
+                pid => $init_pid,
+                bundle => $bundle,
+                rootfs => $rootfs,
+                annotations => $spec->{annotations} // {},
+            };
+            try {
+                run_hooks($spec->{hooks}{createRuntime}, $state, must_succeed => 1, type => 'createRuntime');
+                channel_send($init_w_fd, {type => 'create_runtime_hooks_done'});
+            } catch ($e) {
+                chomp $e;
+                channel_send($init_w_fd, {type => 'create_runtime_hooks_error', error => $e});
+            }
+        },
         init_ready => sub ($msg) {$init_ready = 1;},
         init_error => sub ($msg) {$init_error = $msg->{error} // 'unknown';},
     );
@@ -895,7 +1040,51 @@ sub _handle_seccomp_notify ($main_r_fd, $init_w_fd, $spec, $id, $bundle, $init_p
 # Container Lifecycle: create
 # ═══════════════════════════════════════════════════════════════════════
 
+# Fork the container's first process straight into its cgroup with
+# clone3(CLONE_INTO_CGROUP); the init it forks inherits the cgroup. Moving a
+# process in later through cgroup.procs costs several milliseconds (the
+# kernel waits for an RCU grace period on the first migration), being born
+# there costs nothing. Falls back to fork() when there is no cgroup or
+# clone3 fails (Linux < 5.7, no permission); returns ($pid, $in_cgroup).
+use constant CLONE_INTO_CGROUP => 1 << 33;
+
+sub _fork_into_cgroup ($cgpath) {
+    if ($cgpath && sysopen(my $cg_fh, $cgpath, O_RDONLY | O_DIRECTORY | O_CLOEXEC)) {
+        my $pid = _clone_into_cgroup_fd(fileno $cg_fh);
+        close $cg_fh;
+        return ($pid, 1) if defined $pid;
+    }
+    my $pid = fork() // fatal("fork: $!");
+    return ($pid, 0);
+}
+
+# clone3(CLONE_INTO_CGROUP) into the cgroup open as $cg_fd: the pid (0 in
+# the child), or undef if clone3 failed (no child then).
+sub _clone_into_cgroup_fd ($cg_fd) {
+
+    # Unlike fork(), a raw clone3 does not flush Perl's output buffers: do
+    # it now so buffered output is not written twice. (Setting $| flushes;
+    # no IO::Handle methods, which may need loading a module, impossible
+    # once inside the container's mount namespace.)
+    for my $fh (\*STDOUT, \*STDERR) {
+        my $previous = select $fh;    ## no critic (InputOutput::ProhibitOneArgSelect)
+        my $autoflush = $|;
+        $| = 1;
+        $| = $autoflush;
+        select $previous;    ## no critic (InputOutput::ProhibitOneArgSelect)
+    }
+    my $args = pack('Q11', CLONE_INTO_CGROUP, 0, 0, 0, SIGCHLD, 0, 0, 0, 0, 0, $cg_fd);
+    my $pid = syscall(SYS_clone3 + 0, $args, length $args);
+    return $pid if $pid >= 0;
+    log_debug("clone3(CLONE_INTO_CGROUP): $!; falling back to fork");
+    return;
+}
+
 sub cmd_create (%p) {
+
+    # The container's init runs module code after pivot_root, when the lib
+    # directory is gone: load everything now.
+    Nacre::Lazy::load_all();
     my $id = $p{id} // fatal("container id required");
     my $bundle = $p{bundle} // getcwd();
     my $root = $p{root} // $DEFAULT_ROOT;
@@ -923,6 +1112,16 @@ sub cmd_create (%p) {
 
     _validate_create_spec($spec);
 
+    my $cgpath = cgroup_path($spec, $id);
+    if (POSIX::geteuid() != 0) {
+        $cgpath = cgroup_rootless_path($cgpath, $spec);
+        if (!$cgpath && !grep {($_->{type} // '') eq 'pid' && !$_->{path}} @{$spec->{linux}{namespaces} // []}) {
+            warn "nacre: Creating a rootless container with no cgroup and no private pid namespace. "
+                . "Such configuration is strongly discouraged (as it is impossible to properly kill "
+                . "all container's processes).\n";
+        }
+    }
+
     # Snapshot config.json — OCI spec: "Any updates to config.json
     # after this step MUST NOT affect the container."
     cache_spec($root, $id, $spec);
@@ -930,8 +1129,6 @@ sub cmd_create (%p) {
     my $rootfs = $spec->{root}{path} // 'rootfs';
     $rootfs = "$bundle/$rootfs" unless $rootfs =~ m{^/};
     fatal("rootfs '$rootfs' does not exist") unless -d $rootfs;
-
-    my $cgpath = cgroup_path($spec, $id);
 
     my ($clone_flags, $join_ns_ref, $has_userns) = _create_parse_namespaces($spec);
     my @join_ns = @$join_ns_ref;
@@ -967,9 +1164,20 @@ sub cmd_create (%p) {
         close $dfh;
     };
 
+    # Set the cgroup up before forking so that the container's processes
+    # can be born in it. pids.max waits until setup is done (setup forks).
+    if ($cgpath) {
+        try {
+            cgroup_setup($cgpath, $spec, defer_pids => 1);
+        } catch ($e) {
+            delete_state($root, $id);
+            die $e;    ## no critic (ErrorHandling::RequireCarping)
+        }
+        eval {apply_device_cgroup($cgpath, $spec);};
+    }
+
     # Fork: child will become the init process
-    my $child_pid = fork();
-    fatal("fork: $!") unless defined $child_pid;
+    my ($child_pid, $in_cgroup) = _fork_into_cgroup($cgpath);
 
     if ($child_pid == 0) {
         _create_child_process(    ## no critic (Subroutines::ProhibitManyArgs)
@@ -989,12 +1197,13 @@ sub cmd_create (%p) {
     POSIX::close($init_debug_fd_pre) if defined $init_debug_fd_pre;
 
     my ($init_pid, $init_ready, $init_error)
-        = _create_parent_msg_loop($main_r_fd, $init_w_fd, $spec, $id, $bundle, $cgpath, $clone_flags,);
+        = _create_parent_msg_loop($main_r_fd, $init_w_fd, $spec, $id, $bundle, $in_cgroup ? undef : $cgpath,
+        $clone_flags,);
 
     waitpid($child_pid, 0);
 
     my $state = _create_parent_finish(
-        $init_pid, $init_ready, $init_error, $clone_flags, $cgpath, $spec,
+        $init_pid, $init_ready, $init_error, $clone_flags, $cgpath, $in_cgroup, $spec,
         $pty_parent_sock, $id, $bundle, $rootfs, $root, \%p,
     );
 
@@ -1050,15 +1259,6 @@ sub cmd_start (%p) {
 # ═══════════════════════════════════════════════════════════════════════
 # Container Lifecycle: state
 # ═══════════════════════════════════════════════════════════════════════
-
-sub cmd_state (%p) {
-    my $id = $p{id} // fatal("container id required");
-    my $root = $p{root} // $DEFAULT_ROOT;
-
-    my $state = load_state($root, $id);
-    print $JSON->encode(oci_state_json($state));
-    return;
-}
 
 # ═══════════════════════════════════════════════════════════════════════
 # Container Lifecycle: kill
@@ -1159,16 +1359,17 @@ sub cmd_delete (%p) {
 
             # Unfreeze first for paused containers so SIGKILL can be delivered
             if ($state->{status} eq 'paused' && $state->{cgroupPath}) {
-                eval {write_file("$state->{cgroupPath}/cgroup.freeze", "0\n")};
-                usleep(100_000);
+                my $cg = $state->{cgroupPath};
+                eval {write_file("$cg/cgroup.freeze", "0\n")};
+                wait_until(1, sub {(read_file("$cg/cgroup.events") // '') !~ /^frozen 1/m});
             }
 
-            # Force kill
+            # Force kill, then wait for the init to actually exit (it is not
+            # our child, so it cannot be reaped here).
             if ($state->{pid} > 0) {
-                kill 9, $state->{pid};
-
-                # Wait a bit
-                usleep(100_000);
+                my $pid = $state->{pid};
+                kill 9, $pid;
+                pidfd_wait($pid, 1) // wait_until(1, sub {!kill 0, $pid});
             }
             if ($state->{cgroupPath}) {
                 cgroup_cleanup($state->{cgroupPath});
@@ -1209,7 +1410,7 @@ sub cmd_run (%p) {
 
         # Detached mode: create + start, then return immediately.
         # Equivalent to `runc create` + `runc start`.
-        my $state = cmd_create(%p);
+        my $state = cmd_create(%p, _command => 'run');
         cmd_start(id => $id, root => $root);
 
         # Write pid file if requested
@@ -1227,7 +1428,7 @@ sub cmd_run (%p) {
     my $sr_ret = syscall($pr_nr, $pr_opt, 1, 0, 0, 0);
 
     # Create (foreground: keep stdio so user sees container output)
-    my $state = cmd_create(%p, foreground => 1);
+    my $state = cmd_create(%p, foreground => 1, _command => 'run');
 
     # Set PTY to raw mode BEFORE sending the start signal.  The slave's
     # default ONLCR converts \n→\r\n; clearing OPOST before start ensures
@@ -1255,8 +1456,9 @@ sub cmd_run (%p) {
         $exit_code = _run_wait_init($init_pid);
     }
 
-    # Delete
-    eval {cmd_delete(id => $id, root => $root, force => 1);};
+    # Delete, unless --keep asked to leave the stopped container (and its
+    # cgroup) around for inspection and a later explicit "delete".
+    eval {cmd_delete(id => $id, root => $root, force => 1);} unless $p{keep};
 
     exit($exit_code);
 }
@@ -1378,63 +1580,6 @@ sub _run_wait_init ($init_pid) {
 # ═══════════════════════════════════════════════════════════════════════
 # Container: list
 # ═══════════════════════════════════════════════════════════════════════
-
-sub cmd_list (%p) {
-    my $root = $p{root} // $DEFAULT_ROOT;
-    my $format = $p{format} // 'table';
-    my $quiet = $p{quiet} // 0;
-
-    my @containers;
-    if (opendir(my $dh, $root)) {
-        while (my $id = readdir($dh)) {
-            next if $id =~ /^\./;
-            my $st = eval {load_state($root, $id)};
-            next unless $st;
-            push @containers, $st;
-        }
-        closedir($dh);
-    } elsif ($p{root_explicit}) {
-
-        # Explicit --root with non-existent directory is an error
-        fatal("root directory '$root' does not exist");
-    }
-
-    # Default root that doesn't exist is fine — just show empty list
-
-    if ($quiet) {
-        print "$_->{id}\n" for sort {$a->{id} cmp $b->{id}} @containers;
-        return;
-    }
-
-    if ($format eq 'json') {
-
-        # JSON list output: compact, field order matches runc
-        # (ociVersion, id, pid, status, bundle, rootfs, created)
-        my @entries;
-        for my $c (sort {$a->{id} cmp $b->{id}} @containers) {
-            my $s = oci_state_json($c);
-            my @pairs;
-            for my $key (qw(ociVersion id pid status bundle rootfs created)) {
-                next unless defined $s->{$key};
-                push @pairs, $JSON_COMPACT->encode($key) . ':' . $JSON_COMPACT->encode($s->{$key});
-            }
-            push @entries, '{' . join(',', @pairs) . '}';
-        }
-        print '[' . join(',', @entries) . "]\n";
-        return;
-    }
-
-    # Table format (runc column order: ID PID STATUS BUNDLE CREATED OWNER)
-    printf "%-20s %-10s %-10s %-40s %-30s %s\n", 'ID', 'PID', 'STATUS', 'BUNDLE', 'CREATED', 'OWNER';
-    for my $c (sort {$a->{id} cmp $b->{id}} @containers) {
-        printf "%-20s %-10s %-10s %-40s %-30s %s\n",
-            $c->{id}, $c->{pid}, $c->{status},
-            $c->{bundle} // '',
-            $c->{created} // '',
-            '';
-    }
-    return;
-}
 
 # ═══════════════════════════════════════════════════════════════════════
 # Container: pause / resume
@@ -1817,17 +1962,23 @@ sub _exec_child_join_ns ($ns_fds_ref, $err_w) {
     return;
 }
 
-sub _exec_child_pid_fork ($ns_fds_ref, $gc_pid_w, $err_w, $cg_sync_r, $pty_child_fh, $seccomp_child_fh) {
+sub _exec_child_pid_fork (    ## no critic (Subroutines::ProhibitManyArgs)
+    $ns_fds_ref, $gc_pid_w, $err_w, $cg_sync_r, $pty_child_fh, $seccomp_child_fh, $cg_fh,
+) {
     my $joined_pid_ns = grep {$_->{name} eq 'pid'} @$ns_fds_ref;
     return unless $joined_pid_ns;
 
-    my $pid2 = fork();
+    # Clone the grandchild (the exec'd process) straight into its cgroup.
+    my $pid2 = $cg_fh ? _clone_into_cgroup_fd(fileno $cg_fh) : undef;
+    my $in_cgroup = defined $pid2 ? 1 : 0;
+    $pid2 //= fork();
     if (!defined $pid2) {
         syswrite($err_w, "fork for PID ns: $!");
         _exit(255);
     }
+    close $cg_fh if $cg_fh;
     if ($pid2 > 0) {
-        syswrite($gc_pid_w, pack("L", $pid2));
+        syswrite($gc_pid_w, pack("LC", $pid2, $in_cgroup));
         close $gc_pid_w;
         close $err_w;
         close $cg_sync_r;
@@ -1918,6 +2069,7 @@ sub _exec_child_send_seccomp ($spec, $seccomp_child_fh) {
 }
 
 sub _exec_child_apply_security ($exec_proc, $spec, $seccomp_child_fh, $additional_gids, $exec_user, $cap_add) {
+    apply_personality($spec);
     _exec_child_send_seccomp($spec, $seccomp_child_fh);
 
     if ($additional_gids && @$additional_gids) {
@@ -2106,6 +2258,11 @@ sub _exec_parent_seccomp_notify ($seccomp_parent_fh, $spec, $id, $state, $init_p
 }
 
 sub cmd_exec (%p) {    ## no critic (Subroutines::ProhibitExcessComplexity)
+
+    # The child sets the process up after entering the container's mount
+    # namespace, where lib/ is gone: load what it uses (and only that --
+    # exec is frequent, e.g. for health checks; see test/unit/exec-modules.t).
+    Nacre::Lazy::load('Nacre::Process', 'Nacre::Seccomp');
     my $id = $p{id} // exec_fatal("container id required");
     my $root = $p{root} // $DEFAULT_ROOT;
     my @cmd = @{$p{command} // []};
@@ -2142,8 +2299,19 @@ sub cmd_exec (%p) {    ## no critic (Subroutines::ProhibitExcessComplexity)
     my $pipes = _exec_setup_pipes($opts{tty}, $spec);
     _exec_relocate_fds($preserve_fds, $pipes);
 
-    my $child = fork();
-    fatal("fork for exec: $!") unless defined $child;
+    # The exec'd process is born in the target cgroup (clone3), so that no
+    # cgroup.procs write is needed. When it joins a pid namespace, it is the
+    # grandchild: the child stays outside the container's cgroup (it only
+    # waits for it) and clones the grandchild into the cgroup itself.
+    my ($exec_target_cgpath, $init_actual_cgpath)
+        = _exec_resolve_cgroup($p{exec_cgroup}, $state->{cgroupPath}, $init_pid);
+    my ($child, $in_cgroup, $cg_fh);
+    if ($has_pid_ns_in_exec) {
+        sysopen($cg_fh, $exec_target_cgpath, O_RDONLY | O_DIRECTORY | O_CLOEXEC) if $exec_target_cgpath;
+        $child = fork() // fatal("fork for exec: $!");
+    } else {
+        ($child, $in_cgroup) = _fork_into_cgroup($exec_target_cgpath);
+    }
 
     if ($child == 0) {    ## no critic (RequireFinalReturn)
         close $pipes->{err_r};
@@ -2165,8 +2333,10 @@ sub cmd_exec (%p) {    ## no critic (Subroutines::ProhibitExcessComplexity)
         _exec_child_pid_fork(
             \@ns_fds, $pipes->{gc_pid_w}, $pipes->{err_w}, $pipes->{cg_sync_r},
             $pipes->{pty_child_fh},
-            $pipes->{seccomp_child_fh},
+            $pipes->{seccomp_child_fh}, $cg_fh,
         );
+
+        join_session_keyring($id, ($exec_proc && $exec_proc->{selinuxLabel}) || $spec->{process}{selinuxLabel});
 
         chdir('/');
         chdir($opts{cwd} // $spec->{process}{cwd} // '/');
@@ -2178,6 +2348,10 @@ sub cmd_exec (%p) {    ## no critic (Subroutines::ProhibitExcessComplexity)
 
         sysread($pipes->{cg_sync_r}, my $cg_sync_buf, 1);
         close $pipes->{cg_sync_r};
+
+        if (my $label = ($exec_proc && $exec_proc->{selinuxLabel}) || $spec->{process}{selinuxLabel}) {
+            apply_selinux_exec_label($label);
+        }
 
         log_debug("setns_init: about to exec");
         _exec_child_close_fds($preserve_fds, $pipes->{err_w});
@@ -2197,10 +2371,12 @@ sub cmd_exec (%p) {    ## no critic (Subroutines::ProhibitExcessComplexity)
     close $pipes->{cg_sync_r};
     close $pipes->{seccomp_child_fh} if $pipes->{seccomp_child_fh};
 
-    my ($exec_target_cgpath, $init_actual_cgpath)
-        = _exec_resolve_cgroup($p{exec_cgroup}, $state->{cgroupPath}, $init_pid);
+    close $cg_fh if $cg_fh;
 
-    my $deferred_exec_cg_path = _exec_parent_write_cgroup($exec_target_cgpath, $init_actual_cgpath, $p{exec_cgroup},
+    my $deferred_exec_cg_path
+        = $in_cgroup
+        ? undef
+        : _exec_parent_write_cgroup($exec_target_cgpath, $init_actual_cgpath, $p{exec_cgroup},
         $child, $has_pid_ns_in_exec,);
 
     syswrite($pipes->{sync_w}, "x", 1);
@@ -2208,9 +2384,12 @@ sub cmd_exec (%p) {    ## no critic (Subroutines::ProhibitExcessComplexity)
 
     my $final_pid = $child;
     if ($has_pid_ns_in_exec) {
-        sysread($pipes->{gc_pid_r}, my $gc_pid_buf, 4);
-        if (defined $gc_pid_buf && length($gc_pid_buf) == 4) {
-            $final_pid = unpack("L", $gc_pid_buf);
+
+        # The grandchild's pid, and whether it was born in the cgroup.
+        sysread($pipes->{gc_pid_r}, my $gc_pid_buf, 5);
+        if (defined $gc_pid_buf && length($gc_pid_buf) == 5) {
+            ($final_pid, my $gc_in_cgroup) = unpack("LC", $gc_pid_buf);
+            $deferred_exec_cg_path = undef if $gc_in_cgroup;
         }
     }
     close $pipes->{gc_pid_r};
@@ -2254,11 +2433,16 @@ sub cmd_exec (%p) {    ## no critic (Subroutines::ProhibitExcessComplexity)
     for my $ns (@ns_fds) {close $ns->{fd};}
 
     if ($p{detach}) {
+
+        # Wait until the process has been exec'd -- err_w is close-on-exec,
+        # so that is EOF -- or the child reported why it could not be. No
+        # timeout: a slow start must not turn a failure into a success.
         my $err_msg = '';
-        my $rin = '';
-        vec($rin, fileno($pipes->{err_r}), 1) = 1;
-        if (select($rin, undef, undef, 0.1)) {
-            sysread($pipes->{err_r}, $err_msg, 4096);
+        while (1) {
+            my $n = sysread($pipes->{err_r}, my $buf, 4096);
+            next if !defined $n && $! == EINTR;
+            last unless $n;
+            $err_msg .= $buf;
         }
         close $pipes->{err_r};
         if ($err_msg ne '') {
@@ -2431,7 +2615,10 @@ sub cmd_update (%p) {
 # ─── helpers for cmd_events ──────────────────────────────────────────
 
 sub _collect_cgroup_stats ($cgpath) {
-    my %s;
+
+    # runc always reports the hugetlb map, even when empty.
+    my %s = (hugetlb => {});
+    return \%s unless defined $cgpath;
     $s{pids}{current} = scalar(cgroup_pids($cgpath));
     my $pids_max = read_file("$cgpath/pids.max") // 'max';
     chomp $pids_max;
@@ -2450,11 +2637,18 @@ sub _collect_cgroup_stats ($cgpath) {
         $s{cpu}{$k} = int($v) if defined $v;
     }
 
-    # OOM events
-    my $events = read_file("$cgpath/memory.events") // '';
-    for my $line (split /\n/, $events) {
-        my ($k, $v) = split /\s+/, $line;
-        $s{memory}{$k} = int($v) if defined $v;
+    # memory.events is deliberately left out: runc's stats schema has no such
+    # fields, and OOMs are reported as separate "oom" events by cmd_events.
+
+    # hugetlb, keyed by page size ("2MB", "1GB", ...). Like runc, prefer the
+    # reservation counter when the kernel has one.
+    for my $cur (glob "$cgpath/hugetlb.*.current") {
+        my ($size) = $cur =~ m{/hugetlb\.([^./]+)\.current$} or next;
+        my $prefix = "$cgpath/hugetlb.$size";
+        my $usage = read_file("$prefix.rsvd.current") // read_file($cur) // '0';
+        my $events = read_file("$prefix.events") // '';
+        my ($failcnt) = $events =~ /^max\s+(\d+)/m;
+        $s{hugetlb}{$size} = {usage => int($usage), failcnt => int($failcnt // 0)};
     }
 
     # PSI (pressure stall information) - io, cpu, memory
@@ -2523,16 +2717,22 @@ sub cmd_events (%p) {
     my $stats = $p{stats};
 
     my $state = load_state($root, $id);
-    my $cgpath = $state->{cgroupPath} // fatal("no cgroup path");
+
+    # A rootless container may have no cgroup; like runc, report empty stats.
+    my $cgpath = $state->{cgroupPath};
 
     if ($stats) {
         _emit_event({type => 'stats', id => $id, data => _collect_cgroup_stats($cgpath)});
         return;
     }
 
+    # Consumers tail the stream (often redirected to a file), so each event
+    # must reach them immediately rather than sit in a block buffer.
+    STDOUT->autoflush(1);
+
     # Track OOM events — check memory.events for oom counter changes
     my $last_oom_count = 0;
-    my $mem_events = read_file("$cgpath/memory.events");
+    my $mem_events = defined $cgpath ? read_file("$cgpath/memory.events") : undef;
     if (defined $mem_events && $mem_events =~ /^oom\s+(\d+)/m) {
         $last_oom_count = $1;
     }
@@ -2541,7 +2741,7 @@ sub cmd_events (%p) {
         _emit_event({type => 'stats', id => $id, data => _collect_cgroup_stats($cgpath)});
 
         # Check for OOM events
-        $mem_events = read_file("$cgpath/memory.events");
+        $mem_events = defined $cgpath ? read_file("$cgpath/memory.events") : undef;
         if (defined $mem_events && $mem_events =~ /^oom\s+(\d+)/m) {
             my $oom_count = $1;
             if ($oom_count > $last_oom_count) {
@@ -2581,7 +2781,7 @@ sub cmd_ps (%p) {
     my @pids = cgroup_pids($cgpath);
 
     if ($format eq 'json') {
-        print $JSON->encode(\@pids);
+        print $JSON->encode([map {$_ + 0} @pids]);
         return;
     }
 
@@ -2611,8 +2811,38 @@ sub cmd_spec (%p) {
         fatal("$path already exists. Use --force to overwrite.");
     }
 
-    write_file($path, $JSON->encode(default_spec()));
+    my $spec = default_spec();
+    _spec_to_rootless($spec) if $p{rootless};
+    write_file($path, $JSON->encode($spec));
     print "Generated $path\n" unless $p{quiet};
+    return;
+}
+
+# Adjust a spec for running as an unprivileged user, as "runc spec
+# --rootless" does: a user namespace mapping only the caller's own IDs, no
+# network namespace (it could not be configured), /sys bind-mounted instead
+# of a fresh sysfs, no uid=/gid= mount options that could not be mapped, and
+# no cgroup resources.
+sub _spec_to_rootless ($spec) {
+    my $linux = $spec->{linux} //= {};
+    $linux->{namespaces}
+        = [(grep {($_->{type} // '') !~ /^(?:network|user)$/} @{$linux->{namespaces} // []}), {type => 'user'},];
+    $linux->{uidMappings} = [{hostID => POSIX::geteuid(), containerID => 0, size => 1}];
+    $linux->{gidMappings} = [{hostID => POSIX::getegid(), containerID => 0, size => 1}];
+
+    for my $m (@{$spec->{mounts} // []}) {
+        if (($m->{destination} // '') =~ m{^/sys/?$}) {
+            %$m = (
+                destination => '/sys',
+                type => 'none',
+                source => '/sys',
+                options => [qw(rbind nosuid noexec nodev ro)],
+            );
+            next;
+        }
+        $m->{options} = [grep {!/^[ug]id=/} @{$m->{options} // []}] if $m->{options};
+    }
+    delete $linux->{resources};
     return;
 }
 
@@ -2621,19 +2851,20 @@ sub cmd_spec (%p) {
 # ═══════════════════════════════════════════════════════════════════════
 
 sub cmd_features {
+    require Nacre::Mount;
     my $features = {
         ociVersionMin => '1.0.0',
         ociVersionMax => '1.2.0',
         hooks => [qw(prestart createRuntime createContainer startContainer poststart poststop)],
-        mountOptions => [sort (keys %MOUNT_FLAGS, 'idmap', 'ridmap')],
+        mountOptions => [sort (keys %{Nacre::Mount::mount_flags()}, 'idmap', 'ridmap')],
         linux => {
             namespaces => [sort keys %NS_MAP],
             capabilities => [@CAP_NAMES],
             cgroup => {
-                v2 => JSON::PP::true,
+                v2 => Nacre::JSON::true,
             },
             seccomp => {
-                enabled => JSON::PP::true,
+                enabled => Nacre::JSON::true,
                 actions => [
                     qw(SCMP_ACT_KILL SCMP_ACT_KILL_PROCESS SCMP_ACT_TRAP
                         SCMP_ACT_ERRNO SCMP_ACT_NOTIFY SCMP_ACT_LOG SCMP_ACT_ALLOW)
@@ -2649,8 +2880,8 @@ sub cmd_features {
                         SECCOMP_FILTER_FLAG_SPEC_ALLOW)
                 ],
             },
-            apparmor => {enabled => JSON::PP::false},
-            selinux => {enabled => JSON::PP::false},
+            apparmor => {enabled => Nacre::JSON::false},
+            selinux => {enabled => selinux_enabled() ? Nacre::JSON::true : Nacre::JSON::false},
         },
         annotations => {
             'org.opencontainers.runtime.nacre' => 'Perl OCI runtime',
@@ -2704,7 +2935,7 @@ sub _dispatch_delete ($root, @) {
 }
 
 sub _dispatch_run ($root, @) {
-    my ($bundle, $pid_file, $console_socket, $pidfd_socket, $no_pivot, $detach);
+    my ($bundle, $pid_file, $console_socket, $pidfd_socket, $no_pivot, $detach, $keep);
     GetOptions(
         'bundle|b=s' => \$bundle,
         'pid-file=s' => \$pid_file,
@@ -2712,7 +2943,9 @@ sub _dispatch_run ($root, @) {
         'pidfd-socket=s' => \$pidfd_socket,
         'no-pivot' => \$no_pivot,
         'detach|d' => \$detach,
+        'keep' => \$keep,
     );
+    fatal("--detach and --keep cannot both be specified") if $detach && $keep;
     my $id = shift @ARGV // fatal("container id required");
     cmd_run(
         id => $id,
@@ -2722,6 +2955,7 @@ sub _dispatch_run ($root, @) {
         console_socket => $console_socket,
         pidfd_socket => $pidfd_socket,
         detach => $detach,
+        keep => $keep,
         no_pivot => $no_pivot,
     );
     return;
@@ -2754,7 +2988,7 @@ sub _dispatch_exec ($root, @) {
     }
     @ARGV = @before;
 
-    Getopt::Long::Configure('require_order');
+    Nacre::Getopt::Configure('require_order');
     GetOptions(
         'cwd=s' => \$exec_cwd,
         'env|e=s' => \@exec_env,
@@ -2771,7 +3005,7 @@ sub _dispatch_exec ($root, @) {
         'cap=s' => \@cap_add,
         'cgroup=s' => \$exec_cgroup,
     );
-    Getopt::Long::Configure('permute');
+    Nacre::Getopt::Configure('permute');
     my $id = shift @ARGV // fatal("container id required");
     @exec_cmd = @ARGV unless @exec_cmd;
     cmd_exec(
@@ -2852,9 +3086,9 @@ sub _dispatch_ps ($root, @) {
 }
 
 sub _dispatch_spec ($, @) {
-    my ($bundle, $force);
-    GetOptions('bundle|b=s' => \$bundle, 'force' => \$force);
-    cmd_spec(bundle => $bundle, force => $force);
+    my ($bundle, $force, $rootless);
+    GetOptions('bundle|b=s' => \$bundle, 'force' => \$force, 'rootless' => \$rootless);
+    cmd_spec(bundle => $bundle, force => $force, rootless => $rootless);
     return;
 }
 
@@ -2867,7 +3101,7 @@ sub main {
     my $systemd_cgroup = 0;
 
     # Parse global options (before command)
-    Getopt::Long::Configure('pass_through', 'no_auto_abbrev');
+    Nacre::Getopt::Configure('pass_through', 'no_auto_abbrev');
     GetOptions(
         'root=s' => sub {$root = $_[1]; $root_explicit = 1;},
         'log=s' => \my $log_file,
@@ -2875,6 +3109,8 @@ sub main {
         'debug' => \$debug,
         'systemd-cgroup' => \$systemd_cgroup,
     );
+
+    $root = rootless_default_root() // $root unless $root_explicit;
 
     # Initialize logging subsystem
     setup_logging(
@@ -2974,7 +3210,7 @@ GLOBAL OPTIONS:
    --debug             enable debug output for logging
    --log value         set the log file path where internal debug information is written
    --log-format value  set the format used by logs ('text' (default), or 'json') (default: "text")
-   --root value        root directory for storage of container state (default: "/run/nacre")
+   --root value        root directory for storage of container state (default: "/run/nacre", or "\$XDG_RUNTIME_DIR/nacre" for non-root users)
    --help, -h          show help
    --version, -v       print the version
 USAGE

@@ -46,6 +46,7 @@ package Nacre::Const; use constant {
     SYS_ioprio_set        => 251,
     SYS_sched_setattr     => 314,
     SYS_sched_setaffinity => 203,
+    SYS_personality       => 135,
     SYS_set_mempolicy     => 238,
     SYS_keyctl            => 250,
     SYS_add_key           => 248,
@@ -94,6 +95,7 @@ package Nacre::Const; use constant {
     SYS_ioprio_set        => 30,
     SYS_sched_setattr     => 274,
     SYS_sched_setaffinity => 122,
+    SYS_personality       => 92,
     SYS_set_mempolicy     => 237,
     SYS_keyctl            => 219,
     SYS_add_key           => 217,
@@ -298,7 +300,7 @@ our @EXPORT_OK = qw(
     SYS_clone SYS_clone3 SYS_prctl SYS_capget SYS_capset
     SYS_mknod SYS_mknodat SYS_seccomp SYS_bpf SYS_pidfd_open
     SYS_close_range SYS_sethostname SYS_setdomainname SYS_setgroups
-    SYS_prlimit64 SYS_ioprio_set SYS_sched_setattr SYS_sched_setaffinity
+    SYS_prlimit64 SYS_ioprio_set SYS_sched_setattr SYS_sched_setaffinity SYS_personality
     SYS_set_mempolicy SYS_keyctl SYS_add_key SYS_memfd_create
     SYS_open_tree SYS_move_mount SYS_mount_setattr
     SYS_fsopen SYS_fsconfig SYS_fsmount SYS_statfs SYS_fchown

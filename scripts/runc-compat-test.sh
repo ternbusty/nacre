@@ -4,25 +4,38 @@
 #
 # Usage:
 #   sudo ./scripts/runc-compat-test.sh [--runc-dir DIR] [--binary PATH] \
-#                                      [--pattern FILE]
+#                                      [--pattern FILE] \
+#                                      [--rootless-user USER \
+#                                       [--rootless-features FEATURES]]
+#
+# With --rootless-user, bats runs as USER (as runc's tests/rootless.sh does)
+# and FEATURES ("", "idmap", "cgroup" or "idmap+cgroup") selects what the
+# host provides: subuid/subgid ranges usable via newuidmap/newgidmap, and a
+# cgroup delegated to USER. The script sets these up and undoes them.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-RUNC_TAG="${RUNC_TAG:-v1.5.1}"
+# runc release whose bats suite the pattern file is written against. Bump it
+# deliberately (together with the pattern file), not by tracking "latest".
+RUNC_TAG="${RUNC_TAG:-$(<"${SCRIPT_DIR}/runc-version")}"
 RUNC_REPO_DIR="${RUNC_REPO_DIR:-}"
 NACRE_BIN="${NACRE_BIN:-${PROJECT_ROOT}/nacre-wrapper}"
 SUMMARY_FILE="${SUMMARY_FILE:-}"
 TAP_OUTPUT="${TAP_OUTPUT:-}"
 PATTERN_FILE="${PROJECT_ROOT}/scripts/runc_test_pattern"
+ROOTLESS_USER=""
+ROOTLESS_FEATURES=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --runc-dir)  RUNC_REPO_DIR="$2"; shift 2 ;;
     --binary)    NACRE_BIN="$2"; shift 2 ;;
     --pattern)   PATTERN_FILE="$2"; shift 2 ;;
+    --rootless-user)     ROOTLESS_USER="$2"; shift 2 ;;
+    --rootless-features) ROOTLESS_FEATURES="$2"; shift 2 ;;
     *)           echo "Unknown option: $1" >&2; exit 1 ;;
   esac
 done
@@ -57,8 +70,18 @@ fi
 NACRE_SCRIPT_DIR="$(cd "$(dirname "$NACRE_BIN")" && pwd)"
 cp "$NACRE_BIN" "$RUNC_REPO_DIR/runc"
 cp "$NACRE_SCRIPT_DIR/nacre" "$RUNC_REPO_DIR/nacre"
+# Replace lib/ wholesale: when --runc-dir is reused, "cp -r" onto an existing
+# lib/ would nest the fresh copy at lib/lib and leave stale modules in place.
+rm -rf "$RUNC_REPO_DIR/lib"
 cp -r "$NACRE_SCRIPT_DIR/lib" "$RUNC_REPO_DIR/lib"
 chmod +x "$RUNC_REPO_DIR/runc" "$RUNC_REPO_DIR/nacre"
+# Testing a stale copy silently is worse than failing.
+if ! cmp -s "$NACRE_BIN" "$RUNC_REPO_DIR/runc" \
+    || ! cmp -s "$NACRE_SCRIPT_DIR/nacre" "$RUNC_REPO_DIR/nacre" \
+    || ! diff -rq "$NACRE_SCRIPT_DIR/lib" "$RUNC_REPO_DIR/lib" >/dev/null; then
+  echo "ERROR: nacre copy in ${RUNC_REPO_DIR} does not match ${NACRE_SCRIPT_DIR}" >&2
+  exit 1
+fi
 
 # Fetch rootfs images
 echo ">>> Fetching rootfs images ..."
@@ -111,23 +134,154 @@ cleanup_stale_state() {
   done
 }
 
+# All descendants of a pid, the pid itself first.
+descendants() {
+  local c
+  echo "$1"
+  for c in $(ps -o pid= --ppid "$1" 2>/dev/null); do
+    descendants "$c"
+  done
+}
+
+# Print what every process under $1 is doing, for a bats run that is about
+# to hit its timeout: per-thread state, wait channel, current syscall and
+# kernel stack, and open fds. Once timeout kills the run there is nothing
+# left to look at.
+dump_hang_diagnostics() {
+  local p t exe
+  echo "  --- hang diagnostics ($fname, $(date -u +%T)) ---"
+  for p in $(descendants "$1"); do
+    [[ -d /proc/$p ]] || continue
+    exe=$(sudo readlink "/proc/$p/exe" 2>/dev/null || true)
+    echo "  [pid $p ppid $(ps -o ppid= -p "$p" | tr -d ' ')] exe=$exe"
+    echo "    cmd: $(sudo cat "/proc/$p/cmdline" 2>/dev/null | tr '\0' ' ' | cut -c1-300)"
+    # The harness itself (sudo, timeout, script, bats' shells) only gets the
+    # lines above; nacre and the container processes get per-thread detail.
+    case "${exe##*/}" in
+      sudo|timeout|script|bash|cat) continue ;;
+    esac
+    for t in /proc/"$p"/task/*; do
+      echo "    tid ${t##*/} comm=$(cat "$t/comm" 2>/dev/null) state=$(awk '{print $3}' "$t/stat" 2>/dev/null)" \
+        "wchan=$(cat "$t/wchan" 2>/dev/null) syscall=$(sudo cat "$t/syscall" 2>/dev/null | cut -d' ' -f1-4)"
+      sudo cat "$t/stack" 2>/dev/null | head -12 | sed 's/^/        /'
+    done
+    echo "    fds: $(sudo ls -l "/proc/$p/fd" 2>/dev/null | awk 'NR > 1 {print $9 "->" $11}' | tr '\n' ' ' | cut -c1-800)"
+  done
+  echo "  --- end hang diagnostics ---"
+}
+
+# Run bats on $file with $filter under a timeout. A watchdog records hang
+# diagnostics shortly before the timeout fires. Returns bats' exit status
+# (124 on timeout).
+run_bats() {
+  local bats_pid watchdog rc=0
+  local as_user=()
+  [[ -n "$ROOTLESS_USER" ]] && as_user=(-H -u "$ROOTLESS_USER")
+  sudo -E "${as_user[@]}" PATH="$PATH" RUNC="$PWD/runc" _BATS_FF="$FILTER_FILE" "${ROOTLESS_ENV[@]}" \
+      timeout "$timeout_secs" script -q -e -c \
+      '. "$_BATS_FF" && exec bats -f "$BATS_FILTER" -t '"$file" /dev/null > "$TMPOUT" 2>&1 &
+  bats_pid=$!
+  (
+    sleep $(( timeout_secs - 10 ))
+    if kill -0 "$bats_pid" 2>/dev/null; then dump_hang_diagnostics "$bats_pid"; fi
+  ) &
+  watchdog=$!
+  wait "$bats_pid" || rc=$?
+  kill "$watchdog" 2>/dev/null || true
+  wait "$watchdog" 2>/dev/null || true
+  return "$rc"
+}
+
+# ── rootless mode (mirrors runc's tests/rootless.sh) ──────────────────
+ROOTLESS_CGROUP="/sys/fs/cgroup/runc-cgroups-integration-test"
+ROOTLESS_ENV=()
+ROOTLESS_UNDO=()
+
+rootless_undo() {
+  local i
+  for (( i = ${#ROOTLESS_UNDO[@]} - 1; i >= 0; i-- )); do
+    eval "${ROOTLESS_UNDO[$i]}" || true
+  done
+}
+
+rootless_setup() {
+  local group
+  group="$(id -gn "$ROOTLESS_USER")"
+  ROOTLESS_ENV=(ROOTLESS_FEATURES="$ROOTLESS_FEATURES")
+  trap rootless_undo EXIT
+
+  if [[ "$ROOTLESS_FEATURES" == *idmap* ]]; then
+    local f
+    for f in newuidmap newgidmap; do
+      command -v "$f" >/dev/null || { echo "ERROR: idmap needs $f (uidmap package)" >&2; exit 1; }
+    done
+    # Same ranges as runc's tests/rootless.sh.
+    for f in /etc/subuid /etc/subgid; do
+      cp -a "$f" "$f.nacre-test.bak" 2>/dev/null || : > "$f.nacre-test.bak"
+      ROOTLESS_UNDO+=("mv '$f.nacre-test.bak' '$f'")
+      grep -v "^$ROOTLESS_USER:" "$f.nacre-test.bak" > "$f" || true
+    done
+    echo "$ROOTLESS_USER:100000:65536" >> /etc/subuid
+    echo "$ROOTLESS_USER:200000:65536" >> /etc/subgid
+    # A directory owned by container UID 1024 (containerID 1000 maps to
+    # 100000), used by a cwd.bats test.
+    local aux
+    aux="$(mktemp -d)"
+    chown "$((100000 - 1000 + 1024))" "$aux"
+    ROOTLESS_UNDO+=("rmdir '$aux'")
+    ROOTLESS_ENV+=(ROOTLESS_UIDMAP_START=100000 ROOTLESS_UIDMAP_LENGTH=65536
+      ROOTLESS_GIDMAP_START=200000 ROOTLESS_GIDMAP_LENGTH=65536
+      ROOTLESS_AUX_UID=1024 ROOTLESS_AUX_DIR="$aux")
+  fi
+
+  if [[ "$ROOTLESS_FEATURES" == *cgroup* ]]; then
+    # Delegate a cgroup to the user (cgroup v2 delegation containment: the
+    # directory, its subtree_control and cgroup.procs, and the root's
+    # cgroup.procs, which processes are moved out of).
+    local c
+    for c in $(cat /sys/fs/cgroup/cgroup.controllers); do
+      echo "+$c" > /sys/fs/cgroup/cgroup.subtree_control || true
+    done
+    mkdir -p "$ROOTLESS_CGROUP"
+    ROOTLESS_UNDO+=("rmdir '$ROOTLESS_CGROUP'")
+    chown "root:$group" "$ROOTLESS_CGROUP" "$ROOTLESS_CGROUP/cgroup.subtree_control" \
+      "$ROOTLESS_CGROUP/cgroup.procs" /sys/fs/cgroup/cgroup.procs
+    ROOTLESS_UNDO+=("chown root:root /sys/fs/cgroup/cgroup.procs")
+    chmod g+rwx "$ROOTLESS_CGROUP"
+    chmod g+rw "$ROOTLESS_CGROUP/cgroup.subtree_control" "$ROOTLESS_CGROUP/cgroup.procs" \
+      /sys/fs/cgroup/cgroup.procs
+    ROOTLESS_UNDO+=("chmod g-w /sys/fs/cgroup/cgroup.procs")
+  fi
+}
+
 escape_ere() {
   sed 's/[][\\.*^$()|+?{}]/\\&/g' <<< "$1"
 }
 
+if [[ -n "$ROOTLESS_USER" ]]; then
+  [[ $EUID -eq 0 ]] || { echo "ERROR: --rootless-user needs the script to run as root" >&2; exit 1; }
+  rootless_setup
+  echo ">>> Rootless mode: user=$ROOTLESS_USER features=${ROOTLESS_FEATURES:-none}"
+fi
+
 # Build per-file filter regexes from the pattern file
-declare -A NAME_TO_FILE
+# A few names exist in more than one file (e.g. "runc run" in run.bats and
+# start_hello.bats); such a name runs in each of them.
+declare -A NAME_TO_FILES
 while IFS= read -r mapping; do
   file="${mapping%%	*}"
   tname="${mapping#*	}"
   tname="${tname%"${tname##*[! ]}"}"
-  NAME_TO_FILE["$tname"]="$file"
+  NAME_TO_FILES["$tname"]+="$file"$'\n'
 done < <(grep -rH '@test "' tests/integration/*.bats \
     | sed -n 's/^\(.*\.bats\):.*@test "\(.*\)" {.*$/\1\t\2/p')
 
 declare -A FILE_FILTER
 declare -A FILE_TEST_COUNT
+declare -A FILE_TESTS    # file -> newline-separated test names
+declare -A SEEN
 PATTERN_SKIP=0
+NOT_FOUND=()
 
 while IFS= read -r name; do
   [[ -z "$name" || "$name" == \#* ]] && continue
@@ -137,20 +291,35 @@ while IFS= read -r name; do
     continue
   fi
 
-  file="${NAME_TO_FILE[$name]:-}"
-  if [[ -z "$file" ]]; then
-    echo "WARN: test not found in any .bats file: $name" >&2
+  # Allow trailing "# comment" (no runc test name contains '#')
+  name="${name%%[[:space:]]#*}"
+  name="${name%"${name##*[! ]}"}"
+
+  if [[ -n "${SEEN[$name]:-}" ]]; then
+    echo "WARN: duplicate entry in pattern file: $name" >&2
+    continue
+  fi
+  SEEN[$name]=1
+
+  files="${NAME_TO_FILES[$name]:-}"
+  if [[ -z "$files" ]]; then
+    echo "ERROR: test not found in any .bats file: $name" >&2
+    NOT_FOUND+=("$name")
     continue
   fi
 
   escaped=$(escape_ere "$name")
-  if [[ -z "${FILE_FILTER[$file]:-}" ]]; then
-    FILE_FILTER[$file]="^${escaped} *$"
-    FILE_TEST_COUNT[$file]=1
-  else
-    FILE_FILTER[$file]="${FILE_FILTER[$file]}|^${escaped} *$"
-    FILE_TEST_COUNT[$file]=$(( ${FILE_TEST_COUNT[$file]} + 1 ))
-  fi
+  while IFS= read -r file; do
+    [[ -z "$file" ]] && continue
+    FILE_TESTS[$file]+="$name"$'\n'
+    if [[ -z "${FILE_FILTER[$file]:-}" ]]; then
+      FILE_FILTER[$file]="^${escaped} *$"
+      FILE_TEST_COUNT[$file]=1
+    else
+      FILE_FILTER[$file]="${FILE_FILTER[$file]}|^${escaped} *$"
+      FILE_TEST_COUNT[$file]=$(( ${FILE_TEST_COUNT[$file]} + 1 ))
+    fi
+  done <<< "$files"
 done < "$PATTERN_FILE"
 
 TOTAL_ENABLED=0
@@ -167,6 +336,12 @@ FAIL=0
 BATS_SKIP=0
 FAIL_NAMES=()
 
+# A pattern entry that matches no test would otherwise be silently dropped.
+for n in "${NOT_FOUND[@]}"; do
+  FAIL=$((FAIL + 1))
+  FAIL_NAMES+=("$n (not found in runc ${RUNC_TAG})")
+done
+
 FILE_INDEX=0
 FILE_TOTAL=${#FILE_FILTER[@]}
 
@@ -175,7 +350,12 @@ for file in $(printf '%s\n' "${!FILE_FILTER[@]}" | sort); do
   filter="${FILE_FILTER[$file]}"
   fname=$(basename "$file")
   expected=${FILE_TEST_COUNT[$file]}
-  timeout_secs=$(( expected * 30 ))
+  # GitHub's arm64 runners are much slower for mount/idmap operations.
+  if [[ "$(uname -m)" == "aarch64" ]]; then
+    timeout_secs=$(( expected * 60 ))
+  else
+    timeout_secs=$(( expected * 30 ))
+  fi
   (( timeout_secs < 180 )) && timeout_secs=180
 
   echo "=== [$FILE_INDEX/$FILE_TOTAL] $fname ($expected tests, ${timeout_secs}s) ==="
@@ -190,19 +370,13 @@ for file in $(printf '%s\n' "${!FILE_FILTER[@]}" | sort); do
   chmod 644 "$FILTER_FILE"
 
   rc=0
-  sudo -E PATH="$PATH" RUNC="$PWD/runc" _BATS_FF="$FILTER_FILE" \
-      timeout "$timeout_secs" script -q -e -c \
-      '. "$_BATS_FF" && exec bats -f "$BATS_FILTER" -t '"$file" /dev/null > "$TMPOUT" 2>&1 \
-    || rc=$?
+  run_bats || rc=$?
 
   if [[ $rc -eq 124 ]]; then
     echo "  TIMEOUT ($fname), retrying..."
     cleanup_stale_state
     rc=0
-    sudo -E PATH="$PATH" RUNC="$PWD/runc" _BATS_FF="$FILTER_FILE" \
-        timeout "$timeout_secs" script -q -e -c \
-        '. "$_BATS_FF" && exec bats -f "$BATS_FILTER" -t '"$file" /dev/null > "$TMPOUT" 2>&1 \
-      || rc=$?
+    run_bats || rc=$?
   fi
   rm -f "$FILTER_FILE"
 
@@ -211,19 +385,27 @@ for file in $(printf '%s\n' "${!FILE_FILTER[@]}" | sort); do
   file_pass=0
   file_fail=0
   in_fail=0
+  declare -A reported=()
   while IFS= read -r line; do
+    line="${line%$'\r'}"    # "script" emits CRLF line endings
     if [[ "$line" =~ ^ok\ [0-9]+\ (.+) ]]; then
       tname="${BASH_REMATCH[1]}"
       if [[ "$tname" =~ \#\ skip ]]; then
-        echo "  SKIP  ${tname%% \# skip*}"
+        tname="${tname%% \# skip*}"
+        tname="${tname%"${tname##*[! ]}"}"
+        echo "  SKIP  $tname"
         BATS_SKIP=$((BATS_SKIP + 1))
       else
+        tname="${tname%"${tname##*[! ]}"}"
         file_pass=$((file_pass + 1))
         echo "  PASS  $tname"
       fi
+      reported[$tname]=1
       in_fail=0
     elif [[ "$line" =~ ^not\ ok\ [0-9]+\ (.+) ]]; then
       tname="${BASH_REMATCH[1]}"
+      tname="${tname%"${tname##*[! ]}"}"
+      reported[$tname]=1
       file_fail=$((file_fail + 1))
       echo "  FAIL  $tname"
       FAIL_NAMES+=("$tname")
@@ -234,6 +416,16 @@ for file in $(printf '%s\n' "${!FILE_FILTER[@]}" | sort); do
       in_fail=0
     fi
   done < "$TMPOUT"
+
+  # Tests that produced no TAP line at all (timeout, bats crash, ...) count
+  # as failures; otherwise a hang in one test silently hides the rest.
+  while IFS= read -r tname; do
+    [[ -z "$tname" || -n "${reported[$tname]:-}" ]] && continue
+    file_fail=$((file_fail + 1))
+    echo "  FAIL  $tname (no result, bats rc=$rc)"
+    FAIL_NAMES+=("$tname (no result, bats rc=$rc)")
+  done <<< "${FILE_TESTS[$file]}"
+  unset reported
 
   if [[ $file_fail -gt 0 ]]; then
     echo "  --- full bats output ($fname) ---"
@@ -247,12 +439,6 @@ for file in $(printf '%s\n' "${!FILE_FILTER[@]}" | sort); do
         echo "  --- end init.log ---"
       fi
     done
-  fi
-
-  if [[ $rc -ne 0 && $file_pass -eq 0 && $file_fail -eq 0 ]]; then
-    file_fail=$expected
-    echo "  FAIL  $fname (bats exited with rc=$rc, no TAP output)"
-    FAIL_NAMES+=("$fname (rc=$rc)")
   fi
 
   PASS=$((PASS + file_pass))
@@ -286,7 +472,7 @@ if [[ -n "$SUMMARY_FILE" ]]; then
   {
     echo "## runc bats compatibility test results"
     echo ""
-    echo "Runtime: nacre (Perl)"
+    echo "Runtime: nacre (Perl)${ROOTLESS_USER:+, rootless (features: ${ROOTLESS_FEATURES:-none})}"
     echo "runc ref: \`${RUNC_TAG}\`"
     echo ""
     echo "| Metric | Count |"

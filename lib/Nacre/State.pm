@@ -1,8 +1,8 @@
 package Nacre::State;
 use v5.38;
 use Exporter 'import';
-use JSON::PP;
-use File::Path qw(remove_tree);
+use Nacre::JSON;
+use Fcntl qw(S_ISVTX);
 use Nacre::Util qw($JSON fatal read_file read_file_or_die write_file_atomic ensure_dir);
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -42,9 +42,9 @@ sub load_cached_spec ($root, $id, $bundle) {
 sub default_spec {
     return {
         ociVersion => '1.2.0',
-        root => {path => 'rootfs', readonly => JSON::PP::true},
+        root => {path => 'rootfs', readonly => Nacre::JSON::true},
         process => {
-            terminal => JSON::PP::true,
+            terminal => Nacre::JSON::true,
             user => {uid => 0, gid => 0},
             args => ['sh'],
             env => ['PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'TERM=xterm',],
@@ -55,7 +55,7 @@ sub default_spec {
                 permitted => [qw(CAP_AUDIT_WRITE CAP_KILL CAP_NET_BIND_SERVICE)],
             },
             rlimits => [{type => 'RLIMIT_NOFILE', hard => 1024, soft => 1024},],
-            noNewPrivileges => JSON::PP::true,
+            noNewPrivileges => Nacre::JSON::true,
         },
         hostname => 'nacre',
         mounts => [
@@ -104,7 +104,7 @@ sub default_spec {
         ],
         linux => {
             resources => {
-                devices => [{allow => JSON::PP::false, access => 'rwm'}],
+                devices => [{allow => Nacre::JSON::false, access => 'rwm'}],
             },
             namespaces => [
                 {type => 'pid'},
@@ -157,7 +157,10 @@ sub save_state ($root, $state) {
 
 sub delete_state ($root, $id) {
     my $dir = state_dir($root, $id);
-    remove_tree($dir) if -d $dir;
+    if (-d $dir) {
+        require File::Path;    # only delete needs it
+        File::Path::remove_tree($dir);
+    }
     return;
 }
 
@@ -240,8 +243,23 @@ sub oci_state_json ($state) {
     return $out;
 }
 
+# Like runc, an unprivileged caller keeps state under $XDG_RUNTIME_DIR (it
+# cannot write /run). The sticky bit keeps the XDG runtime-dir cleaner from
+# pruning it. undef when the default /run/nacre applies.
+sub rootless_default_root () {
+    return if POSIX::geteuid() == 0 || !$ENV{XDG_RUNTIME_DIR};
+    my $root = "$ENV{XDG_RUNTIME_DIR}/nacre";
+
+    # Best effort: commands that never touch state (spec, --version) must
+    # not fail on an unusable $XDG_RUNTIME_DIR; the others fail later with
+    # an error about the state directory itself.
+    mkdir($root, 0700) unless -d $root;
+    chmod(0700 | S_ISVTX, $root) if -O $root;
+    return $root;
+}
+
 our @EXPORT_OK = qw(
-    load_spec cache_spec load_cached_spec default_spec
+    load_spec cache_spec load_cached_spec default_spec rootless_default_root
     state_dir load_state save_state delete_state refresh_state
     parse_proc_starttime get_pid_starttime oci_state_json
 );
