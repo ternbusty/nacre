@@ -628,6 +628,45 @@ run_test "masked paths without a mount namespace are refused" bash -c '
     [ $rc -ne 0 ] && echo "$output" | grep -qF "without a private MNT namespace"
 '
 
+# ── 22. seccomp actions ──
+echo ""
+echo "Seccomp actions:"
+
+seccomp_bundle() {
+    local dir=$1 default=$2 rule=$3
+    make_bundle "$dir" '"sh", "-c", "echo ACTIONS-OK"' ', "seccomp": {
+      "defaultAction": "'"$default"'",
+      "architectures": ["SCMP_ARCH_X86_64", "SCMP_ARCH_AARCH64"],
+      "syscalls": [{ "names": ["acct"], "action": "'"$rule"'" }]
+    }'
+}
+
+# An action nacre does not know must not leave the filter, or a rule, out.
+BUNDLE_BADDEF=$(mktemp -d /tmp/nacre-test-bundle-XXXX)
+seccomp_bundle "$BUNDLE_BADDEF" SCMP_ACT_BOGUS SCMP_ACT_ERRNO
+run_test "unknown seccomp defaultAction is refused" bash -c '
+    output=$(perl '"$NACRE"' --root '"$ROOT"' run --bundle '"$BUNDLE_BADDEF"' test-sec-baddef 2>&1)
+    rc=$?
+    [ $rc -ne 0 ] && echo "$output" | grep -qF "SCMP_ACT_BOGUS'"'"' is not a valid action"
+'
+
+BUNDLE_BADRULE=$(mktemp -d /tmp/nacre-test-bundle-XXXX)
+seccomp_bundle "$BUNDLE_BADRULE" SCMP_ACT_ALLOW SCMP_ACT_BOGUS
+run_test "unknown seccomp rule action is refused" bash -c '
+    output=$(perl '"$NACRE"' --root '"$ROOT"' run --bundle '"$BUNDLE_BADRULE"' test-sec-badrule 2>&1)
+    rc=$?
+    [ $rc -ne 0 ] && echo "$output" | grep -qF "is not a valid action"
+'
+
+for act in SCMP_ACT_KILL_THREAD SCMP_ACT_TRACE; do
+    b=$(mktemp -d /tmp/nacre-test-bundle-XXXX)
+    seccomp_bundle "$b" SCMP_ACT_ALLOW "$act"
+    run_test "seccomp action $act is accepted" bash -c '
+        output=$(perl '"$NACRE"' --root '"$ROOT"' run --bundle '"$b"' test-sec-'"$act"' 2>&1)
+        echo "$output" | grep -qF "ACTIONS-OK"
+    '
+done
+
 # ── Summary ──
 echo ""
 echo "═══════════════════════════════════════════"
