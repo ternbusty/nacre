@@ -41,6 +41,16 @@ jobs:
           cd runtime-tools
           make runtimetest validation-executables
 
+      - name: Diagnose runtimetest under RLIMIT_AS (temporary)
+        run: |
+          cd $HOME/runtime-tools
+          for as in 1073741824 2147483648 4294967296; do
+            echo "== RLIMIT_AS soft=$as"
+            prlimit --as=$as:$((as * 2)) ./runtimetest --help > /tmp/rt-diag.out 2>&1
+            echo "rc=$?"; head -5 /tmp/rt-diag.out
+          done
+          ulimit -a
+
       - name: Build busybox rootfs tarball
         run: |
           set -eux
