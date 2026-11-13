@@ -506,7 +506,43 @@ run_test "update memory limit" bash -c '
     [ "$mem_max" = "268435456" ]
 '
 
-# ── 18. stdio of a container without a terminal ──
+# ── 18. seccomp ──
+echo ""
+echo "Seccomp:"
+
+SECCOMP_CONFIG=', "seccomp": {
+      "defaultAction": "SCMP_ACT_ALLOW",
+      "architectures": ["SCMP_ARCH_X86_64", "SCMP_ARCH_AARCH64"],
+      "syscalls": [{ "names": ["mkdir", "mkdirat"], "action": "SCMP_ACT_ERRNO", "errnoRet": 1 }]
+    }'
+
+BUNDLE_SECCOMP=$(mktemp -d /tmp/nacre-test-bundle-XXXX)
+make_bundle "$BUNDLE_SECCOMP" '"sh", "-c", "mkdir /tmp/d 2>/dev/null && echo MKDIR-ALLOWED || echo MKDIR-BLOCKED"' "$SECCOMP_CONFIG"
+
+run_test "seccomp errno rule blocks the syscall" bash -c '
+    output=$(perl '"$NACRE"' --root '"$ROOT"' run --bundle '"$BUNDLE_SECCOMP"' test-seccomp 2>&1)
+    echo "$output" | grep -qF "MKDIR-BLOCKED"
+'
+
+# The filter is applied after pivot_root: a module the image places where the
+# host's perl looks for modules must not be loaded into the runtime.
+BUNDLE_PLANT=$(mktemp -d /tmp/nacre-test-bundle-XXXX)
+make_bundle "$BUNDLE_PLANT" '"sh", "-c", "echo CONTAINER-RAN"' "$SECCOMP_CONFIG"
+for inc in $(perl -e 'print "@INC"'); do
+    mkdir -p "$BUNDLE_PLANT/rootfs$inc/FFI"
+    cat > "$BUNDLE_PLANT/rootfs$inc/FFI/Platypus.pm" <<'PM'
+package FFI::Platypus;
+open my $fh, '>', '/tmp/image-code-ran';
+1;
+PM
+done
+
+run_test "image perl modules are not loaded by the runtime" bash -c '
+    output=$(perl '"$NACRE"' --root '"$ROOT"' run --bundle '"$BUNDLE_PLANT"' test-seccomp-plant 2>&1)
+    echo "$output" | grep -qF "CONTAINER-RAN" && [ ! -e '"$BUNDLE_PLANT"'/rootfs/tmp/image-code-ran ]
+'
+
+# ── 19. stdio of a container without a terminal ──
 echo ""
 echo "Detached stdio:"
 

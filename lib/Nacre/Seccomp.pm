@@ -9,31 +9,12 @@ use Nacre::Const qw(
 use Nacre::Util qw(log_debug fatal);
 
 # ═══════════════════════════════════════════════════════════════════════
-# Seccomp (via dlopen/dlsym of libseccomp, with BPF fallback)
+# Seccomp (a classic BPF program assembled here and loaded via seccomp(2))
 # ═══════════════════════════════════════════════════════════════════════
-
-my $SECCOMP_AVAILABLE = 0;
-my $LIBSECCOMP;
-
-sub _libseccomp_path {
-    require Config;
-    my $arch = $Config::Config{archname} // '';    ## no critic (ProhibitPackageVars)
-    my $multi = $arch =~ /aarch64|arm64/i ? 'aarch64-linux-gnu' : 'x86_64-linux-gnu';
-    for my $p ("/usr/lib/$multi/libseccomp.so.2", '/usr/lib/libseccomp.so.2') {
-        return $p if -e $p;
-    }
-    return;
-}
-
-sub init_libseccomp {
-    eval {
-        require DynaLoader;
-        my $path = _libseccomp_path() // return;
-        $LIBSECCOMP = DynaLoader::dl_load_file($path, 0);
-        $SECCOMP_AVAILABLE = 1 if $LIBSECCOMP;
-    };
-    return;
-}
+#
+# Everything this module needs is loaded with it, before the container is
+# forked: the filter is applied after pivot_root, when only the container's
+# files are reachable, so nothing may be loaded from disk at that point.
 
 # Seccomp actions
 use constant {
@@ -46,110 +27,14 @@ use constant {
     SCMP_ACT_ERRNO_BASE => 0x00050000,
 };
 
+my %_SYSCALL_NR;
+
 sub apply_seccomp_raw ($spec) {
     my $seccomp = $spec->{linux}{seccomp} // return;
-
-    # If FFI::Platypus is available, use it
-    if (eval {require FFI::Platypus; 1}) {
-        return _apply_seccomp_ffi($spec);
-    }
-
-    # Fallback: build and load BPF program directly via seccomp(2)
+    fatal("seccomp: cannot resolve syscall names: no kernel headers were found (install linux-libc-dev)")
+        if !%_SYSCALL_NR && grep {@{$_->{names} // []}} @{$seccomp->{syscalls} // []};
     return _apply_seccomp_minimal($seccomp);
 }
-
-sub _apply_seccomp_ffi ($spec) {
-    my $seccomp = $spec->{linux}{seccomp} // return;
-
-    require FFI::Platypus;
-    my $ffi = FFI::Platypus->new(api => 2);
-    $ffi->lib(_libseccomp_path() // '/usr/lib/libseccomp.so.2');
-
-    $ffi->attach('seccomp_init' => ['uint32'] => 'opaque');
-    $ffi->attach('seccomp_arch_add' => ['opaque', 'uint32'] => 'int');
-    $ffi->attach(
-        'seccomp_rule_add' => ['opaque', 'uint32', 'int', 'uint'] => 'int',
-        sub ($xsub, @args) {
-            return $xsub->(@args);
-        }
-    );
-    $ffi->attach('seccomp_syscall_resolve_name' => ['string'] => 'int');
-    $ffi->attach('seccomp_load' => ['opaque'] => 'int');
-    $ffi->attach('seccomp_release' => ['opaque'] => 'void');
-    $ffi->attach('seccomp_export_bpf' => ['opaque', 'int'] => 'int');
-    $ffi->attach('seccomp_attr_set' => ['opaque', 'uint32', 'uint32'] => 'int');
-
-    my $default_action_str = $seccomp->{defaultAction} // 'SCMP_ACT_ALLOW';
-    my $default_errno_ret = $seccomp->{defaultErrnoRet};
-    my $default_action = _seccomp_action_val($default_action_str, $default_errno_ret)
-        // fatal("unknown seccomp action: $default_action_str");
-
-    my $ctx = seccomp_init($default_action)
-        or fatal("seccomp_init failed");
-
-    seccomp_attr_set($ctx, 2, 0);    # SCMP_FLTATR_CTL_NNP = 2
-
-    my %arch_map = (
-        SCMP_ARCH_X86_64 => 0xc000003e,
-        SCMP_ARCH_X86 => 0x40000003,
-        SCMP_ARCH_AARCH64 => 0xc00000b7,
-        SCMP_ARCH_ARM => 0x40000028,
-    );
-
-    for my $arch (@{$seccomp->{architectures} // []}) {
-        my $arch_val = $arch_map{$arch} // next;
-        seccomp_arch_add($ctx, $arch_val);
-    }
-
-    for my $rule (@{$seccomp->{syscalls} // []}) {
-        my $action_str = $rule->{action} // $default_action_str;
-        my $errno_val = $rule->{errnoRet} // $default_errno_ret;
-        my $action = _seccomp_action_val($action_str, $errno_val) // next;
-
-        for my $name (@{$rule->{names} // []}) {
-            my $nr = seccomp_syscall_resolve_name($name);
-            next if $nr < 0;
-            seccomp_rule_add($ctx, $action, $nr, 0);
-        }
-    }
-
-    pipe(my $rd, my $wr) or fatal("pipe for seccomp export: $!");
-    my $fd = fileno($wr);
-    my $ret = seccomp_export_bpf($ctx, $fd);
-    close $wr;
-
-    if ($ret == 0) {
-        local $/ = undef;
-        my $bpf_prog = <$rd>;
-        close $rd;
-
-        if (defined $bpf_prog && length $bpf_prog >= 8) {
-            my $filter_count = length($bpf_prog) / 8;
-            my $sock_fprog = pack('S x![P] P', $filter_count, unpack('Q', pack('P', $bpf_prog)));
-
-            my $nr_sec = SYS_seccomp + 0;
-            my $op = SECCOMP_SET_MODE_FILTER + 0;
-            my $fl = _resolve_seccomp_flags($seccomp, 0);
-            my $sec_ret = syscall($nr_sec, $op, $fl, $sock_fprog);
-            if ($sec_ret != 0) {
-                seccomp_release($ctx);
-                fatal("seccomp: BPF load failed via FFI (errno=$!)");
-            }
-        }
-    } else {
-        close $rd;
-        my $lr = seccomp_load($ctx);
-        if ($lr != 0) {
-            seccomp_release($ctx);
-            fatal("seccomp: seccomp_load failed (ret=$lr)");
-        }
-    }
-
-    seccomp_release($ctx);
-    return;
-}
-
-my %_SYSCALL_NR;
 
 sub _init_syscall_table {
     return if %_SYSCALL_NR;
@@ -178,8 +63,9 @@ sub _init_syscall_table {
     return;
 }
 
+# The table is filled when this module loads, from the host's headers. Never
+# retry here: by now the container's headers would be read instead.
 sub _resolve_seccomp_syscall ($name) {
-    _init_syscall_table();
     return $_SYSCALL_NR{$name};
 }
 
@@ -440,7 +326,7 @@ sub _apply_seccomp_minimal ($seccomp) {
     }
 }
 
-our @EXPORT_OK = qw(init_libseccomp apply_seccomp_raw);
+our @EXPORT_OK = qw(apply_seccomp_raw);
 
 _init_syscall_table();
 
