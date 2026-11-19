@@ -1,6 +1,29 @@
 #!/usr/bin/perl
 # nacre — a Linux OCI container runtime written in Perl
 use v5.38;
+
+# The commands that run perl inside a container first re-exec perl from a
+# copy the container cannot write (CVE-2019-5736, see Nacre::ExeGuard):
+# here, before the rest of this file is compiled, so it is compiled once,
+# and before the pragmas below, whose modules (feature.pm, warnings.pm) the
+# process that only re-execs would load for nothing.
+BEGIN {
+    # The re-executed perl (marked by Nacre::ExeGuard) and rootless runs (whose
+    # container root cannot write the host's perl) need not load the module.
+    if (!delete $ENV{_NACRE_EXE_GUARDED} && $> == 0 && grep {$_ eq 'create' || $_ eq 'run' || $_ eq 'exec'} @ARGV) {
+
+        # This process only re-execs: find lib/ as FindBin's RealBin does,
+        # without the ~6 ms of loading FindBin.
+        my $script = __FILE__;
+        while (defined(my $link = readlink $script)) {
+            $script = $link =~ m{^/} ? $link : ($script =~ s{[^/]*\z}{}r) . $link;
+        }
+        my $dir = $script =~ m{/} ? $script =~ s{[^/]*\z}{}r : './';
+        require "${dir}lib/Nacre/ExeGuard.pm";    ## no critic (RequireBarewordIncludes) -- by path, as @INC has no lib/ yet
+        Nacre::ExeGuard::reexec_from_protected_copy(\@ARGV);
+    }
+}
+
 use feature 'try', 'defer';
 no warnings 'experimental::try', 'experimental::defer';
 
@@ -35,7 +58,7 @@ use Nacre::Const qw(
     SYS_sethostname SYS_setdomainname SYS_setgroups SYS_fchown SYS_waitid
     CLONE_NEWNS CLONE_NEWUSER CLONE_NEWPID CLONE_NEWCGROUP CLONE_NEWTIME
     SIGCHLD MS_MOVE
-    PR_SET_NO_NEW_PRIVS PR_SET_CHILD_SUBREAPER PR_SET_PDEATHSIG
+    PR_SET_NO_NEW_PRIVS PR_SET_CHILD_SUBREAPER PR_SET_PDEATHSIG PR_SET_DUMPABLE
     SECCOMP_FILTER_FLAG_TSYNC SECCOMP_FILTER_FLAG_LOG
     SECCOMP_FILTER_FLAG_NEW_LISTENER
     CLOSE_RANGE_CLOEXEC AT_RECURSIVE AT_EMPTY_PATH MOUNT_ATTR_IDMAP
@@ -2360,6 +2383,11 @@ sub cmd_exec (%p) {    ## no critic (Subroutines::ProhibitExcessComplexity)
 
         log_debug("nsexec container setup");
         log_debug("child process in init()");
+
+        # Not dumpable while it is in the container's namespaces, as runc's
+        # nsexec: the container's processes cannot open its /proc/<pid>
+        # entries (exe, fd, mem, ...). Exec'ing the program resets it.
+        do_syscall(SYS_prctl, PR_SET_DUMPABLE, 0, 0, 0, 0);
 
         _exec_child_join_ns(\@ns_fds, $pipes->{err_w});
         for my $ns (@ns_fds) {close $ns->{fd};}
