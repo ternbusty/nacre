@@ -14,12 +14,19 @@ jobs:
         with:
           fetch-depth: 0
 
+      # The modules in ~/perl5 include XS built for this runner's perl: key
+      # the cache on the image and the perl version, so that a new image
+      # (ubuntu-latest moving on) builds them again instead of loading ones
+      # its perl cannot ("loadable library and perl binaries are mismatched").
+      - name: Find image and perl version
+        id: perl
+        run: echo "version=$ImageOS-$(perl -e 'print $^V')" >> "$GITHUB_OUTPUT"
+
       - name: Cache CPAN modules
         uses: actions/cache@v4
         with:
           path: ~/perl5
-          key: cpan-${{ runner.os }}-perl-tidy-critic
-          restore-keys: cpan-${{ runner.os }}-
+          key: cpan-${{ runner.os }}-${{ steps.perl.outputs.version }}-tidy-critic
 
       - name: Install Perl::Tidy and Perl::Critic
         run: |
