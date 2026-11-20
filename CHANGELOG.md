@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.1](https://github.com/ternbusty/nacre/compare/v0.3.0...v0.3.1) (2026-11-20)
+
+
+### Bug Fixes
+
+* keep the container from writing to the host's perl (CVE-2019-5736) ([#27](https://github.com/ternbusty/nacre/issues/27)) ([ba4027a](https://github.com/ternbusty/nacre/commit/ba4027ae45930f669b8468ec27968abe535e5686))
+* **seccomp:** refuse an action nacre does not know instead of skipping it ([#26](https://github.com/ternbusty/nacre/issues/26)) ([b2eb8eb](https://github.com/ternbusty/nacre/commit/b2eb8eb58d32f2c55fc2c07d476a8f3c35a629d7))
+
+
+### Performance Improvements
+
+* close the init's fds with close_range, not a 1020-call loop ([#29](https://github.com/ternbusty/nacre/issues/29)) ([ac4fc5c](https://github.com/ternbusty/nacre/commit/ac4fc5c4038021cfc43b05a6aabcb6083f213d48))
+
 ## [0.3.0](https://github.com/ternbusty/nacre/compare/v0.2.0...v0.3.0) (2026-11-13)
 
 
