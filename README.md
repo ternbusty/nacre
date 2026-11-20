@@ -6,7 +6,6 @@ A Linux OCI container runtime written in Perl.
 
 - Linux (kernel 5.x+)
 - Perl 5.38+
-- Kernel headers (`linux-libc-dev` on Debian and Ubuntu): nacre reads the syscall numbers for seccomp filters from them
 
 ## Install
 

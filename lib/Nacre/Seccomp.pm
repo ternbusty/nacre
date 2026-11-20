@@ -7,6 +7,7 @@ use Nacre::Const qw(
     SECCOMP_FILTER_FLAG_NEW_LISTENER SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV
 );
 use Nacre::Util qw(log_debug fatal);
+use Nacre::SyscallTable ();
 
 # ═══════════════════════════════════════════════════════════════════════
 # Seccomp (a classic BPF program assembled here and loaded via seccomp(2))
@@ -27,82 +28,16 @@ use constant {
     SCMP_ACT_ERRNO_BASE => 0x00050000,
 };
 
-my %_SYSCALL_NR;
+# Syscall name -> number on this machine's architecture
+my %_SYSCALL_NR = Nacre::SyscallTable::native_table();
 
 sub apply_seccomp_raw ($spec) {
     my $seccomp = $spec->{linux}{seccomp} // return;
-    fatal("seccomp: cannot resolve syscall names: no kernel headers were found (install linux-libc-dev)")
+    fatal("seccomp: cannot resolve syscall names: nacre has no syscall table for this architecture")
         if !%_SYSCALL_NR && grep {@{$_->{names} // []}} @{$seccomp->{syscalls} // []};
     return _apply_seccomp_minimal($seccomp);
 }
 
-sub _init_syscall_table {
-    return if %_SYSCALL_NR;
-    require Config;
-    my $arch = $Config::Config{archname} // '';    ## no critic (ProhibitPackageVars)
-
-    my @hdrs;
-    if ($arch =~ /x86_64|amd64/i) {
-        @hdrs = ('/usr/include/x86_64-linux-gnu/asm/unistd_64.h', '/usr/include/asm/unistd_64.h',);
-    } elsif ($arch =~ /aarch64|arm64/i) {
-        @hdrs = ('/usr/include/aarch64-linux-gnu/asm/unistd.h', '/usr/include/asm-generic/unistd.h',);
-    } else {
-        @hdrs = ('/usr/include/asm/unistd.h');
-    }
-
-    for my $hdr (@hdrs) {
-        my $ok = open my $fh, '<', $hdr;
-        next unless $ok;
-        %_SYSCALL_NR = _parse_unistd($fh);
-        close $fh;
-        last if %_SYSCALL_NR;
-    }
-    return;
-}
-
-# asm-generic/unistd.h (aarch64) numbers some syscalls as __NR3264_<base>
-# and names them through aliases, one set for 64-bit and one for 32-bit:
-#   #if __BITS_PER_LONG == 64 && !defined(__SYSCALL_COMPAT)
-#   #define __NR_newfstatat __NR3264_fstatat
-#   #else
-#   #define __NR_fstatat64 __NR3264_fstatat
-#   #endif
-# Take the 64-bit names; without them a profile's newfstatat, fstat, fcntl,
-# lseek or mmap is unknown and left out of the filter.
-sub _parse_unistd ($fh) {
-    my (%nr, %nr3264, @aliases);
-    my ($depth, $bits64_depth, $in_bits32) = (0, undef, 0);
-    while (my $line = <$fh>) {
-        if ($line =~ /^\s*#\s*if/) {
-            $depth++;
-            $bits64_depth = $depth if $line =~ /__BITS_PER_LONG\s*==\s*64/;
-            next;
-        }
-        if ($line =~ /^\s*#\s*else/) {
-            $in_bits32 = 1 if defined $bits64_depth && $depth == $bits64_depth;
-            next;
-        }
-        if ($line =~ /^\s*#\s*endif/) {
-            ($bits64_depth, $in_bits32) = (undef, 0) if defined $bits64_depth && $depth == $bits64_depth;
-            $depth--;
-            next;
-        }
-        next unless $line =~ /^\s*#\s*define\s+__NR(3264)?_(\w+)\s+(\w+)/;
-        my ($is3264, $name, $value) = ($1, $2, $3);
-        if ($value =~ /^\d+$/) {
-            ($is3264 ? $nr3264{$name} : $nr{$name}) = $value + 0;
-        } elsif (!$is3264 && !$in_bits32 && $value =~ /^__NR3264_(\w+)$/) {
-            push @aliases, [$name, $1];
-        }
-    }
-    for my $a (@aliases) {
-        $nr{$a->[0]} = $nr3264{$a->[1]} if defined $nr3264{$a->[1]};
-    }
-    return %nr;
-}
-
-# The table is filled when this module loads, from the host's headers. Never
-# retry here: by now the container's headers would be read instead.
 sub _resolve_seccomp_syscall ($name) {
     return $_SYSCALL_NR{$name};
 }
@@ -385,7 +320,5 @@ sub _apply_seccomp_minimal ($seccomp) {
 }
 
 our @EXPORT_OK = qw(apply_seccomp_raw validate_seccomp);
-
-_init_syscall_table();
 
 1;
