@@ -300,6 +300,31 @@ sub _init_run_create_hooks ($spec, $rootfs, $id, $bundle, $main_chan_w, $main_ch
     return;
 }
 
+# Close every fd >= $from except $keep (which may be undef). Uses close_range
+# (one call, or two around $keep) and falls back to a loop on kernels without
+# it. Unlike the exec-time close in _init_post_start, these fds are closed now
+# (flags 0), not marked close-on-exec: the init still has to wait for start.
+sub close_fds_except ($from, $keep) {
+    my $via_range = sub ($lo, $hi) {
+        $lo <= $hi ? do_syscall(SYS_close_range, $lo, $hi, 0) : 0;
+    };
+    my $ok;
+    if (!defined $keep) {
+        $ok = $via_range->($from, ~0) != -1;
+    } else {
+        $ok = $via_range->($from, $keep - 1) != -1
+            && $via_range->($keep + 1, ~0) != -1;
+    }
+    return if $ok;
+
+    # Old kernel (no close_range): fall back to a bounded loop.
+    for my $fd ($from .. 1023) {
+        next if defined $keep && $fd == $keep;
+        POSIX::close($fd);
+    }
+    return;
+}
+
 sub run_init_process (    ## no critic (RequireFinalReturn)
     $spec, $rootfs, $notify_fd, $main_chan_w, $main_chan_r,
     $cgpath, $id, $bundle, $console_socket_path, $debug_fd,
@@ -384,10 +409,7 @@ sub run_init_process (    ## no critic (RequireFinalReturn)
     # Channel fds are no longer needed — seccomp handoff is complete and
     # init_ready has been sent.
     my $notify_fileno = ref($notify_fd) ? fileno($notify_fd) : $notify_fd;
-    for my $fd (3 .. 1023) {
-        next if defined $notify_fileno && $fd == $notify_fileno;
-        POSIX::close($fd);
-    }
+    close_fds_except(3, $notify_fileno);
 
     # Install signal handlers before waiting.  As PID 1 in the container's
     # PID namespace, signals without explicit handlers are silently ignored
