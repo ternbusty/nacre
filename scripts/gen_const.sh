@@ -233,6 +233,10 @@ emit_section "mount_setattr flags (kernel 5.12+)" \
 emit_section "PTY / terminal ioctls" \
     TIOCGPTN TIOCSPTLCK TIOCSCTTY TIOCSWINSZ TIOCGWINSZ
 
+emit_section "memfd and file sealing" \
+    MFD_CLOEXEC MFD_ALLOW_SEALING \
+    F_ADD_SEALS F_SEAL_SEAL F_SEAL_SHRINK F_SEAL_GROW F_SEAL_WRITE
+
 cat <<'SIGNALS'
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -319,6 +323,9 @@ our @EXPORT_OK = qw(
     OPEN_TREE_CLONE OPEN_TREE_CLOEXEC MOVE_MOUNT_F_EMPTY_PATH
 
     TIOCGPTN TIOCSPTLCK TIOCSCTTY TIOCSWINSZ TIOCGWINSZ
+
+    MFD_CLOEXEC MFD_ALLOW_SEALING
+    F_ADD_SEALS F_SEAL_SEAL F_SEAL_SHRINK F_SEAL_GROW F_SEAL_WRITE
 
     %SIG_NUM %NS_MAP
 );

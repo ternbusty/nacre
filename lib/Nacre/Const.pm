@@ -264,6 +264,19 @@ use constant {
 };
 
 # ═══════════════════════════════════════════════════════════════════════
+# memfd and file sealing
+# ═══════════════════════════════════════════════════════════════════════
+use constant {
+    MFD_CLOEXEC => 0x00000001,
+    MFD_ALLOW_SEALING => 0x00000002,
+    F_ADD_SEALS => 1033,
+    F_SEAL_SEAL => 0x00000001,
+    F_SEAL_SHRINK => 0x00000002,
+    F_SEAL_GROW => 0x00000004,
+    F_SEAL_WRITE => 0x00000008,
+};
+
+# ═══════════════════════════════════════════════════════════════════════
 # Signals (name -> number, from Perl's Config at runtime)
 # ═══════════════════════════════════════════════════════════════════════
 use Config;
@@ -339,6 +352,9 @@ our @EXPORT_OK = qw(
     OPEN_TREE_CLONE OPEN_TREE_CLOEXEC MOVE_MOUNT_F_EMPTY_PATH
 
     TIOCGPTN TIOCSPTLCK TIOCSCTTY TIOCSWINSZ TIOCGWINSZ
+
+    MFD_CLOEXEC MFD_ALLOW_SEALING
+    F_ADD_SEALS F_SEAL_SEAL F_SEAL_SHRINK F_SEAL_GROW F_SEAL_WRITE
 
     %SIG_NUM %NS_MAP
 );

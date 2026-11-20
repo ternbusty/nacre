@@ -666,6 +666,88 @@ for act in SCMP_ACT_KILL_THREAD SCMP_ACT_TRACE; do
         echo "$output" | grep -qF "ACTIONS-OK"
     '
 done
+# ── 23. the container cannot write to the host's perl (CVE-2019-5736) ──
+echo ""
+echo "Host perl binary:"
+
+# The program nacre starts is a "#!/proc/self/exe" script, so the container
+# runs the perl binary nacre runs, keeps hold of it and writes to it once
+# nacre has exited. nacre runs here with a copy of perl: an attack that
+# works writes to the copy, not to the host's perl.
+PERL_COPY_DIR=$(mktemp -d /tmp/nacre-test-bundle-XXXX)
+
+make_exe_bundle() {
+    local dir=$1 args=$2
+    make_bundle "$dir" "$args"
+    # perl needs its libraries to start in the container
+    for lib in $(ldd "$(command -v perl)" | grep -oE '/[^ ]+'); do
+        mkdir -p "$dir/rootfs$(dirname "$lib")"
+        cp -L "$lib" "$dir/rootfs$lib"
+    done
+    # With "bg", the writes go on in the background after the program exits:
+    # "nacre exec" waits for it in perl, which keeps the file busy.
+    cat > "$dir/rootfs/bin/victim" <<'VICTIM'
+#!/proc/self/exe -x
+#!perl
+open my $exe, '<', '/proc/self/exe' or die "open /proc/self/exe: $!";
+fcntl($exe, 2, 0);    # F_SETFD: keep it open across the exec
+my $fd = fileno $exe;
+my $loop = "i=0; while [ \$i -lt 30 ]; do
+    if echo PWNED >> /proc/self/fd/$fd 2>/dev/null; then echo overwritten > /tmp/result; exit; fi
+    i=\$((i + 1)); sleep 0.1; done; echo protected > /tmp/result";
+exec '/bin/sh', '-c', ($ARGV[0] // '') eq 'bg' ? "($loop) </dev/null >/dev/null 2>&1 &" : $loop;
+VICTIM
+    chmod +x "$dir/rootfs/bin/victim"
+}
+BUNDLE_EXE_START=$(mktemp -d /tmp/nacre-test-bundle-XXXX)
+make_exe_bundle "$BUNDLE_EXE_START" '"/bin/victim"'
+BUNDLE_EXE_EXEC=$(mktemp -d /tmp/nacre-test-bundle-XXXX)
+make_exe_bundle "$BUNDLE_EXE_EXEC" '"sleep","30"'
+
+# exe_attack <start|exec> [VAR=value...]: run /bin/victim as the container's
+# program or through "nacre exec", with nacre on the copy of perl; prints
+# what the container saw and whether the copy changed.
+exe_attack() {
+    local via=$1
+    shift
+    local id="test-exe-$via" copy="$PERL_COPY_DIR/perl" bundle="$BUNDLE_EXE_EXEC"
+    [ "$via" = start ] && bundle="$BUNDLE_EXE_START"
+    cp "$(command -v perl)" "$copy"
+    rm -f "$bundle/rootfs/tmp/result"
+    env "$@" "$copy" "$NACRE" --root "$ROOT" create --bundle "$bundle" "$id" </dev/null >/dev/null 2>&1
+    env "$@" "$copy" "$NACRE" --root "$ROOT" start "$id" >/dev/null 2>&1
+    if [ "$via" = exec ]; then
+        env "$@" "$copy" "$NACRE" --root "$ROOT" exec --detach "$id" /bin/victim bg </dev/null >/dev/null 2>&1
+    fi
+    for _ in $(seq 60); do
+        [ -s "$bundle/rootfs/tmp/result" ] && break
+        sleep 0.1
+    done
+    cat "$bundle/rootfs/tmp/result" 2>/dev/null || echo "no result"
+    if cmp -s "$copy" "$(command -v perl)"; then echo "perl unchanged"; else echo "perl changed"; fi
+    perl "$NACRE" --root "$ROOT" delete --force "$id" >/dev/null 2>&1
+}
+
+# exe_check <start|exec> <guarded|unguarded>. Unguarded skips the re-exec
+# (it is how the re-executed nacre knows it already ran from the copy) and
+# checks the attack itself works here, so that "protected" means something.
+exe_check() {
+    local out
+    if [ "$2" = guarded ]; then
+        out=$(exe_attack "$1")
+        echo "$out"
+        [ "$out" = $'protected\nperl unchanged' ]
+    else
+        out=$(exe_attack "$1" _NACRE_EXE_GUARDED=1)
+        echo "$out"
+        [ "$out" = $'overwritten\nperl changed' ]
+    fi
+}
+
+run_test "without the re-exec, the container's program writes to perl" exe_check start unguarded
+run_test "the container's program cannot write to perl" exe_check start guarded
+run_test "without the re-exec, a program run by exec writes to perl" exe_check exec unguarded
+run_test "a program run by exec cannot write to perl" exe_check exec guarded
 
 # ── Summary ──
 echo ""

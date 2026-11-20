@@ -18,6 +18,7 @@
 #include <linux/close_range.h>
 #include <linux/mount.h>
 #include <linux/fcntl.h>
+#include <linux/memfd.h>
 #include <signal.h>
 
 #define P(name)  printf(#name "=%d\n", (int)(name))
@@ -219,6 +220,15 @@ int main(void) {
     /* ── fcntl extras ───────────────────────────────────────────── */
     PX(O_CLOEXEC);
     PX(O_PATH);
+
+    /* ── memfd and file sealing ─────────────────────────────────── */
+    PX(MFD_CLOEXEC);
+    PX(MFD_ALLOW_SEALING);
+    P(F_ADD_SEALS);
+    PX(F_SEAL_SEAL);
+    PX(F_SEAL_SHRINK);
+    PX(F_SEAL_GROW);
+    PX(F_SEAL_WRITE);
 
     return 0;
 }
