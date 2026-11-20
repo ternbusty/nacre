@@ -109,6 +109,7 @@ sub _resolve_seccomp_syscall ($name) {
 
 my %_SECCOMP_RET = (
     SCMP_ACT_KILL => 0x00000000,
+    SCMP_ACT_KILL_THREAD => 0x00000000,
     SCMP_ACT_KILL_PROCESS => 0x80000000,
     SCMP_ACT_TRAP => 0x00030000,
     SCMP_ACT_NOTIFY => 0x7fc00000,
@@ -127,6 +128,26 @@ sub _seccomp_action_val ($str, $errno_override = undef) {
     }
     if ($str =~ /^SCMP_ACT_TRACE\((\d+)\)$/) {
         return 0x7ff00000 | ($1 & 0xffff);
+    }
+    if ($str eq 'SCMP_ACT_TRACE') {
+
+        # As runc: errnoRet, if given, is the value the tracer sees, else EPERM
+        my $ev = $errno_override // 1;
+        return 0x7ff00000 | ($ev & 0xffff);
+    }
+    return;
+}
+
+# An action nacre does not know must not leave the filter, or a rule of it,
+# out: refuse the spec, as runc does.
+sub validate_seccomp ($seccomp) {
+    my $default = $seccomp->{defaultAction} // 'SCMP_ACT_ALLOW';
+    fatal("seccomp: '$default' is not a valid action")
+        unless defined _seccomp_action_val($default, $seccomp->{defaultErrnoRet});
+    for my $rule (@{$seccomp->{syscalls} // []}) {
+        my $act = $rule->{action} // $default;
+        fatal("seccomp: '$act' is not a valid action")
+            unless defined _seccomp_action_val($act, $rule->{errnoRet} // $seccomp->{defaultErrnoRet});
     }
     return;
 }
@@ -281,14 +302,13 @@ sub _apply_seccomp_minimal ($seccomp) {
     my $default_errno_ret = $seccomp->{defaultErrnoRet};
 
     my $default_ret = _seccomp_action_val($default_str, $default_errno_ret)
-        // do {warn "nacre: seccomp: unknown default action $default_str\n"; return};
+        // fatal("seccomp: '$default_str' is not a valid action");
 
     my @rules;
     for my $rule (@{$seccomp->{syscalls} // []}) {
         my $act = $rule->{action} // $default_str;
         my $errno_val = $rule->{errnoRet} // $default_errno_ret;
-        my $ret = _seccomp_action_val($act, $errno_val);
-        next unless defined $ret;
+        my $ret = _seccomp_action_val($act, $errno_val) // fatal("seccomp: '$act' is not a valid action");
         next if $ret == $default_ret;
 
         my @rule_args;
@@ -364,7 +384,7 @@ sub _apply_seccomp_minimal ($seccomp) {
     }
 }
 
-our @EXPORT_OK = qw(apply_seccomp_raw);
+our @EXPORT_OK = qw(apply_seccomp_raw validate_seccomp);
 
 _init_syscall_table();
 

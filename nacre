@@ -63,7 +63,7 @@ use Nacre::State qw(
 # Only container setup needs these; most other commands never load them.
 # cmd_create and cmd_exec load them all up front (see Nacre::Lazy).
 use Nacre::FastPath qw(cmd_state cmd_list);
-use Nacre::Lazy 'Nacre::Seccomp' => qw(apply_seccomp_raw);
+use Nacre::Lazy 'Nacre::Seccomp' => qw(apply_seccomp_raw validate_seccomp);
 use Nacre::Lazy 'Nacre::Device' => qw(apply_device_cgroup);
 use Nacre::Lazy 'Nacre::Net' => qw(move_net_devices rename_net_devices);
 use Nacre::Lazy 'Nacre::Caps' => qw(validate_capabilities);
@@ -559,6 +559,7 @@ sub _validate_namespaces ($spec) {
 sub _validate_create_spec ($spec) {
     _validate_namespaces($spec);
     if (my $seccomp = $spec->{linux}{seccomp}) {
+        validate_seccomp($seccomp);
         my $has_notify = 0;
         for my $rule (@{$seccomp->{syscalls} // []}) {
             if (($rule->{action} // '') eq 'SCMP_ACT_NOTIFY') {
