@@ -2,6 +2,20 @@
 # nacre — a Linux OCI container runtime written in Perl
 use v5.38;
 
+# Put lib/ next to this file, as an absolute path, at the front of @INC.
+# FindBin's RealBin gives the same directory, but loading FindBin and the
+# modules only it needs here (Cwd, File::Spec) took ~2 ms of the ~14 ms of
+# "state". nacre chdirs later, so a relative path is made absolute from the
+# current directory.
+BEGIN {
+    my $script = __FILE__;
+    while (defined(my $link = readlink $script)) {
+        $script = $link =~ m{^/} ? $link : ($script =~ s{[^/]*\z}{}r) . $link;
+    }
+    $script = readlink('/proc/self/cwd') . "/$script" unless $script =~ m{^/};
+    unshift @INC, ($script =~ s{[^/]*\z}{}r) . 'lib';
+}
+
 # The commands that run perl inside a container first re-exec perl from a
 # copy the container cannot write (CVE-2019-5736, see Nacre::ExeGuard):
 # here, before the rest of this file is compiled, so it is compiled once,
@@ -11,15 +25,7 @@ BEGIN {
     # The re-executed perl (marked by Nacre::ExeGuard) and rootless runs (whose
     # container root cannot write the host's perl) need not load the module.
     if (!delete $ENV{_NACRE_EXE_GUARDED} && $> == 0 && grep {$_ eq 'create' || $_ eq 'run' || $_ eq 'exec'} @ARGV) {
-
-        # This process only re-execs: find lib/ as FindBin's RealBin does,
-        # without the ~6 ms of loading FindBin.
-        my $script = __FILE__;
-        while (defined(my $link = readlink $script)) {
-            $script = $link =~ m{^/} ? $link : ($script =~ s{[^/]*\z}{}r) . $link;
-        }
-        my $dir = $script =~ m{/} ? $script =~ s{[^/]*\z}{}r : './';
-        require "${dir}lib/Nacre/ExeGuard.pm";    ## no critic (RequireBarewordIncludes) -- by path, as @INC has no lib/ yet
+        require Nacre::ExeGuard;
         Nacre::ExeGuard::reexec_from_protected_copy(\@ARGV);
     }
 }
@@ -27,14 +33,11 @@ BEGIN {
 use feature 'try', 'defer';
 no warnings 'experimental::try', 'experimental::defer';
 
-# "state" and "list" are called often (container managers poll them) and
-# only read state.json: answer them here, before the rest of this file --
-# most of the start-up time -- is compiled. Nacre::FastPath returns for
-# anything it does not handle exactly like the regular path.
+# "state" and "list" only read state.json: answer them here, before the rest
+# of this file -- most of the start-up time -- is compiled. Nacre::FastPath
+# returns for anything it does not handle exactly like the regular path.
 BEGIN {
     if (grep {$_ eq 'state' || $_ eq 'list'} @ARGV) {
-        require FindBin;
-        unshift @INC, "$FindBin::RealBin/lib";
         require Nacre::FastPath;
         Nacre::FastPath::try_fast(\@ARGV);
     }
@@ -49,8 +52,6 @@ use Fcntl qw(:flock :mode :seek O_RDONLY O_WRONLY O_RDWR O_CREAT
 use Time::HiRes qw(usleep);
 use Cwd qw(abs_path getcwd);
 use Errno qw(EINTR EAGAIN EWOULDBLOCK ENOENT EEXIST EBUSY EPERM ENOSYS EACCES EOVERFLOW);
-use FindBin;
-use lib "$FindBin::RealBin/lib";
 use Nacre::Getopt qw(GetOptions);
 use Nacre::Const qw(
     O_CLOEXEC O_PATH

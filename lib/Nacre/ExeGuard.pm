@@ -76,7 +76,6 @@ sub _readonly_mount () {
 
 # A copy of the running perl binary in a memfd sealed against writes.
 sub _sealed_memfd () {
-    unshift @INC, __FILE__ =~ s{/Nacre/ExeGuard\.pm\z}{}r;
     require Nacre::Const;
     my $name = "nacre-perl\0";
     my $fd = syscall(Nacre::Const::SYS_memfd_create() + 0,
