@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.2](https://github.com/ternbusty/nacre/compare/v0.3.1...v0.3.2) (2026-11-22)
+
+
+### Bug Fixes
+
+* resolve seccomp syscall names without the host's kernel headers ([#31](https://github.com/ternbusty/nacre/issues/31)) ([5c0fb5f](https://github.com/ternbusty/nacre/commit/5c0fb5f0b9dfaf9334a505feebaba3c42af9cf09))
+
+
+### Performance Improvements
+
+* find lib/ without FindBin ([#32](https://github.com/ternbusty/nacre/issues/32)) ([99de34b](https://github.com/ternbusty/nacre/commit/99de34b454c7e57926896864d3e8c1dbf0efc7dc))
+* keep POSIX, File::Basename and Config_heavy.pl out of state and list ([#33](https://github.com/ternbusty/nacre/issues/33)) ([a30d6c3](https://github.com/ternbusty/nacre/commit/a30d6c30106e73465fea7e0fbc9cffde670ac4bc))
+
 ## [0.3.1](https://github.com/ternbusty/nacre/compare/v0.3.0...v0.3.1) (2026-11-20)
 
 
