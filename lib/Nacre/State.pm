@@ -247,7 +247,7 @@ sub oci_state_json ($state) {
 # cannot write /run). The sticky bit keeps the XDG runtime-dir cleaner from
 # pruning it. undef when the default /run/nacre applies.
 sub rootless_default_root () {
-    return if POSIX::geteuid() == 0 || !$ENV{XDG_RUNTIME_DIR};
+    return if $> == 0 || !$ENV{XDG_RUNTIME_DIR};
     my $root = "$ENV{XDG_RUNTIME_DIR}/nacre";
 
     # Best effort: commands that never touch state (spec, --version) must

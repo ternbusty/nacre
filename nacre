@@ -64,7 +64,7 @@ use Nacre::Const qw(
     SECCOMP_FILTER_FLAG_NEW_LISTENER
     CLOSE_RANGE_CLOEXEC AT_RECURSIVE AT_EMPTY_PATH MOUNT_ATTR_IDMAP
     TIOCGPTN TIOCSPTLCK TIOCSCTTY TIOCSWINSZ TIOCGWINSZ
-    @CAP_NAMES %SIG_NUM %NS_MAP
+    @CAP_NAMES %NS_MAP
 );
 use Nacre::Util qw(
     $JSON $JSON_COMPACT $LOG_FH
@@ -113,6 +113,19 @@ use Nacre::Lazy 'Nacre::Mount' => qw(
 
 # -- Default root path for state --
 my $DEFAULT_ROOT = '/run/nacre';
+
+# -- Signal name -> number, from perl's Config --
+# Not in Nacre::Const: sig_name and sig_num load Config_heavy.pl, which
+# "state" and "list" (Nacre::FastPath) would load for nothing.
+my %SIG_NUM;
+{
+    require Config;
+    my @names = split ' ', $Config::Config{sig_name};    ## no critic (ProhibitPackageVars)
+    my @nums = split ' ', $Config::Config{sig_num};    ## no critic (ProhibitPackageVars)
+    for my $i (0 .. $#names) {
+        $SIG_NUM{$names[$i]} = $nums[$i] if $names[$i] && $nums[$i];
+    }
+}
 
 # ═══════════════════════════════════════════════════════════════════════
 # Init Process (runs inside the container)

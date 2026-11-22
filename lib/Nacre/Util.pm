@@ -2,8 +2,6 @@ package Nacre::Util;
 use v5.38;
 use Exporter 'import';
 use Nacre::JSON;
-use File::Basename qw(dirname);
-use POSIX qw(WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG);
 use Fcntl qw(:mode);
 use Errno qw(EINTR);
 use Time::HiRes qw(usleep);
@@ -123,16 +121,24 @@ sub write_file_atomic ($path, $content) {
     return;
 }
 
+# File::Basename's dirname, without loading File::Basename: "state" and
+# "list" load this module before anything else they need.
+sub _dirname ($path) {
+    return '/' if $path =~ m{\A/+\z};
+    (my $dir = $path) =~ s{/*[^/]*/*\z}{};
+    return $dir ne '' ? $dir : $path =~ m{\A/} ? '/' : '.';
+}
+
 sub ensure_dir ($path) {
     return if -d $path;
     my @todo;
     my $p = $path;
     while ($p ne '' && $p ne '/' && !-d $p) {
         push @todo, $p;
-        $p = dirname($p);
+        $p = _dirname($p);
     }
     for my $d (reverse @todo) {
-        my $parent = dirname($d);
+        my $parent = _dirname($d);
         my @pst = stat($parent);
         my $mode = 0755;
         if (@pst && ($pst[2] & S_ISGID)) {
@@ -151,9 +157,12 @@ sub iso8601_now {
     return sprintf('%04d-%02d-%02dT%02d:%02d:%02dZ', $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1], $t[0]);
 }
 
+# The shell's exit code for a wait status: POSIX's WIFEXITED/WEXITSTATUS and
+# WIFSIGNALED/WTERMSIG, written out so that this module needs no POSIX.
 sub wait_exit_code ($status = $?) {
-    return WEXITSTATUS($status) if WIFEXITED($status);
-    return 128 + WTERMSIG($status) if WIFSIGNALED($status);
+    my $sig = $status & 0x7f;
+    return ($status >> 8) & 0xff if $sig == 0;    # exited
+    return 128 + $sig if $sig != 0x7f;    # killed by a signal (0x7f: stopped)
     return 1;
 }
 
@@ -222,7 +231,10 @@ sub pidfd_wait ($pid, $timeout) {
         $exited = 1 if $n > 0;
         last;
     }
-    POSIX::close($pidfd);
+
+    # POSIX::close without POSIX: a handle on the fd closes it
+    open(my $pidfh, '<&=', $pidfd) or return $exited;
+    close $pidfh;
     return $exited;
 }
 

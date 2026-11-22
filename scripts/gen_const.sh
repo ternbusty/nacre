@@ -237,21 +237,6 @@ emit_section "memfd and file sealing" \
     MFD_CLOEXEC MFD_ALLOW_SEALING \
     F_ADD_SEALS F_SEAL_SEAL F_SEAL_SHRINK F_SEAL_GROW F_SEAL_WRITE
 
-cat <<'SIGNALS'
-
-# ═══════════════════════════════════════════════════════════════════════
-# Signals (name -> number, from Perl's Config at runtime)
-# ═══════════════════════════════════════════════════════════════════════
-use Config;
-our %SIG_NUM;
-{
-    my @names = split ' ', $Config{sig_name};
-    my @nums = split ' ', $Config{sig_num};
-    for my $i (0 .. $#names) {
-        $SIG_NUM{$names[$i]} = $nums[$i] if $names[$i] && $nums[$i];
-    }
-}
-SIGNALS
 
 # NS_MAP (Perl data, uses CLONE_* constants)
 cat <<'NSMAP'
@@ -327,7 +312,7 @@ our @EXPORT_OK = qw(
     MFD_CLOEXEC MFD_ALLOW_SEALING
     F_ADD_SEALS F_SEAL_SEAL F_SEAL_SHRINK F_SEAL_GROW F_SEAL_WRITE
 
-    %SIG_NUM %NS_MAP
+    %NS_MAP
 );
 
 1;
